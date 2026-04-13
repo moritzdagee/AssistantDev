@@ -6,6 +6,19 @@ Format: [Datum] Änderung | Datei | Grund
 
 ## 2026-04-13
 
+### CREATE_EMAIL_REPLY Feature
+- Neuer Trigger `[CREATE_EMAIL_REPLY:json]` fuer E-Mail-Antworten mit korrektem Threading
+- JSON-Felder: message_id, to, cc, subject, body, quote_original
+- `send_email_reply()` Funktion: AppleScript sucht E-Mail per Message-ID in Apple Mail, oeffnet Reply; Fallback auf neue E-Mail wenn nicht gefunden
+- CREATE_EMAIL Parser erkennt und ueberspringt CREATE_EMAIL_REPLY (kein Doppel-Match)
+- `/send_email_reply` API-Route fuer direkten Aufruf
+- System-Prompt (DATEI-ERSTELLUNG Block) um CREATE_EMAIL_REPLY Anweisung ergaenzt
+- Agent-Prompts (privat, signicat, signicat_outbound, trustedcarrier) um CREATE_EMAIL_REPLY Anweisung ergaenzt
+- JS-Frontend zeigt "Reply" statt "Draft" bei Reply-E-Mails
+- KEINE WIEDERHOLUNG Block um CREATE_EMAIL_REPLY erweitert
+- 10 neue Tests in run_tests.py (Stand: 453 Tests)
+- Dateien: src/web_server.py, tests/run_tests.py, config/agents/*.txt
+
 ### GitHub Integration + Terminal-Workflow eingerichtet
 - Git Repository initialisiert in ~/AssistantDev/
 - GitHub Repo erstellt: github.com/moritzdagee/AssistantDev (private)

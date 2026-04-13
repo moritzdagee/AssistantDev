@@ -111,7 +111,7 @@ Fuer JEDES neue Feature oder jeden Bugfix MUESSEN neue Unit Tests in `tests/run_
 - Geaenderte Defaults: pruefen ob der neue Default-Wert korrekt ist
 
 Tests gehoeren in die passende Sektion oder eine neue `section("Features YYYY-MM-DD")`.
-Testsuite MUSS nach jeder Aenderung grueen bleiben. Aktueller Stand: 219 Tests.
+Testsuite MUSS nach jeder Aenderung grueen bleiben. Aktueller Stand: 453 Tests.
 
 ## CLAUDE CODE PROMPTS — STIL-REGEL
 
