@@ -4,6 +4,26 @@ Format: [Datum] Änderung | Datei | Grund
 
 ---
 
+## 2026-04-13
+
+### GitHub Integration + Terminal-Workflow eingerichtet
+- Git Repository initialisiert in ~/AssistantDev/
+- GitHub Repo erstellt: github.com/moritzdagee/AssistantDev (private)
+- Branching-Strategie: main (stable/deployed) / develop (integration) / feature/xxx
+- Initial Commit + develop Branch gepusht
+- 4 Workflow-Skripte erstellt in ~/AssistantDev/scripts/:
+  - new_feature.sh [name]: Branch von develop erstellen
+  - finish_feature.sh [name]: Feature in develop mergen, Branch loeschen
+  - deploy.sh: Deploy + automatischer Git-Commit bei Erfolg
+  - claude_task.sh [task] [branch]: Branch + Claude Code in einem Befehl
+- .gitignore schuetzt: models.json (API-Keys), config/agents/, memory/*.json, *.backup_*, claude_outputs/
+- CLAUDE.md um Abschnitt Git Workflow erweitert
+- Claude CLI eingerichtet: ~/.local/bin/claude (v2.1.90), eingeloggt als moritz.cremer@me.com
+- Terminal-Workflow: Alle Claude Code Prompts ab sofort als direkt ausfuehrbare Terminal-Commands
+- Homebrew installiert, gh CLI installiert und eingeloggt als moritzdagee
+
+---
+
 ## 2026-04-13 — GitHub Repository Setup
 
 2026-04-13 | GitHub Repository moritzdagee/AssistantDev private eingerichtet. Branching-Strategie main/develop/feature. Workflow-Skripte new_feature.sh finish_feature.sh deploy.sh claude_task.sh erstellt. | .gitignore, scripts/, CLAUDE.md | Versionskontrolle und strukturierter Workflow
