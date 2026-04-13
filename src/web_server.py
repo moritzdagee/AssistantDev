@@ -1022,6 +1022,77 @@ end tell'''
         raise Exception(f"AppleScript Fehler: {result.stderr.strip()}")
     return True
 
+def send_email_reply(spec):
+    """Opens Apple Mail reply to an existing email identified by message_id."""
+    import subprocess
+    to      = spec.get('to', '')
+    subject = spec.get('subject', '')
+    body    = spec.get('body', '')
+    cc      = spec.get('cc', '')
+    message_id = spec.get('message_id', '')
+    quote_original = spec.get('quote_original', True)
+
+    def esc(s):
+        s = s.replace('\\', '\\\\')
+        s = s.replace('"', '\\"')
+        s = s.replace('\n', '\\n')
+        s = s.replace('\r', '')
+        return s
+
+    # Build CC recipients AppleScript lines
+    cc_lines = ''
+    if cc:
+        for addr in [a.strip() for a in cc.split(',') if a.strip()]:
+            cc_lines += f'\n            make new cc recipient at end of cc recipients with properties {{address:"{esc(addr)}"}}'
+
+    # AppleScript: try to find message by message-id and reply, fallback to new email
+    if message_id:
+        script = f'''tell application "Mail"
+    set foundMsg to missing value
+    set msgId to "{esc(message_id)}"
+    repeat with acct in accounts
+        repeat with mbox in mailboxes of acct
+            try
+                set msgs to (messages of mbox whose message id is msgId)
+                if (count of msgs) > 0 then
+                    set foundMsg to item 1 of msgs
+                    exit repeat
+                end if
+            end try
+        end repeat
+        if foundMsg is not missing value then exit repeat
+    end repeat
+    if foundMsg is not missing value then
+        set replyMsg to reply foundMsg with opening window
+        delay 0.5
+        tell replyMsg
+            set subject to "{esc(subject)}"
+            set content to "{esc(body)}"{cc_lines}
+        end tell
+    else
+        set newMessage to make new outgoing message with properties {{subject:"{esc(subject)}", content:"{esc(body)}", visible:true}}
+        tell newMessage
+            make new to recipient at end of to recipients with properties {{address:"{esc(to)}"}}{cc_lines}
+        end tell
+    end if
+    activate
+end tell'''
+    else:
+        # No message_id: fallback to regular new email
+        script = f'''tell application "Mail"
+    set newMessage to make new outgoing message with properties {{subject:"{esc(subject)}", content:"{esc(body)}", visible:true}}
+    tell newMessage
+        make new to recipient at end of to recipients with properties {{address:"{esc(to)}"}}{cc_lines}
+    end tell
+    activate
+end tell'''
+
+    result = subprocess.run(['osascript', '-e', script],
+                          capture_output=True, text=True, timeout=30)
+    if result.returncode != 0:
+        raise Exception(f"AppleScript Fehler: {result.stderr.strip()}")
+    return True
+
 def send_whatsapp_draft(spec, agent_name=None):
     """Opens WhatsApp with a pre-filled message. Looks up phone in contacts.json, then macOS Contacts."""
     import subprocess
@@ -4095,7 +4166,7 @@ function handleChatResponse(data) {
   if (data.created_videos && data.created_videos.length) data.created_videos.forEach(vid => addVideoPreview(vid));
   if (data.created_emails && data.created_emails.length) {
     data.created_emails.forEach(e => {
-      if (e && e.ok) addStatusMsg('\u2709 Apple Mail geoeffnet: '+e.subject);
+      if (e && e.ok) addStatusMsg('\u2709 Apple Mail ' + (e.reply ? 'Reply' : 'Draft') + ' geoeffnet: '+e.subject);
       else addMailtoFallback(e||{});
     });
   }
@@ -4389,7 +4460,7 @@ function handleResponse(data) {
   if (data.created_videos && data.created_videos.length) data.created_videos.forEach(vid => addVideoPreview(vid));
   if (data.created_emails && data.created_emails.length) {
     data.created_emails.forEach(e => {
-      if (e && e.ok) addStatusMsg('\u2709 Apple Mail geoeffnet: '+e.subject);
+      if (e && e.ok) addStatusMsg('\u2709 Apple Mail ' + (e.reply ? 'Reply' : 'Draft') + ' geoeffnet: '+e.subject);
       else addMailtoFallback(e||{});
     });
   }
@@ -5638,14 +5709,20 @@ Fuer PowerPoint (.pptx):
 Fuer E-Mail-Draft (oeffnet Apple Mail):
 [CREATE_EMAIL:{"to":"empfaenger@example.com","cc":"","subject":"Betreff","body":"E-Mail Text hier"}]
 
-WICHTIG: Du schickst NIEMALS eine E-Mail direkt ab. Du erstellst IMMER nur einen Draft der in Apple Mail geoeffnet wird. Das gilt fuer alle Formulierungen: 'schreibe', 'sende', 'schick', 'antworte', 'reply', 'forward' — immer CREATE_EMAIL, niemals direkt senden.
+Fuer E-Mail-Antwort (oeffnet Apple Mail Reply mit korrektem Threading):
+[CREATE_EMAIL_REPLY:{"message_id":"<original-message-id@domain.com>","to":"absender@example.com","cc":"andere@example.com","subject":"Re: Betreff","body":"Antworttext hier","quote_original":true}]
+
+WICHTIG: Du schickst NIEMALS eine E-Mail direkt ab. Du erstellst IMMER nur einen Draft der in Apple Mail geoeffnet wird. Das gilt fuer alle Formulierungen: 'schreibe', 'sende', 'schick', 'antworte', 'reply', 'forward' — immer CREATE_EMAIL oder CREATE_EMAIL_REPLY, niemals direkt senden.
 
 Wenn du auf eine E-Mail antwortest (z.B. "antworte auf diese E-Mail", "reply", "Antwort verfassen", "schreib eine Antwort"):
-- Extrahiere aus der Original-E-Mail im Kontext: Von (Absender), An (Empfaenger), Betreff
+- Verwende CREATE_EMAIL_REPLY statt CREATE_EMAIL fuer korrekte Threading
+- message_id: Lies den Message-ID Header aus der Original-E-Mail (z.B. aus der .eml Datei im Kontext)
 - to: Original-Absender (aus "Von:" Feld)
 - cc: Alle Original-Empfaenger aus "An:" AUSSER moritz.cremer@me.com und londoncityfox@gmail.com
 - subject: "Re: " + Original-Betreff (nur wenn nicht bereits "Re:" vorhanden)
-- body: Dein Antworttext + eine Leerzeile + jede Zeile des Original-Bodys mit "> " davor (klassisches E-Mail-Quoting)
+- body: Dein Antworttext
+- quote_original: true wenn das Original zitiert werden soll (Standard), false wenn nicht
+- Falls keine message_id verfuegbar: verwende CREATE_EMAIL als Fallback
 
 Verwende dies immer wenn der Nutzer ein Dokument, eine Tabelle, PDF, Praesentation oder E-Mail benoetigt.
 
@@ -5654,7 +5731,7 @@ Fuer WhatsApp-Nachricht (oeffnet WhatsApp mit vorausgefuellter Nachricht):
 
 WICHTIG: WhatsApp-Nachrichten werden NIEMALS automatisch gesendet. Die App wird nur geoeffnet mit vorausgefuelltem Text. Der Nutzer muss manuell auf Senden klicken. Verwende dies wenn der Nutzer sagt: 'schreib auf WhatsApp', 'WhatsApp an', 'schick per WhatsApp'.
 
-KEINE WIEDERHOLUNG: Wenn im Verlauf bereits eine Aktion ausgefuehrt wurde (erkennbar an '[... — Aktion ausgefuehrt]'), erzeuge diese Aktion NICHT erneut. Jede CREATE_EMAIL, CREATE_WHATSAPP, CREATE_SLACK und CREATE_VIDEO Aktion darf nur EINMAL pro expliziter Nutzer-Anfrage erzeugt werden. Wenn der Nutzer eine NEUE Anfrage stellt (z.B. Video generieren statt WhatsApp), fuehre NUR die neue Aktion aus.
+KEINE WIEDERHOLUNG: Wenn im Verlauf bereits eine Aktion ausgefuehrt wurde (erkennbar an '[... — Aktion ausgefuehrt]'), erzeuge diese Aktion NICHT erneut. Jede CREATE_EMAIL, CREATE_EMAIL_REPLY, CREATE_WHATSAPP, CREATE_SLACK und CREATE_VIDEO Aktion darf nur EINMAL pro expliziter Nutzer-Anfrage erzeugt werden. Wenn der Nutzer eine NEUE Anfrage stellt (z.B. Video generieren statt WhatsApp), fuehre NUR die neue Aktion aus.
 
 Fuer Slack-Nachricht (oeffnet Slack Desktop mit vorausgefuelltem Text):
 [CREATE_SLACK:{"channel":"#kanalname","message":"Nachrichtentext hier"}]
@@ -6023,6 +6100,16 @@ def send_email_draft_route():
     try:
         spec = request.json
         send_email_draft(spec)
+        return jsonify({'ok': True, 'subject': spec.get('subject',''), 'to': spec.get('to','')})
+    except Exception as e:
+        return jsonify({'ok': False, 'error': str(e)})
+
+
+@app.route('/send_email_reply', methods=['POST'])
+def send_email_reply_route():
+    try:
+        spec = request.json
+        send_email_reply(spec)
         return jsonify({'ok': True, 'subject': spec.get('subject',''), 'to': spec.get('to','')})
     except Exception as e:
         return jsonify({'ok': False, 'error': str(e)})
@@ -6505,13 +6592,17 @@ def process_single_message(msg, kontext_override=None, state=None, **kwargs):
                     i = idx + 1
             return results
 
-        # Parse CREATE_EMAIL
+        # Parse CREATE_EMAIL (but not CREATE_EMAIL_REPLY)
         email_prefix = '[CREATE_EMAIL:'
         ei = 0
         while ei < len(text):
             eidx = text.find(email_prefix, ei)
             if eidx == -1:
                 break
+            # Skip if this is actually CREATE_EMAIL_REPLY
+            if text[eidx:eidx+len('[CREATE_EMAIL_REPLY:')] == '[CREATE_EMAIL_REPLY:':
+                ei = eidx + 1
+                continue
             jstart = eidx + len(email_prefix)
             depth = 0
             j = jstart
@@ -6554,6 +6645,54 @@ def process_single_message(msg, kontext_override=None, state=None, **kwargs):
             else:
                 ei = eidx + 1
 
+        # Parse CREATE_EMAIL_REPLY
+        er_prefix = '[CREATE_EMAIL_REPLY:'
+        eri = 0
+        while eri < len(text):
+            eridx = text.find(er_prefix, eri)
+            if eridx == -1:
+                break
+            erjstart = eridx + len(er_prefix)
+            depth = 0
+            erj = erjstart
+            erjend = -1
+            erin_str = False
+            eresc = False
+            while erj < len(text):
+                erc = text[erj]
+                if eresc:
+                    eresc = False
+                elif erc == '\\':
+                    eresc = True
+                elif erc == '"' and not eresc:
+                    erin_str = not erin_str
+                elif not erin_str:
+                    if erc == '{':
+                        depth += 1
+                    elif erc == '}':
+                        depth -= 1
+                        if depth == 0:
+                            erjend = erj + 1
+                            break
+                erj += 1
+            if erjend != -1 and erjend < len(text) and text[erjend] == ']':
+                full_block = text[eridx:erjend+1]
+                json_str = text[erjstart:erjend]
+                spec = {}
+                try:
+                    spec = json.loads(json_str)
+                    send_email_reply(spec)
+                    created_emails.append({'ok': True, 'subject': spec.get('subject',''), 'to': spec.get('to',''), 'body': spec.get('body',''), 'reply': True})
+                    marker = f'\n[E-Mail-Reply an {spec.get("to","")} erstellt — Aktion ausgefuehrt]\n'
+                    text = text[:eridx] + marker + text[erjend+1:]
+                    eri = eridx + len(marker)
+                except Exception as ere:
+                    created_emails.append({'ok': False, 'subject': spec.get('subject',''), 'to': '', 'error': str(ere), 'body': spec.get('body',''), 'reply': True})
+                    marker = '\n[E-Mail-Reply fehlgeschlagen]\n'
+                    text = text[:eridx] + marker + text[erjend+1:]
+                    eri = eridx + len(marker)
+            else:
+                eri = eridx + 1
 
         # Parse CREATE_WHATSAPP
         created_whatsapps = []
