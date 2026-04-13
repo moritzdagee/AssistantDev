@@ -1,0 +1,9 @@
+*.backup_*
+*.pyc
+__pycache__
+config/models.json
+config/agents/
+memory/**/*.json
+.DS_Store
+*.log
+claude_outputs/
