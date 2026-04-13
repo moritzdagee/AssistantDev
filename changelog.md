@@ -6,6 +6,49 @@ Format: [Datum] Änderung | Datei | Grund
 
 ## 2026-04-13
 
+### LLM-Modell Audit, API-Tests & models.json Update
+- Alle 5 Provider getestet (Anthropic, OpenAI, Mistral, Perplexity, Gemini)
+- **Anthropic**: claude-sonnet-4-6, claude-opus-4-6, claude-haiku-4-5 — alle OK (HTTP 200)
+- **OpenAI**: gpt-4o, gpt-4o-mini, o1 — alle HTTP 429 (Quota exceeded, Billing pruefen!). o3 und o4-mini als neue Modelle hinzugefuegt
+- **Mistral**: mistral-large ✅, mistral-small ✅, mistral-nemo ❌ (invalid model ID entfernt). Neu hinzugefuegt: mistral-medium, magistral-medium (Reasoning), magistral-small (Reasoning), codestral (Code), open-mistral-nemo
+- **Perplexity**: sonar ✅, sonar-pro ✅, sonar-reasoning ❌ (deprecated Dez 2025, entfernt), sonar-reasoning-pro ✅, sonar-deep-research ✅
+- **Gemini**: gemini-2.5-flash ✅, gemini-2.5-pro ⚠️ (503 high demand), gemini-3-flash-preview ✅, gemini-3-pro-preview ✅, gemini-3.1-pro-preview ✅, gemini-2.0-flash ❌ (deprecated, entfernt)
+- Dropdown wird dynamisch aus models.json populiert — alle Aenderungen sofort sichtbar
+- Kein Provider-Fallback-Mechanismus vorhanden (nur innerhalb Video/Bild-Generierung)
+- Dateien: `config/models.json`
+
+### /create-email-reply Slash-Command im Frontend
+- `/create-email-reply` Shortcut im Slash-Command-Menü ergänzt (Gruppe: Kommunikation, direkt nach /create-email)
+- Template: "Antworte auf die E-Mail von [Absender] zum Thema [Betreff]: "
+- Dateien: `src/web_server.py`
+- Alle 453 Tests bestanden
+
+### Copy-Button fuer Code-Bloecke im Chat-Frontend
+- `addCodeCopyButtons()` erweitert: behandelt jetzt auch marked.js `<pre><code>` Bloecke (vorher nur custom `code-block-wrapper`)
+- Marked.js-Bloecke werden automatisch in `.code-block-wrapper` gewrappt mit Sprach-Label und Copy-Button
+- Copy-Buttons erscheinen jetzt auch in User-Nachrichten (nicht nur Assistant)
+- Duplikat-Schutz: Buttons werden nicht doppelt eingefuegt
+- Bestehende CSS-Klassen (`code-copy-btn`, hover-Effekte, `copied`-Zustand) werden wiederverwendet
+- Alle 453 Tests bestanden
+- Dateien: `src/web_server.py`, `scripts/patch_code_copy_buttons.py`
+
+### Auto-Deploy bei develop-Merge + Deployment-Audit
+- Git Post-Merge Hook erstellt (`.git/hooks/post-merge`): deployed automatisch wenn auf develop gemerged wird
+- `finish_feature.sh` deployed jetzt automatisch nach Feature-Merge (mit Fehlertoleranz)
+- `deploy.sh` robuster gemacht: logs-Verzeichnis wird angelegt, Timestamps in `logs/deploy.log`, sleep auf 4s erhoeht
+- Sofort-Deploy aller ausstehenden Features inkl. CREATE_EMAIL_REPLY verifiziert (Diff war 0 Zeilen — Quellcode und deployed waren bereits identisch)
+- Dateien: `scripts/deploy.sh`, `scripts/finish_feature.sh`, `.git/hooks/post-merge`
+
+### CREATE_EMAIL from-Feld Support
+- **NEU:** Optionales "from"-Feld in CREATE_EMAIL und CREATE_EMAIL_REPLY implementiert
+  - `send_email_draft()`: setzt `sender` im AppleScript wenn "from" angegeben
+  - `send_email_reply()`: setzt `sender` im Reply-AppleScript und beiden Fallback-Pfaden
+  - System-Prompt: Beispiel-JSON um "from" erweitert, Dokumentation ergaenzt
+  - Beide duplizierten Bloecke (Zeile ~278 und ~994) konsistent gepatcht
+- **signicat.txt:** Absenderadresse-Block eingefuegt (from: moritz.cremer@signicat.com fuer alle Drafts)
+- Dateien: `src/web_server.py`, `config/agents/signicat.txt`
+- Alle 453 Tests bestanden
+
 ### CREATE_EMAIL_REPLY Feature
 - Neuer Trigger `[CREATE_EMAIL_REPLY:json]` fuer E-Mail-Antworten mit korrektem Threading
 - JSON-Felder: message_id, to, cc, subject, body, quote_original
