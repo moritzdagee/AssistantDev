@@ -4,6 +4,12 @@ Format: [Datum] Änderung | Datei | Grund
 
 ---
 
+## 2026-04-13 — GitHub Repository Setup
+
+2026-04-13 | GitHub Repository moritzdagee/AssistantDev private eingerichtet. Branching-Strategie main/develop/feature. Workflow-Skripte new_feature.sh finish_feature.sh deploy.sh claude_task.sh erstellt. | .gitignore, scripts/, CLAUDE.md | Versionskontrolle und strukturierter Workflow
+
+---
+
 ## SERVICE-VERZEICHNIS — Alle verwalteten Dienste
 
 > **WICHTIG:** Wenn ein neuer Service/Daemon erstellt wird, MUSS er hier eingetragen UND in `src/app.py` (Menu Bar App) als `Service(...)` Eintrag hinzugefuegt werden, damit er im macOS Menu Bar sichtbar, startbar und stoppbar ist. Ebenso muss das Script ins App Bundle kopiert werden: `cp src/[script].py /Applications/Assistant.app/Contents/Resources/`

@@ -142,3 +142,24 @@ Danach Server neu starten:
 pkill -f web_server.py
 ```
 (App startet automatisch neu)
+
+## Git Workflow
+
+Repository: github.com/moritzdagee/AssistantDev (private)
+Branches: main (stable), develop (integration), feature/* (Arbeit)
+
+**Branching-Regeln:**
+- Neue Features immer von `develop` abzweigen: `scripts/new_feature.sh <name>`
+- Feature fertig: `scripts/finish_feature.sh <name>` (merged in develop)
+- Deploy: `scripts/deploy.sh` (kopiert ins App-Bundle, testet, committed, pusht)
+- Claude-Aufgabe starten: `scripts/claude_task.sh "<aufgabe>" [branch-name]`
+
+**Workflow:**
+1. `scripts/new_feature.sh mein-feature` — erstellt feature/mein-feature von develop
+2. Aenderungen vornehmen, testen, committen
+3. `scripts/finish_feature.sh mein-feature` — merged in develop, loescht Feature-Branch
+4. Bei Release: develop in main mergen
+
+**Commits:**
+- Aussagekraeftige Commit-Messages auf Deutsch oder Englisch
+- Kein force-push auf main oder develop
