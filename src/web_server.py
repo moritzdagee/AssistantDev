@@ -1,0 +1,7732 @@
+import os
+import json
+import datetime
+import threading
+import uuid
+import copy
+import webbrowser
+import re
+
+# Search engine
+try:
+    from search_engine import auto_search, format_search_feedback, build_index_async, build_global_index_async, detect_global_trigger, update_all_indexes
+except ImportError:
+    auto_search = None
+    format_search_feedback = None
+    build_index_async = None
+    build_global_index_async = None
+    detect_global_trigger = None
+    update_all_indexes = None
+import requests
+from flask import Flask, request, jsonify, render_template_string
+from bs4 import BeautifulSoup
+
+# ─── FILE CREATION HELPERS ───────────────────────────────────────────────────
+
+OUTPUT_DIR = os.path.join(os.path.expanduser("~/Library/Mobile Documents/com~apple~CloudDocs/Downloads shared"), "claude_outputs")
+
+def ensure_output_dir():
+    os.makedirs(OUTPUT_DIR, exist_ok=True)
+    return OUTPUT_DIR
+
+def sanitize_llm_json(raw):
+    """Sanitize JSON from LLM output that may have single quotes, trailing commas, etc."""
+    import re as _sre
+    s = raw.strip()
+    # Remove markdown code fences
+    if s.startswith('```'):
+        s = _sre.sub(r'^```\w*\n?', '', s)
+        s = _sre.sub(r'\n?```$', '', s)
+        s = s.strip()
+    # Try standard JSON first
+    try:
+        import json as _sjson
+        return _sjson.loads(s)
+    except Exception:
+        pass
+    # Fix single quotes → double quotes (careful with apostrophes in text)
+    # Strategy: replace single-quoted keys and values
+    try:
+        import ast
+        parsed = ast.literal_eval(s)
+        return parsed
+    except Exception:
+        pass
+    # Manual fixes: trailing commas before } or ]
+    s2 = _sre.sub(r',\s*([}\]])', r'\1', s)
+    # Replace single quotes with double quotes (simple approach)
+    s2 = s2.replace("'", '"')
+    try:
+        import json as _sjson
+        return _sjson.loads(s2)
+    except Exception:
+        pass
+    # Last resort: raise the original error
+    import json as _sjson
+    return _sjson.loads(raw)
+
+
+def create_docx_from_spec(spec):
+    from docx import Document
+    from docx.shared import Pt, RGBColor
+    doc = Document()
+    title = spec.get('title', 'Dokument')
+    doc.add_heading(title, 0)
+    for item in spec.get('content', []):
+        t = item.get('type', 'paragraph')
+        text = item.get('text', '')
+        if t == 'heading':
+            doc.add_heading(text, level=item.get('level', 1))
+        elif t == 'paragraph':
+            doc.add_paragraph(text)
+        elif t == 'bullet':
+            doc.add_paragraph(text, style='List Bullet')
+        elif t == 'table':
+            rows = item.get('rows', [])
+            if rows:
+                table = doc.add_table(rows=len(rows), cols=len(rows[0]))
+                table.style = 'Table Grid'
+                for i, row in enumerate(rows):
+                    for j, cell_text in enumerate(row):
+                        table.cell(i, j).text = str(cell_text)
+    fname = title.replace(' ', '_').replace('/', '_')[:50] + '.docx'
+    fpath = os.path.join(ensure_output_dir(), fname)
+    doc.save(fpath)
+    return fname, fpath
+
+def create_xlsx_from_spec(spec):
+    import openpyxl
+    from openpyxl.styles import Font, PatternFill, Alignment
+    wb = openpyxl.Workbook()
+    title = spec.get('title', 'Tabelle')
+    sheets = spec.get('sheets', [{'name': 'Sheet1', 'rows': spec.get('rows', [])}])
+    wb.remove(wb.active)
+    for sheet_spec in sheets:
+        ws = wb.create_sheet(sheet_spec.get('name', 'Sheet'))
+        rows = sheet_spec.get('rows', [])
+        for i, row in enumerate(rows):
+            for j, val in enumerate(row):
+                cell = ws.cell(row=i+1, column=j+1, value=val)
+                if i == 0:  # Header row bold
+                    cell.font = Font(bold=True)
+                    cell.fill = PatternFill(start_color='2D3A2D', end_color='2D3A2D', fill_type='solid')
+                    cell.font = Font(bold=True, color='F0F0F0')
+    fname = title.replace(' ', '_').replace('/', '_')[:50] + '.xlsx'
+    fpath = os.path.join(ensure_output_dir(), fname)
+    wb.save(fpath)
+    return fname, fpath
+
+def create_pdf_from_spec(spec):
+    from reportlab.lib.pagesizes import A4
+    from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+    from reportlab.lib.units import cm
+    from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle
+    from reportlab.lib import colors
+    title = spec.get('title', 'Dokument')
+    fname = title.replace(' ', '_').replace('/', '_')[:50] + '.pdf'
+    fpath = os.path.join(ensure_output_dir(), fname)
+    doc = SimpleDocTemplate(fpath, pagesize=A4,
+                            rightMargin=2*cm, leftMargin=2*cm,
+                            topMargin=2*cm, bottomMargin=2*cm)
+    styles = getSampleStyleSheet()
+    story = []
+    story.append(Paragraph(title, styles['Title']))
+    story.append(Spacer(1, 0.5*cm))
+    for item in spec.get('content', []):
+        t = item.get('type', 'paragraph')
+        text = item.get('text', '')
+        if t == 'heading':
+            level = item.get('level', 1)
+            style = styles['Heading' + str(min(level, 3))]
+            story.append(Paragraph(text, style))
+        elif t == 'paragraph':
+            story.append(Paragraph(text, styles['Normal']))
+            story.append(Spacer(1, 0.3*cm))
+        elif t == 'bullet':
+            story.append(Paragraph('• ' + text, styles['Normal']))
+        elif t == 'table':
+            rows = item.get('rows', [])
+            if rows:
+                t_obj = Table(rows)
+                t_obj.setStyle(TableStyle([
+                    ('BACKGROUND', (0,0), (-1,0), colors.HexColor('#2D3A2D')),
+                    ('TEXTCOLOR', (0,0), (-1,0), colors.white),
+                    ('FONTNAME', (0,0), (-1,0), 'Helvetica-Bold'),
+                    ('GRID', (0,0), (-1,-1), 0.5, colors.grey),
+                    ('ROWBACKGROUNDS', (0,1), (-1,-1), [colors.white, colors.HexColor('#F5F5F5')]),
+                ]))
+                story.append(t_obj)
+                story.append(Spacer(1, 0.3*cm))
+    doc.build(story)
+    return fname, fpath
+
+def create_pptx_from_spec(spec):
+    from pptx import Presentation
+    from pptx.util import Inches, Pt, Emu
+    from pptx.dml.color import RGBColor
+    from pptx.enum.text import PP_ALIGN
+
+    prs = Presentation()
+    title_str = spec.get('title', 'Praesentation')
+
+    # Dark theme colors
+    BG_COLOR    = RGBColor(0x1a, 0x1a, 0x1a)
+    GOLD_COLOR  = RGBColor(0xf0, 0xc0, 0x60)
+    WHITE_COLOR = RGBColor(0xf0, 0xf0, 0xf0)
+    GRAY_COLOR  = RGBColor(0x88, 0x88, 0x88)
+
+    slide_width  = prs.slide_width
+    slide_height = prs.slide_height
+
+    def set_bg(slide):
+        from pptx.oxml.ns import qn
+        from lxml import etree
+        background = slide.background
+        fill = background.fill
+        fill.solid()
+        fill.fore_color.rgb = BG_COLOR
+
+    def add_textbox(slide, text, left, top, width, height,
+                    size=18, bold=False, color=WHITE_COLOR, align=PP_ALIGN.LEFT):
+        txBox = slide.shapes.add_textbox(left, top, width, height)
+        tf = txBox.text_frame
+        tf.word_wrap = True
+        p = tf.paragraphs[0]
+        p.alignment = align
+        run = p.add_run()
+        run.text = text
+        run.font.size = Pt(size)
+        run.font.bold = bold
+        run.font.color.rgb = color
+        return txBox
+
+    slides_spec = spec.get('slides', [])
+
+    for i, slide_spec in enumerate(slides_spec):
+        layout = prs.slide_layouts[6]  # blank
+        slide = prs.slides.add_slide(layout)
+        set_bg(slide)
+
+        stype   = slide_spec.get('type', 'content')
+        heading = slide_spec.get('heading', '')
+        body    = slide_spec.get('body', '')
+        bullets = slide_spec.get('bullets', [])
+        footer  = slide_spec.get('footer', '')
+
+        margin  = Inches(0.5)
+        w       = slide_width - 2 * margin
+
+        if stype == 'title':
+            # Big title slide
+            add_textbox(slide, title_str,
+                        margin, Inches(1.8), w, Inches(1.2),
+                        size=36, bold=True, color=WHITE_COLOR, align=PP_ALIGN.CENTER)
+            if heading:
+                add_textbox(slide, heading,
+                            margin, Inches(3.2), w, Inches(0.8),
+                            size=22, color=GOLD_COLOR, align=PP_ALIGN.CENTER)
+            # Gold rule
+            from pptx.util import Pt as PtU
+            line = slide.shapes.add_shape(
+                1, margin, Inches(3.0), w, Emu(40000))
+            line.fill.solid()
+            line.fill.fore_color.rgb = GOLD_COLOR
+            line.line.fill.background()
+        else:
+            # Heading bar
+            bar = slide.shapes.add_shape(
+                1, 0, 0, slide_width, Inches(0.95))
+            bar.fill.solid()
+            bar.fill.fore_color.rgb = RGBColor(0x2d, 0x3a, 0x2d)
+            bar.line.fill.background()
+
+            if heading:
+                add_textbox(slide, heading,
+                            margin, Emu(120000), w, Inches(0.75),
+                            size=24, bold=True, color=WHITE_COLOR)
+
+            y = Inches(1.1)
+
+            if body:
+                add_textbox(slide, body,
+                            margin, y, w, Inches(1.2),
+                            size=16, color=WHITE_COLOR)
+                y += Inches(1.3)
+
+            for bullet in bullets:
+                add_textbox(slide, '– ' + bullet,
+                            margin + Inches(0.2), y, w - Inches(0.2), Inches(0.5),
+                            size=15, color=RGBColor(0xd0, 0xd0, 0xd0))
+                y += Inches(0.52)
+
+        # Slide number
+        add_textbox(slide, str(i + 1),
+                    slide_width - Inches(0.8), slide_height - Inches(0.4),
+                    Inches(0.6), Inches(0.3),
+                    size=10, color=GRAY_COLOR, align=PP_ALIGN.RIGHT)
+
+        if footer:
+            add_textbox(slide, footer,
+                        margin, slide_height - Inches(0.4), w, Inches(0.3),
+                        size=10, color=GRAY_COLOR)
+
+    fname = title_str.replace(' ', '_').replace('/', '_')[:50] + '.pptx'
+    fpath = os.path.join(ensure_output_dir(), fname)
+    prs.save(fpath)
+    return fname, fpath
+
+def send_email_draft(spec):
+    import subprocess
+    to      = spec.get('to', '')
+    subject = spec.get('subject', '')
+    body    = spec.get('body', '')
+    cc      = spec.get('cc', '')
+
+    # Escape for AppleScript - handle all special chars
+    def esc(s):
+        s = s.replace('\\', '\\\\')
+        s = s.replace('"', '\\"')
+        s = s.replace('\n', '\\n')
+        s = s.replace('\r', '')
+        return s
+
+    cc_line = f'\n        make new cc recipient at end of cc recipients with properties {{address:\"{esc(cc)}\"}}' if cc else ''
+
+    script = f'''tell application "Mail"
+    set newMessage to make new outgoing message with properties {{subject:"{esc(subject)}", content:"{esc(body)}", visible:true}}
+    tell newMessage
+        make new to recipient at end of to recipients with properties {{address:"{esc(to)}"}}{cc_line}
+    end tell
+    activate
+end tell'''
+
+    result = subprocess.run(['osascript', '-e', script], 
+                          capture_output=True, text=True, timeout=10)
+    if result.returncode != 0:
+        raise Exception(f"AppleScript Fehler: {result.stderr.strip()}")
+    return True
+
+BASE = os.path.expanduser("~/Library/Mobile Documents/com~apple~CloudDocs/Downloads shared/claude_datalake")
+AGENTS_DIR = os.path.join(BASE, "config/agents")
+MODELS_FILE = os.path.join(BASE, "config/models.json")
+
+app = Flask(__name__)
+
+def cleanup_agent_files():
+    """Clean old memory content from agent txt files on startup."""
+    STRIP_MARKERS = [
+        "--- GEDAECHTNIS:", "--- DATEI-ERSTELLUNG ---",
+        "--- WEITERE FAEHIGKEITEN ---", "VERGANGENE KONVERSATIONEN:",
+        "GESPEICHERTE DATEIEN IM MEMORY", "Von: ", "An: ", "Betreff: ",
+    ]
+    if not os.path.exists(AGENTS_DIR):
+        return
+    for fname in os.listdir(AGENTS_DIR):
+        if not fname.endswith('.txt'):
+            continue
+        fpath = os.path.join(AGENTS_DIR, fname)
+        try:
+            with open(fpath, 'r', errors='ignore') as f:
+                raw = f.read()
+            cut = len(raw)
+            for marker in STRIP_MARKERS:
+                pos = raw.find(marker)
+                if 0 < pos < cut:
+                    cut = pos
+            clean = raw[:cut].strip()
+            if len(clean) < len(raw) - 10:
+                with open(fpath, 'w') as f:
+                    f.write(clean)
+                print(f"Cleaned: {fname}")
+        except Exception as e:
+            print(f"Cleanup error {fname}: {e}")
+
+cleanup_agent_files()
+
+# ─── PROVIDER ADAPTERS ────────────────────────────────────────────────────────
+
+def call_anthropic(api_key, model_id, system_prompt, messages):
+    from anthropic import Anthropic
+    client = Anthropic(api_key=api_key)
+    r = client.messages.create(model=model_id, max_tokens=4096, system=system_prompt, messages=messages)
+    return r.content[0].text
+
+def call_openai(api_key, model_id, system_prompt, messages):
+    import openai
+    client = openai.OpenAI(api_key=api_key)
+    oai_messages = [{"role": "system", "content": system_prompt}] + messages
+    r = client.chat.completions.create(model=model_id, messages=oai_messages, max_tokens=4096)
+    return r.choices[0].message.content
+
+def call_perplexity(api_key, model_id, system_prompt, messages):
+    import requests as _pplx_req
+    from requests.exceptions import ReadTimeout, ConnectionError as ReqConnectionError
+
+    # Perplexity requires strictly alternating user/assistant messages after system.
+    # Merge consecutive same-role messages to enforce this.
+    raw_msgs = list(messages)
+    # Remove empty messages
+    raw_msgs = [m for m in raw_msgs if m.get('content')]
+    # Flatten list-type content (vision messages) to text
+    for m in raw_msgs:
+        if isinstance(m.get('content'), list):
+            m = dict(m)
+            m['content'] = ' '.join(
+                p.get('text', '') for p in m['content']
+                if isinstance(p, dict) and p.get('type') == 'text'
+            )
+    # Merge consecutive same-role messages
+    merged = []
+    for m in raw_msgs:
+        content_text = m.get('content', '')
+        if isinstance(content_text, list):
+            content_text = ' '.join(
+                p.get('text', '') for p in content_text
+                if isinstance(p, dict) and p.get('type') == 'text'
+            )
+        if not content_text or not content_text.strip():
+            continue
+        if merged and merged[-1]['role'] == m['role']:
+            merged[-1]['content'] += '\n\n' + content_text
+        else:
+            merged.append({'role': m['role'], 'content': content_text})
+    # Ensure first non-system message is 'user' (Perplexity requirement)
+    if merged and merged[0]['role'] != 'user':
+        merged.insert(0, {'role': 'user', 'content': '.'})
+    # Ensure last message is 'user' (Perplexity sends to model for completion)
+    if merged and merged[-1]['role'] != 'user':
+        merged.append({'role': 'user', 'content': '.'})
+    pplx_messages = [{"role": "system", "content": system_prompt}] + merged
+    headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
+    payload = {"model": model_id, "messages": pplx_messages, "max_tokens": 8000}
+
+    # Model-specific timeouts (connect_timeout, read_timeout)
+    PERPLEXITY_TIMEOUTS = {
+        'sonar-deep-research': (10, 300),   # Deep Research: bis zu 5 Min
+        'sonar-reasoning-pro': (10, 180),   # Reasoning Pro: bis zu 3 Min
+        'sonar-reasoning': (10, 180),       # Reasoning: bis zu 3 Min
+        'sonar-pro': (10, 120),             # Sonar Pro: 2 Min
+        'sonar': (10, 120),                 # Sonar: 2 Min
+    }
+    timeout = PERPLEXITY_TIMEOUTS.get(model_id, (10, 120))
+
+    MODEL_LABELS = {
+        'sonar-deep-research': 'Sonar Deep Research',
+        'sonar-reasoning-pro': 'Sonar Reasoning Pro',
+        'sonar-reasoning': 'Sonar Reasoning',
+        'sonar-pro': 'Sonar Pro',
+        'sonar': 'Sonar',
+    }
+    model_label = MODEL_LABELS.get(model_id, model_id)
+
+    try:
+        resp = _pplx_req.post(
+            "https://api.perplexity.ai/chat/completions",
+            headers=headers, json=payload, timeout=timeout
+        )
+    except ReadTimeout:
+        raise Exception(
+            f"Perplexity {model_label} hat zu lange gebraucht (Timeout nach {timeout[1]}s). "
+            f"Versuche es erneut oder waehle ein schnelleres Modell."
+        )
+    except ReqConnectionError:
+        raise Exception(
+            f"Verbindung zu Perplexity fehlgeschlagen. Pruefe deine Internetverbindung."
+        )
+
+    data = resp.json()
+    if resp.status_code != 200:
+        raise Exception(f"Perplexity API Fehler: {data.get('error', {}).get('message', str(data))}")
+    text = data["choices"][0]["message"]["content"]
+    # Append citations as clickable Markdown links if present
+    citations = data.get("citations")
+    if citations and isinstance(citations, list) and len(citations) > 0:
+        text += "\n\n**Quellen:**\n"
+        for i, url in enumerate(citations, 1):
+            try:
+                from urllib.parse import urlparse
+                domain = urlparse(url).netloc.replace("www.", "")
+            except Exception:
+                domain = url[:60]
+            text += f"[{i}] [{domain}]({url})\n"
+    return text
+
+def call_mistral(api_key, model_id, system_prompt, messages):
+    headers = {"Authorization": "Bearer " + api_key, "Content-Type": "application/json"}
+    mistral_messages = [{"role": "system", "content": system_prompt}] + messages
+    payload = {"model": model_id, "messages": mistral_messages, "max_tokens": 4096}
+    r = requests.post("https://api.mistral.ai/v1/chat/completions", headers=headers, json=payload, timeout=60)
+    return r.json()["choices"][0]["message"]["content"]
+
+def call_gemini(api_key, model_id, system_prompt, messages):
+    """Gemini via REST API (kein SDK noetig)."""
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/{model_id}:generateContent?key={api_key}"
+    contents = []
+    for m in messages:
+        role = 'user' if m['role'] == 'user' else 'model'
+        c = m['content']
+        if isinstance(c, list):
+            parts = []
+            for item in c:
+                if item.get('type') == 'text':
+                    parts.append({'text': item['text']})
+                elif item.get('type') == 'image':
+                    parts.append({'inline_data': {'mime_type': item['source']['media_type'], 'data': item['source']['data']}})
+            contents.append({'role': role, 'parts': parts})
+        else:
+            contents.append({'role': role, 'parts': [{'text': str(c)}]})
+    payload = {'contents': contents, 'generationConfig': {'maxOutputTokens': 4096}}
+    if system_prompt:
+        payload['systemInstruction'] = {'parts': [{'text': system_prompt}]}
+    try:
+        r = requests.post(url, json=payload, timeout=120)
+        data = r.json()
+        if r.status_code != 200:
+            err_msg = data.get('error', {}).get('message', str(data))
+            if '429' in str(r.status_code) or 'quota' in err_msg.lower() or 'rate' in err_msg.lower():
+                return ("Gemini Rate Limit erreicht. Entweder kurz warten "
+                        "oder auf bezahlten API Plan upgraden: "
+                        "https://ai.google.dev/pricing")
+            raise Exception(f"Gemini API Fehler ({r.status_code}): " + err_msg)
+        parts = data['candidates'][0]['content'].get('parts', [])
+        return ''.join(p.get('text', '') for p in parts)
+    except requests.exceptions.Timeout:
+        raise Exception("Gemini API Timeout (120s)")
+
+# Human-readable provider names
+PROVIDER_DISPLAY = {
+    'anthropic': 'Anthropic',
+    'openai': 'OpenAI',
+    'mistral': 'Mistral',
+    'gemini': 'Google',
+    'perplexity': 'Perplexity',
+}
+
+# Human-readable model names
+MODEL_DISPLAY = {
+    'claude-sonnet-4-6': 'Claude Sonnet 4.6',
+    'claude-opus-4-6': 'Claude Opus 4.6',
+    'claude-haiku-4-5': 'Claude Haiku 4.5',
+    'claude-sonnet-4-20250514': 'Claude Sonnet 4',
+    'claude-3-5-sonnet-20241022': 'Claude 3.5 Sonnet',
+    'gpt-4o': 'GPT-4o',
+    'gpt-4o-mini': 'GPT-4o Mini',
+    'o1': 'o1',
+    'o1-mini': 'o1 Mini',
+    'mistral-large-latest': 'Mistral Large',
+    'mistral-small-latest': 'Mistral Small',
+    'open-mistral-nemo': 'Mistral Nemo',
+    'gemini-2.0-flash': 'Gemini 2.0 Flash',
+    'gemini-2.5-pro': 'Gemini 2.5 Pro',
+    'gemini-2.5-flash': 'Gemini 2.5 Flash',
+    'gemini-3-flash-preview': 'Gemini 3 Flash',
+    'gemini-3-pro-preview': 'Gemini 3 Pro',
+    'gemini-3.1-pro-preview': 'Gemini 3.1 Pro',
+    'gemini-2.5-flash-lite': 'Gemini 2.5 Flash Lite',
+    'gemini-1.5-pro': 'Gemini 1.5 Pro',
+    'sonar': 'Sonar',
+    'sonar-pro': 'Sonar Pro',
+    'sonar-reasoning': 'Sonar Reasoning',
+    'sonar-reasoning-pro': 'Sonar Reasoning Pro',
+    'sonar-deep-research': 'Sonar Deep Research',
+}
+
+ADAPTERS = {"anthropic": call_anthropic, "openai": call_openai, "perplexity": call_perplexity, "mistral": call_mistral, "gemini": call_gemini}
+
+# ─── STATE (see session-based state below) ────────────────────────────────────
+
+def load_models():
+    if os.path.exists(MODELS_FILE):
+        with open(MODELS_FILE) as f:
+            return json.load(f)
+    return {"providers": {}}
+
+# ─── FILE EXTRACTION ──────────────────────────────────────────────────────────
+
+def extract_file_content(raw, filename):
+    fname = filename.lower()
+    if fname.endswith('.pdf'):
+        try:
+            import PyPDF2, io
+            reader = PyPDF2.PdfReader(io.BytesIO(raw))
+            return "\n".join(p.extract_text() or "" for p in reader.pages)
+        except Exception as e:
+            return "[PDF Fehler: " + str(e) + "]"
+    if fname.endswith('.docx'):
+        try:
+            import zipfile, io
+            from xml.etree import ElementTree as ET
+            z = zipfile.ZipFile(io.BytesIO(raw))
+            xml = z.read('word/document.xml')
+            tree = ET.fromstring(xml)
+            ns = '{http://schemas.openxmlformats.org/wordprocessingml/2006/main}'
+            return ' '.join(node.text for node in tree.iter(ns+'t') if node.text)
+        except Exception as e:
+            return "[DOCX Fehler: " + str(e) + "]"
+    if fname.endswith('.xlsx'):
+        try:
+            import zipfile, io
+            from xml.etree import ElementTree as ET
+            z = zipfile.ZipFile(io.BytesIO(raw))
+            strings = []
+            if 'xl/sharedStrings.xml' in z.namelist():
+                tree = ET.fromstring(z.read('xl/sharedStrings.xml'))
+                for si in tree.iter('{http://schemas.openxmlformats.org/spreadsheetml/2006/main}t'):
+                    strings.append(si.text or '')
+            result = []
+            if 'xl/worksheets/sheet1.xml' in z.namelist():
+                tree = ET.fromstring(z.read('xl/worksheets/sheet1.xml'))
+                ns = '{http://schemas.openxmlformats.org/spreadsheetml/2006/main}'
+                for row in tree.iter(ns+'row'):
+                    vals = []
+                    for cell in row.iter(ns+'c'):
+                        v = cell.find(ns+'v')
+                        if v is not None and v.text:
+                            if cell.get('t','') == 's':
+                                vals.append(strings[int(v.text)] if int(v.text) < len(strings) else '')
+                            else:
+                                vals.append(v.text)
+                    if vals: result.append('\t'.join(vals))
+            return '\n'.join(result)
+        except Exception as e:
+            return "[XLSX Fehler: " + str(e) + "]"
+    if fname.endswith('.eml'):
+        try:
+            import email
+            msg = email.message_from_bytes(raw)
+            parts = ["Von: " + str(msg.get('From','')), "An: " + str(msg.get('To','')),
+                     "Betreff: " + str(msg.get('Subject','')), "Datum: " + str(msg.get('Date','')), ""]
+            if msg.is_multipart():
+                for part in msg.walk():
+                    if part.get_content_type() == 'text/plain':
+                        parts.append(part.get_payload(decode=True).decode('utf-8', errors='ignore'))
+            else:
+                parts.append(msg.get_payload(decode=True).decode('utf-8', errors='ignore'))
+            return '\n'.join(parts)
+        except Exception as e:
+            return "[EML Fehler: " + str(e) + "]"
+    if any(fname.endswith(ext) for ext in ['.mp4','.mov','.avi','.mkv','.mp3','.wav','.m4a']):
+        return "[Mediendatei: " + filename + " — Inhalt kann nicht als Text gelesen werden.]"
+    return raw.decode('utf-8', errors='ignore')
+
+# ─── MEMORY SYSTEM ────────────────────────────────────────────────────────────
+
+def load_index(speicher):
+    """Load session index for an agent."""
+    index_file = os.path.join(speicher, '_index.json')
+    if os.path.exists(index_file):
+        with open(index_file) as f:
+            return json.load(f)
+    return []
+
+def save_index(speicher, index):
+    """Save session index."""
+    index_file = os.path.join(speicher, '_index.json')
+    with open(index_file, 'w') as f:
+        json.dump(index, f, ensure_ascii=False, indent=2)
+
+def migrate_old_conversations(speicher):
+    """Import existing conversation files that aren't yet in the index."""
+    index = load_index(speicher)
+    indexed_files = {e.get('file','') for e in index}
+
+    conv_files = sorted([
+        f for f in os.listdir(speicher)
+        if f.startswith('konversation_') and f.endswith('.txt')
+    ])
+
+    new_entries = []
+    for fname in conv_files:
+        if fname in indexed_files:
+            continue
+        fpath = os.path.join(speicher, fname)
+        try:
+            with open(fpath) as f:
+                content = f.read()
+            # Extract date from filename: konversation_2026-03-31_15-27.txt
+            parts = fname.replace('konversation_','').replace('.txt','').split('_')
+            if len(parts) >= 2:
+                date_str = parts[0] + ' ' + parts[1].replace('-',':')
+            else:
+                date_str = fname
+            # Build a short summary from content (first 800 chars)
+            summary = "[Importiert] " + content[:400].replace('\n',' ').strip()
+            new_entries.append({
+                "date": date_str,
+                "file": fname,
+                "summary": summary,
+                "referenced_files": []
+            })
+        except:
+            pass
+
+    if new_entries:
+        # Insert old entries at beginning, sorted by date
+        combined = new_entries + index
+        save_index(speicher, combined)
+        return len(new_entries)
+    return 0
+
+def summarize_conversation(verlauf, agent_prompt):
+    """Ask Claude to summarize the current conversation in 2-3 sentences."""
+    if not verlauf or len(verlauf) < 2:
+        return None
+    try:
+        config = load_models()
+        api_key = config['providers']['anthropic']['api_key']
+        from anthropic import Anthropic
+        client = Anthropic(api_key=api_key)
+        conv_text = "\n".join(
+            ("User: " if m['role'] == 'user' else "Assistant: ") + str(m['content'])[:500]
+            for m in verlauf[-10:]  # last 10 messages max
+        )
+        r = client.messages.create(
+            model="claude-haiku-4-5-20251001",
+            max_tokens=200,
+            system="Fasse die folgende Konversation in 2-3 praezisen Saetzen zusammen. Nur die Zusammenfassung, kein Kommentar.",
+            messages=[{"role": "user", "content": conv_text}]
+        )
+        return r.content[0].text
+    except:
+        return None
+
+def close_current_session(state=None):
+    """Summarize and index the current session before switching agents."""
+    if state is None:
+        state = get_session()
+    if not state['agent'] or not state['verlauf']:
+        return
+    summary = summarize_conversation(state['verlauf'], state['system_prompt'])
+    if not summary:
+        return
+    speicher = state['speicher']
+    index = load_index(speicher)
+    entry = {
+        "date": datetime.datetime.now().strftime("%Y-%m-%d %H:%M"),
+        "file": os.path.basename(state['dateiname']) if state['dateiname'] else "",
+        "summary": summary,
+        "referenced_files": list(state['session_files'])
+    }
+    index.append(entry)
+    # Keep max 50 entries
+    if len(index) > 50:
+        index = index[-50:]
+    save_index(speicher, index)
+
+def build_memory_context(speicher, agent_name):
+    """Compact memory index - no file contents, no full conversations."""
+    index = load_index(speicher)
+    parts = [f"\n\n--- GEDAECHTNIS: {agent_name.upper()} ---"]
+
+    # Instructions for memory access
+    parts.append("""
+Du hast Zugriff auf ein persistentes Gedaechtnis mit vergangenen Konversationen und Dateien.
+Um Inhalte zu laden: schreibe "Memory Folder Suche [Stichwort]" in deiner Nachricht.
+""")
+
+    # Compact session index - titles only, no content
+    if index:
+        parts.append("VERGANGENE SESSIONS (neueste zuerst):")
+        for entry in reversed(index[-10:]):
+            date = entry.get('date', '')
+            summary = entry.get('summary', '')
+            # Only first line, max 80 chars
+            title = summary.strip().split('\n')[0][:80] if summary.strip() else entry.get('file', '')
+            parts.append(f"  • {date}: {title}")
+
+    # List memory files - names only, no content
+    memory_dir = os.path.join(speicher, 'memory')
+    if os.path.exists(memory_dir):
+        # Exclude binary/image files from listing
+        text_exts = {'.txt', '.docx', '.pdf', '.xlsx', '.csv', '.json', '.md', '.eml'}
+        image_exts = {'.png', '.jpg', '.jpeg', '.gif', '.webp', '.bmp'}
+        
+        all_files = sorted(
+            os.listdir(memory_dir),
+            key=lambda f: os.path.getmtime(os.path.join(memory_dir, f)),
+            reverse=True
+        )
+        
+        doc_files = [f for f in all_files if any(f.lower().endswith(e) for e in text_exts)][:10]
+        img_files = [f for f in all_files if any(f.lower().endswith(e) for e in image_exts)][:5]
+        
+        if doc_files:
+            parts.append(f"\nDOKUMENTE IM MEMORY ({len(doc_files)} neueste):")
+            for f in doc_files:
+                parts.append(f"  - {f}")
+        
+        if img_files:
+            parts.append(f"\nBILDER IM MEMORY ({len(img_files)}):")
+            for f in img_files:
+                parts.append(f"  - {f}")
+
+    # Memory-Suche Instruktion
+    parts.append("""
+## Memory-Suche
+Du kannst dein Memory gezielt durchsuchen. Schreibe dazu in deiner Antwort:
+MEMORY_SEARCH: {"query": "Suchbegriff", "date_from": "YYYY-MM-DD", "date_to": "YYYY-MM-DD", "direction": "IN/OUT", "contact": "email-oder-name"}
+Alle Felder ausser query sind optional.
+Wenn der User nach E-Mails, Dokumenten oder vergangenen Informationen fragt, nutze MEMORY_SEARCH bevor du antwortest.
+Expliziter Befehl vom User: /search [suchbegriff]
+
+Beispiele:
+- MEMORY_SEARCH: {"query": "ExFlow Rechnungen", "date_from": "2026-01-01"}
+- MEMORY_SEARCH: {"query": "Onboarding", "direction": "IN", "contact": "thomas"}
+""")
+
+    parts.append("\n--- ENDE GEDAECHTNIS ---")
+    return '\n'.join(parts)
+
+
+def ensure_output_dir():
+    os.makedirs(OUTPUT_DIR, exist_ok=True)
+    return OUTPUT_DIR
+
+def create_docx_from_spec(spec):
+    from docx import Document
+    from docx.shared import Pt, RGBColor
+    doc = Document()
+    title = spec.get('title', 'Dokument')
+    doc.add_heading(title, 0)
+    for item in spec.get('content', []):
+        t = item.get('type', 'paragraph')
+        text = item.get('text', '')
+        if t == 'heading':
+            doc.add_heading(text, level=item.get('level', 1))
+        elif t == 'paragraph':
+            doc.add_paragraph(text)
+        elif t == 'bullet':
+            doc.add_paragraph(text, style='List Bullet')
+        elif t == 'table':
+            rows = item.get('rows', [])
+            if rows:
+                table = doc.add_table(rows=len(rows), cols=len(rows[0]))
+                table.style = 'Table Grid'
+                for i, row in enumerate(rows):
+                    for j, cell_text in enumerate(row):
+                        table.cell(i, j).text = str(cell_text)
+    fname = title.replace(' ', '_').replace('/', '_')[:50] + '.docx'
+    fpath = os.path.join(ensure_output_dir(), fname)
+    doc.save(fpath)
+    return fname, fpath
+
+def create_xlsx_from_spec(spec):
+    import openpyxl
+    from openpyxl.styles import Font, PatternFill, Alignment
+    wb = openpyxl.Workbook()
+    title = spec.get('title', 'Tabelle')
+    sheets = spec.get('sheets', [{'name': 'Sheet1', 'rows': spec.get('rows', [])}])
+    wb.remove(wb.active)
+    for sheet_spec in sheets:
+        ws = wb.create_sheet(sheet_spec.get('name', 'Sheet'))
+        rows = sheet_spec.get('rows', [])
+        for i, row in enumerate(rows):
+            for j, val in enumerate(row):
+                cell = ws.cell(row=i+1, column=j+1, value=val)
+                if i == 0:  # Header row bold
+                    cell.font = Font(bold=True)
+                    cell.fill = PatternFill(start_color='2D3A2D', end_color='2D3A2D', fill_type='solid')
+                    cell.font = Font(bold=True, color='F0F0F0')
+    fname = title.replace(' ', '_').replace('/', '_')[:50] + '.xlsx'
+    fpath = os.path.join(ensure_output_dir(), fname)
+    wb.save(fpath)
+    return fname, fpath
+
+def create_pdf_from_spec(spec):
+    from reportlab.lib.pagesizes import A4
+    from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+    from reportlab.lib.units import cm
+    from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle
+    from reportlab.lib import colors
+    title = spec.get('title', 'Dokument')
+    fname = title.replace(' ', '_').replace('/', '_')[:50] + '.pdf'
+    fpath = os.path.join(ensure_output_dir(), fname)
+    doc = SimpleDocTemplate(fpath, pagesize=A4,
+                            rightMargin=2*cm, leftMargin=2*cm,
+                            topMargin=2*cm, bottomMargin=2*cm)
+    styles = getSampleStyleSheet()
+    story = []
+    story.append(Paragraph(title, styles['Title']))
+    story.append(Spacer(1, 0.5*cm))
+    for item in spec.get('content', []):
+        t = item.get('type', 'paragraph')
+        text = item.get('text', '')
+        if t == 'heading':
+            level = item.get('level', 1)
+            style = styles['Heading' + str(min(level, 3))]
+            story.append(Paragraph(text, style))
+        elif t == 'paragraph':
+            story.append(Paragraph(text, styles['Normal']))
+            story.append(Spacer(1, 0.3*cm))
+        elif t == 'bullet':
+            story.append(Paragraph('• ' + text, styles['Normal']))
+        elif t == 'table':
+            rows = item.get('rows', [])
+            if rows:
+                t_obj = Table(rows)
+                t_obj.setStyle(TableStyle([
+                    ('BACKGROUND', (0,0), (-1,0), colors.HexColor('#2D3A2D')),
+                    ('TEXTCOLOR', (0,0), (-1,0), colors.white),
+                    ('FONTNAME', (0,0), (-1,0), 'Helvetica-Bold'),
+                    ('GRID', (0,0), (-1,-1), 0.5, colors.grey),
+                    ('ROWBACKGROUNDS', (0,1), (-1,-1), [colors.white, colors.HexColor('#F5F5F5')]),
+                ]))
+                story.append(t_obj)
+                story.append(Spacer(1, 0.3*cm))
+    doc.build(story)
+    return fname, fpath
+
+def create_pptx_from_spec(spec):
+    from pptx import Presentation
+    from pptx.util import Inches, Pt, Emu
+    from pptx.dml.color import RGBColor
+    from pptx.enum.text import PP_ALIGN
+
+    prs = Presentation()
+    title_str = spec.get('title', 'Praesentation')
+
+    # Dark theme colors
+    BG_COLOR    = RGBColor(0x1a, 0x1a, 0x1a)
+    GOLD_COLOR  = RGBColor(0xf0, 0xc0, 0x60)
+    WHITE_COLOR = RGBColor(0xf0, 0xf0, 0xf0)
+    GRAY_COLOR  = RGBColor(0x88, 0x88, 0x88)
+
+    slide_width  = prs.slide_width
+    slide_height = prs.slide_height
+
+    def set_bg(slide):
+        from pptx.oxml.ns import qn
+        from lxml import etree
+        background = slide.background
+        fill = background.fill
+        fill.solid()
+        fill.fore_color.rgb = BG_COLOR
+
+    def add_textbox(slide, text, left, top, width, height,
+                    size=18, bold=False, color=WHITE_COLOR, align=PP_ALIGN.LEFT):
+        txBox = slide.shapes.add_textbox(left, top, width, height)
+        tf = txBox.text_frame
+        tf.word_wrap = True
+        p = tf.paragraphs[0]
+        p.alignment = align
+        run = p.add_run()
+        run.text = text
+        run.font.size = Pt(size)
+        run.font.bold = bold
+        run.font.color.rgb = color
+        return txBox
+
+    slides_spec = spec.get('slides', [])
+
+    for i, slide_spec in enumerate(slides_spec):
+        layout = prs.slide_layouts[6]  # blank
+        slide = prs.slides.add_slide(layout)
+        set_bg(slide)
+
+        stype   = slide_spec.get('type', 'content')
+        heading = slide_spec.get('heading', '')
+        body    = slide_spec.get('body', '')
+        bullets = slide_spec.get('bullets', [])
+        footer  = slide_spec.get('footer', '')
+
+        margin  = Inches(0.5)
+        w       = slide_width - 2 * margin
+
+        if stype == 'title':
+            # Big title slide
+            add_textbox(slide, title_str,
+                        margin, Inches(1.8), w, Inches(1.2),
+                        size=36, bold=True, color=WHITE_COLOR, align=PP_ALIGN.CENTER)
+            if heading:
+                add_textbox(slide, heading,
+                            margin, Inches(3.2), w, Inches(0.8),
+                            size=22, color=GOLD_COLOR, align=PP_ALIGN.CENTER)
+            # Gold rule
+            from pptx.util import Pt as PtU
+            line = slide.shapes.add_shape(
+                1, margin, Inches(3.0), w, Emu(40000))
+            line.fill.solid()
+            line.fill.fore_color.rgb = GOLD_COLOR
+            line.line.fill.background()
+        else:
+            # Heading bar
+            bar = slide.shapes.add_shape(
+                1, 0, 0, slide_width, Inches(0.95))
+            bar.fill.solid()
+            bar.fill.fore_color.rgb = RGBColor(0x2d, 0x3a, 0x2d)
+            bar.line.fill.background()
+
+            if heading:
+                add_textbox(slide, heading,
+                            margin, Emu(120000), w, Inches(0.75),
+                            size=24, bold=True, color=WHITE_COLOR)
+
+            y = Inches(1.1)
+
+            if body:
+                add_textbox(slide, body,
+                            margin, y, w, Inches(1.2),
+                            size=16, color=WHITE_COLOR)
+                y += Inches(1.3)
+
+            for bullet in bullets:
+                add_textbox(slide, '– ' + bullet,
+                            margin + Inches(0.2), y, w - Inches(0.2), Inches(0.5),
+                            size=15, color=RGBColor(0xd0, 0xd0, 0xd0))
+                y += Inches(0.52)
+
+        # Slide number
+        add_textbox(slide, str(i + 1),
+                    slide_width - Inches(0.8), slide_height - Inches(0.4),
+                    Inches(0.6), Inches(0.3),
+                    size=10, color=GRAY_COLOR, align=PP_ALIGN.RIGHT)
+
+        if footer:
+            add_textbox(slide, footer,
+                        margin, slide_height - Inches(0.4), w, Inches(0.3),
+                        size=10, color=GRAY_COLOR)
+
+    fname = title_str.replace(' ', '_').replace('/', '_')[:50] + '.pptx'
+    fpath = os.path.join(ensure_output_dir(), fname)
+    prs.save(fpath)
+    return fname, fpath
+
+def send_email_draft(spec):
+    import subprocess
+    to      = spec.get('to', '')
+    subject = spec.get('subject', '')
+    body    = spec.get('body', '')
+    cc      = spec.get('cc', '')
+
+    # Escape for AppleScript - handle all special chars
+    def esc(s):
+        s = s.replace('\\', '\\\\')
+        s = s.replace('"', '\\"')
+        s = s.replace('\n', '\\n')
+        s = s.replace('\r', '')
+        return s
+
+    cc_line = f'\n        make new cc recipient at end of cc recipients with properties {{address:\"{esc(cc)}\"}}' if cc else ''
+
+    script = f'''tell application "Mail"
+    set newMessage to make new outgoing message with properties {{subject:"{esc(subject)}", content:"{esc(body)}", visible:true}}
+    tell newMessage
+        make new to recipient at end of to recipients with properties {{address:"{esc(to)}"}}{cc_line}
+    end tell
+    activate
+end tell'''
+
+    result = subprocess.run(['osascript', '-e', script],
+                          capture_output=True, text=True, timeout=10)
+    if result.returncode != 0:
+        raise Exception(f"AppleScript Fehler: {result.stderr.strip()}")
+    return True
+
+def send_whatsapp_draft(spec, agent_name=None):
+    """Opens WhatsApp with a pre-filled message. Looks up phone in contacts.json, then macOS Contacts."""
+    import subprocess
+    import urllib.parse
+
+    to_name = spec.get('to', '')
+    message = spec.get('message', '')
+    phone = spec.get('phone', '')  # Optional direct phone
+
+    # Step 1: Look up in agent's contacts.json
+    if not phone and to_name and agent_name:
+        parent = agent_name.split('_')[0] if '_' in agent_name else agent_name
+        contacts_path = os.path.join(BASE, parent, "memory", "contacts.json")
+        if os.path.exists(contacts_path):
+            try:
+                with open(contacts_path) as f:
+                    cdata = json.load(f)
+                to_lower = to_name.lower()
+                for c in cdata.get('contacts', []):
+                    cname = (c.get('name') or '').lower()
+                    if to_lower in cname or cname in to_lower:
+                        if c.get('phone'):
+                            phone = c['phone']
+                            break
+            except Exception:
+                pass
+
+    # Step 2: Look up in ALL agents' contacts.json files (cross-agent)
+    if not phone and to_name:
+        try:
+            to_lower = to_name.lower()
+            for agent_dir in os.listdir(BASE):
+                cpath = os.path.join(BASE, agent_dir, "memory", "contacts.json")
+                if os.path.isfile(cpath):
+                    try:
+                        with open(cpath) as f:
+                            cdata = json.load(f)
+                        for c in cdata.get('contacts', []):
+                            cname = (c.get('name') or '').lower()
+                            if to_lower in cname or cname in to_lower:
+                                if c.get('phone'):
+                                    phone = c['phone']
+                                    break
+                    except Exception:
+                        continue
+                if phone:
+                    break
+        except Exception:
+            pass
+
+    # Step 3: Look up in macOS Contacts app via AppleScript
+    if not phone and to_name:
+        try:
+            script = f"""
+            tell application "Contacts"
+                set matchedPeople to every person whose name contains "{to_name}"
+                if (count of matchedPeople) > 0 then
+                    set thePerson to item 1 of matchedPeople
+                    set thePhones to phones of thePerson
+                    if (count of thePhones) > 0 then
+                        set theNumber to value of item 1 of thePhones
+                        return theNumber
+                    end if
+                end if
+                return ""
+            end tell
+            """
+            result = subprocess.run(
+                ['osascript', '-e', script],
+                capture_output=True, text=True, timeout=10
+            )
+            found_phone = result.stdout.strip()
+            if found_phone:
+                phone = found_phone
+        except Exception:
+            pass
+
+    if not phone:
+        # Fallback: copy message to clipboard and just open WhatsApp
+        if message:
+            subprocess.run(['pbcopy'], input=message.encode('utf-8'), timeout=5)
+        subprocess.run(['open', '-a', 'WhatsApp'], capture_output=True, text=True, timeout=10)
+        return to_name, None  # None signals clipboard fallback
+
+    # Normalize phone: remove spaces, dashes, dots, leading +
+    phone_clean = re.sub(r'[\s./-]', '', phone).lstrip('+')
+
+    encoded_msg = urllib.parse.quote(message)
+    whatsapp_url = f"whatsapp://send?phone={phone_clean}&text={encoded_msg}"
+
+    result = subprocess.run(['open', whatsapp_url], capture_output=True, text=True, timeout=10)
+    if result.returncode != 0:
+        raise Exception(f"WhatsApp konnte nicht geoeffnet werden: {result.stderr.strip()}")
+    return to_name, phone
+
+
+def send_slack_draft(spec):
+    """SLACK_API_V1: Sendet Slack-Nachricht via API wenn Bot-Token vorhanden,
+    sonst Fallback auf Desktop-App + Clipboard.
+    """
+    import subprocess
+
+    channel = spec.get('channel', '')
+    to = spec.get('to', '')
+    message = spec.get('message', '')
+    if not message:
+        raise Exception("Slack: Kein Nachrichtentext angegeben")
+    if not channel and not to:
+        raise Exception("Slack: Weder 'channel' noch 'to' angegeben")
+
+    target = channel or to
+
+    # Versuch 1: Slack API (wenn Bot-Token konfiguriert)
+    sc = _get_slack_config() if '_get_slack_config' in dir() or True else None
+    try:
+        sc = _get_slack_config()
+    except Exception:
+        sc = None
+    if sc:
+        # Channel/User-ID aufloesen
+        resolved = target
+        if target.startswith('#'):
+            ch_id = slack_find_channel_id(target)
+            if ch_id:
+                resolved = ch_id
+        elif not target.startswith(('C', 'U', 'D', 'G')):
+            # Kein Channel-Prefix → vermutlich Personenname
+            uid = slack_find_user_id(target)
+            if uid:
+                # DM Channel oeffnen
+                ok, dm_data = _slack_api('conversations.open', json_body={'users': uid})
+                if ok and dm_data.get('channel', {}).get('id'):
+                    resolved = dm_data['channel']['id']
+        ok, resp = slack_send_message(resolved, message)
+        if ok:
+            print(f"[SLACK API] Nachricht gesendet an {target}", flush=True)
+            return target, False  # clipboard_only=False, erfolgreich via API
+        else:
+            print(f"[SLACK API] Fehler: {resp.get('error', '?')} — Fallback auf Desktop", flush=True)
+
+    # Fallback: Desktop-App + Clipboard (alter Mechanismus)
+    subprocess.run(['pbcopy'], input=message.encode('utf-8'), timeout=5)
+    subprocess.run(['open', '-a', 'Slack'], capture_output=True, text=True, timeout=10)
+    script = '''
+delay 1.5
+tell application "System Events"
+    tell process "Slack"
+        set frontmost to true
+        delay 0.3
+        keystroke "v" using command down
+    end tell
+end tell'''
+    result = subprocess.run(['osascript', '-e', script],
+                          capture_output=True, text=True, timeout=10)
+    if result.returncode != 0:
+        return target, True
+    return target, False
+
+
+BASE = os.path.expanduser("~/Library/Mobile Documents/com~apple~CloudDocs/Downloads shared/claude_datalake")
+AGENTS_DIR = os.path.join(BASE, "config/agents")
+MODELS_FILE = os.path.join(BASE, "config/models.json")
+SUBAGENT_KEYWORDS_FILE = os.path.join(BASE, "config/subagent_keywords.json")
+
+# ─── SUB-AGENT DELEGATION ────────────────────────────────────────────────────
+
+_DELEGATION_ACTIONS = {
+    'nutze', 'benutze', 'verwende', 'delegiere', 'frag',
+    'use', 'delegate', 'ask', 'using',
+    'usa', 'delega', 'pergunta',
+}
+_DELEGATION_PHRASES = [
+    'übergib an', 'uebergib an', 'schick das an', 'das soll', 'mit dem',
+    'lass den', 'lass die',
+    'send to', 'switch to', 'hand off', 'let the', 'with the',
+    'manda para', 'deixa o', 'deixa a',
+]
+_DELEGATION_OBJECTS = {
+    'sub-agent', 'subagent', 'sub agent', 'agent', 'spezialist',
+    'specialist', 'spezialisten', 'assistente', 'assistenten',
+}
+
+
+def _load_subagent_keywords():
+    """Load keyword mapping from config file."""
+    if os.path.exists(SUBAGENT_KEYWORDS_FILE):
+        try:
+            with open(SUBAGENT_KEYWORDS_FILE) as f:
+                return json.load(f)
+        except Exception:
+            pass
+    return {}
+
+
+def _levenshtein(s1, s2):
+    """Simple Levenshtein distance."""
+    if len(s1) < len(s2):
+        return _levenshtein(s2, s1)
+    if len(s2) == 0:
+        return len(s1)
+    prev = range(len(s2) + 1)
+    for i, c1 in enumerate(s1):
+        curr = [i + 1]
+        for j, c2 in enumerate(s2):
+            curr.append(min(prev[j + 1] + 1, curr[j] + 1, prev[j] + (c1 != c2)))
+        prev = curr
+    return prev[-1]
+
+
+def _get_available_subagents(parent_name):
+    """Get list of sub-agent names for a parent."""
+    if not os.path.exists(AGENTS_DIR):
+        return []
+    result = []
+    prefix = parent_name + '_'
+    for fname in os.listdir(AGENTS_DIR):
+        if fname.endswith('.txt') and fname.startswith(prefix):
+            full_name = fname[:-4]
+            sub_label = full_name[len(prefix):]
+            result.append({'full_name': full_name, 'sub_label': sub_label})
+    return result
+
+
+def detect_delegation(msg, current_agent):
+    """Detect if user wants to delegate to a sub-agent.
+    Returns dict with full_name, score, matched_keywords — or None."""
+    msg_lower = msg.lower()
+    parent = get_parent_agent(current_agent) or current_agent
+
+    words = msg_lower.split()
+    has_action = any(w.rstrip('.,;:!?') in _DELEGATION_ACTIONS for w in words)
+    if not has_action:
+        has_action = any(phrase in msg_lower for phrase in _DELEGATION_PHRASES)
+    if not has_action:
+        return None
+
+    subs = _get_available_subagents(parent)
+    if not subs:
+        return None
+
+    kw_map = _load_subagent_keywords()
+    best_match = None
+    best_score = 0
+    best_keywords = []
+
+    for sub in subs:
+        sub_label = sub['sub_label']
+        score = 0
+        matched_kws = []
+
+        # 1. Exact match
+        if sub_label in msg_lower:
+            score = 100
+            matched_kws.append(sub_label)
+
+        # 2. Keyword match from config
+        if score == 0 and sub_label in kw_map:
+            for kw in kw_map[sub_label]:
+                if kw.lower() in msg_lower:
+                    score = max(score, 50)
+                    matched_kws.append(kw)
+
+        # 3. Partial / fuzzy match
+        if score == 0:
+            for w in words:
+                w_clean = w.rstrip('.,;:!?')
+                if len(w_clean) < 3:
+                    continue
+                if w_clean in sub_label or sub_label in w_clean:
+                    score = max(score, 30)
+                    matched_kws.append(w_clean)
+                dist = _levenshtein(w_clean, sub_label)
+                if dist <= 2 and len(sub_label) > 3:
+                    score = max(score, 40 - dist * 10)
+                    matched_kws.append(w_clean)
+
+        if score > best_score:
+            best_score = score
+            best_match = sub['full_name']
+            best_keywords = matched_kws[:]
+
+    if best_score > 0:
+        return {
+            'full_name': best_match,
+            'score': best_score,
+            'matched_keywords': list(set(best_keywords)),
+            'display_name': get_agent_display_name(best_match),
+        }
+    return None
+
+
+def execute_delegation(sub_agent_name, original_msg, kontext_items, state=None):
+    if state is None:
+        state = get_session()
+    """Execute a delegated call to a sub-agent. Returns result dict."""
+    prompt_file = os.path.join(AGENTS_DIR, sub_agent_name + '.txt')
+    if not os.path.exists(prompt_file):
+        return {'error': f'Sub-Agent "{sub_agent_name}" nicht gefunden'}
+
+    with open(prompt_file) as f:
+        sub_prompt = f.read()
+    for marker in ['\n\n--- GEDAECHTNIS:', '\n--- GEDAECHTNIS:',
+                   '\n\n--- DATEI-ERSTELLUNG ---', '\n--- DATEI-ERSTELLUNG ---',
+                   '\n\n--- WEITERE FAEHIGKEITEN ---']:
+        sub_prompt = sub_prompt.split(marker)[0]
+    sub_prompt = sub_prompt.strip()
+
+    speicher = get_agent_speicher(sub_agent_name)
+    display_name = get_agent_display_name(sub_agent_name)
+    memory_ctx = build_memory_context(speicher, display_name)
+
+    # Reuse file capability from current system prompt
+    current_sp = state.get('system_prompt', '')
+    cap_start = current_sp.find('\n--- DATEI-ERSTELLUNG ---')
+    cap_end = current_sp.find('--- ENDE DATEI-ERSTELLUNG ---')
+    if cap_start > -1 and cap_end > -1:
+        file_cap_block = current_sp[cap_start:cap_end + len('--- ENDE DATEI-ERSTELLUNG ---')]
+        full_sub_prompt = sub_prompt + memory_ctx + file_cap_block
+    else:
+        full_sub_prompt = sub_prompt + memory_ctx
+
+    # Last 5 messages as context
+    recent_history = state['verlauf'][-5:] if state['verlauf'] else []
+
+    # Build context from kontext_items
+    text_ctx = ''
+    if kontext_items:
+        text_ctx = '\n\n--- KONTEXT ---\n'
+        for item in kontext_items:
+            if not item.get('image_b64'):
+                text_ctx += '\n[' + item['name'] + ']:\n' + item['content'][:10000] + '\n'
+        text_ctx += '\n--- ENDE KONTEXT ---\n'
+
+    full_msg = original_msg + text_ctx if text_ctx else original_msg
+    sub_messages = list(recent_history) + [{'role': 'user', 'content': full_msg}]
+
+    config = load_models()
+    provider_key = state.get('provider', 'anthropic')
+    model_id = state.get('model_id', 'claude-sonnet-4-6')
+    provider_cfg = config['providers'].get(provider_key, {})
+    api_key = provider_cfg.get('api_key', '')
+    model_name = next((m['name'] for m in provider_cfg.get('models', []) if m['id'] == model_id), model_id)
+    adapter = ADAPTERS.get(provider_key)
+    if not adapter:
+        return {'error': 'Unbekannter Anbieter: ' + provider_key}
+
+    text = adapter(api_key, model_id, full_sub_prompt, sub_messages)
+    response_text = '\U0001f916 ' + display_name + ' uebernimmt:\n\n' + text
+
+    return {
+        'response': response_text,
+        'model_name': model_name,
+        'provider_display': PROVIDER_DISPLAY.get(provider_key, provider_key),
+        'model_display': MODEL_DISPLAY.get(model_id, model_name),
+        'delegated_to': sub_agent_name,
+        'delegated_display': display_name,
+    }
+
+
+app = Flask(__name__)
+
+def cleanup_agent_files():
+    """Clean old memory content from agent txt files on startup."""
+    STRIP_MARKERS = [
+        "--- GEDAECHTNIS:", "--- DATEI-ERSTELLUNG ---",
+        "--- WEITERE FAEHIGKEITEN ---", "VERGANGENE KONVERSATIONEN:",
+        "GESPEICHERTE DATEIEN IM MEMORY", "Von: ", "An: ", "Betreff: ",
+    ]
+    if not os.path.exists(AGENTS_DIR):
+        return
+    for fname in os.listdir(AGENTS_DIR):
+        if not fname.endswith('.txt'):
+            continue
+        fpath = os.path.join(AGENTS_DIR, fname)
+        try:
+            with open(fpath, 'r', errors='ignore') as f:
+                raw = f.read()
+            cut = len(raw)
+            for marker in STRIP_MARKERS:
+                pos = raw.find(marker)
+                if 0 < pos < cut:
+                    cut = pos
+            clean = raw[:cut].strip()
+            if len(clean) < len(raw) - 10:
+                with open(fpath, 'w') as f:
+                    f.write(clean)
+                print(f"Cleaned: {fname}")
+        except Exception as e:
+            print(f"Cleanup error {fname}: {e}")
+
+cleanup_agent_files()
+
+# ─── PROVIDER ADAPTERS ────────────────────────────────────────────────────────
+
+def call_anthropic(api_key, model_id, system_prompt, messages):
+    from anthropic import Anthropic
+    client = Anthropic(api_key=api_key)
+    r = client.messages.create(model=model_id, max_tokens=4096, system=system_prompt, messages=messages)
+    return r.content[0].text
+
+def call_openai(api_key, model_id, system_prompt, messages):
+    import openai
+    client = openai.OpenAI(api_key=api_key)
+    oai_messages = [{"role": "system", "content": system_prompt}] + messages
+    r = client.chat.completions.create(model=model_id, messages=oai_messages, max_tokens=4096)
+    return r.choices[0].message.content
+
+def call_perplexity(api_key, model_id, system_prompt, messages):
+    import requests as _pplx_req
+    from requests.exceptions import ReadTimeout, ConnectionError as ReqConnectionError
+
+    # Perplexity requires strictly alternating user/assistant messages after system.
+    # Merge consecutive same-role messages to enforce this.
+    raw_msgs = list(messages)
+    # Remove empty messages
+    raw_msgs = [m for m in raw_msgs if m.get('content')]
+    # Flatten list-type content (vision messages) to text
+    for m in raw_msgs:
+        if isinstance(m.get('content'), list):
+            m = dict(m)
+            m['content'] = ' '.join(
+                p.get('text', '') for p in m['content']
+                if isinstance(p, dict) and p.get('type') == 'text'
+            )
+    # Merge consecutive same-role messages
+    merged = []
+    for m in raw_msgs:
+        content_text = m.get('content', '')
+        if isinstance(content_text, list):
+            content_text = ' '.join(
+                p.get('text', '') for p in content_text
+                if isinstance(p, dict) and p.get('type') == 'text'
+            )
+        if not content_text or not content_text.strip():
+            continue
+        if merged and merged[-1]['role'] == m['role']:
+            merged[-1]['content'] += '\n\n' + content_text
+        else:
+            merged.append({'role': m['role'], 'content': content_text})
+    # Ensure first non-system message is 'user' (Perplexity requirement)
+    if merged and merged[0]['role'] != 'user':
+        merged.insert(0, {'role': 'user', 'content': '.'})
+    # Ensure last message is 'user' (Perplexity sends to model for completion)
+    if merged and merged[-1]['role'] != 'user':
+        merged.append({'role': 'user', 'content': '.'})
+    pplx_messages = [{"role": "system", "content": system_prompt}] + merged
+    headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
+    payload = {"model": model_id, "messages": pplx_messages, "max_tokens": 8000}
+
+    # Model-specific timeouts (connect_timeout, read_timeout)
+    PERPLEXITY_TIMEOUTS = {
+        'sonar-deep-research': (10, 300),   # Deep Research: bis zu 5 Min
+        'sonar-reasoning-pro': (10, 180),   # Reasoning Pro: bis zu 3 Min
+        'sonar-reasoning': (10, 180),       # Reasoning: bis zu 3 Min
+        'sonar-pro': (10, 120),             # Sonar Pro: 2 Min
+        'sonar': (10, 120),                 # Sonar: 2 Min
+    }
+    timeout = PERPLEXITY_TIMEOUTS.get(model_id, (10, 120))
+
+    MODEL_LABELS = {
+        'sonar-deep-research': 'Sonar Deep Research',
+        'sonar-reasoning-pro': 'Sonar Reasoning Pro',
+        'sonar-reasoning': 'Sonar Reasoning',
+        'sonar-pro': 'Sonar Pro',
+        'sonar': 'Sonar',
+    }
+    model_label = MODEL_LABELS.get(model_id, model_id)
+
+    try:
+        resp = _pplx_req.post(
+            "https://api.perplexity.ai/chat/completions",
+            headers=headers, json=payload, timeout=timeout
+        )
+    except ReadTimeout:
+        raise Exception(
+            f"Perplexity {model_label} hat zu lange gebraucht (Timeout nach {timeout[1]}s). "
+            f"Versuche es erneut oder waehle ein schnelleres Modell."
+        )
+    except ReqConnectionError:
+        raise Exception(
+            f"Verbindung zu Perplexity fehlgeschlagen. Pruefe deine Internetverbindung."
+        )
+
+    data = resp.json()
+    if resp.status_code != 200:
+        raise Exception(f"Perplexity API Fehler: {data.get('error', {}).get('message', str(data))}")
+    text = data["choices"][0]["message"]["content"]
+    # Append citations as clickable Markdown links if present
+    citations = data.get("citations")
+    if citations and isinstance(citations, list) and len(citations) > 0:
+        text += "\n\n**Quellen:**\n"
+        for i, url in enumerate(citations, 1):
+            try:
+                from urllib.parse import urlparse
+                domain = urlparse(url).netloc.replace("www.", "")
+            except Exception:
+                domain = url[:60]
+            text += f"[{i}] [{domain}]({url})\n"
+    return text
+
+def call_mistral(api_key, model_id, system_prompt, messages):
+    headers = {"Authorization": "Bearer " + api_key, "Content-Type": "application/json"}
+    mistral_messages = [{"role": "system", "content": system_prompt}] + messages
+    payload = {"model": model_id, "messages": mistral_messages, "max_tokens": 4096}
+    r = requests.post("https://api.mistral.ai/v1/chat/completions", headers=headers, json=payload, timeout=60)
+    return r.json()["choices"][0]["message"]["content"]
+
+def call_gemini(api_key, model_id, system_prompt, messages):
+    """Gemini via REST API (kein SDK noetig)."""
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/{model_id}:generateContent?key={api_key}"
+    contents = []
+    for m in messages:
+        role = 'user' if m['role'] == 'user' else 'model'
+        c = m['content']
+        if isinstance(c, list):
+            parts = []
+            for item in c:
+                if item.get('type') == 'text':
+                    parts.append({'text': item['text']})
+                elif item.get('type') == 'image':
+                    parts.append({'inline_data': {'mime_type': item['source']['media_type'], 'data': item['source']['data']}})
+            contents.append({'role': role, 'parts': parts})
+        else:
+            contents.append({'role': role, 'parts': [{'text': str(c)}]})
+    payload = {'contents': contents, 'generationConfig': {'maxOutputTokens': 4096}}
+    if system_prompt:
+        payload['systemInstruction'] = {'parts': [{'text': system_prompt}]}
+    try:
+        r = requests.post(url, json=payload, timeout=120)
+        data = r.json()
+        if r.status_code != 200:
+            err_msg = data.get('error', {}).get('message', str(data))
+            if '429' in str(r.status_code) or 'quota' in err_msg.lower() or 'rate' in err_msg.lower():
+                return ("Gemini Rate Limit erreicht. Entweder kurz warten "
+                        "oder auf bezahlten API Plan upgraden: "
+                        "https://ai.google.dev/pricing")
+            raise Exception(f"Gemini API Fehler ({r.status_code}): " + err_msg)
+        parts = data['candidates'][0]['content'].get('parts', [])
+        return ''.join(p.get('text', '') for p in parts)
+    except requests.exceptions.Timeout:
+        raise Exception("Gemini API Timeout (120s)")
+
+ADAPTERS = {"anthropic": call_anthropic, "openai": call_openai, "perplexity": call_perplexity, "mistral": call_mistral, "gemini": call_gemini}
+
+# ─── IMAGE & VIDEO GENERATION ────────────────────────────────────────────────
+
+OUTPUT_DIR = os.path.expanduser("~/Library/Mobile Documents/com~apple~CloudDocs/Downloads shared/claude_outputs")
+
+# Provider -> Image support mapping
+IMAGE_PROVIDERS = {
+    "openai": "gpt-image-1",
+    "gemini": "imagen-4.0-generate-001",
+}
+VIDEO_PROVIDERS = {
+    "gemini": "veo-3.1-generate-preview",
+}
+
+# Capability-Tags fuer Model-Dropdown
+MODEL_CAPABILITIES = {
+    "gemini-2.5-flash": ["video", "image"],
+    "gemini-2.5-pro": ["reasoning", "video", "image"],
+    "gemini-3-flash-preview": ["video", "image"],
+    "gemini-3-pro-preview": ["reasoning", "video", "image"],
+    "gemini-3.1-pro-preview": ["reasoning", "video", "image"],
+    "gemini-2.0-flash": ["video", "image"],
+    "gpt-4o": ["image"],
+    "gpt-image-1": ["image"],
+    "o1": ["reasoning"],
+    "sonar-deep-research": ["reasoning"],
+    "sonar-reasoning-pro": ["reasoning"],
+    "sonar-reasoning": ["reasoning"],
+}
+CAPABILITY_EMOJI = {"video": "\U0001f3ac", "image": "\U0001f5bc\ufe0f", "reasoning": "\U0001f9e0"}
+
+
+def _generate_image_single(prompt, fpath, provider_key, api_key):
+    """Try generating an image with a single provider. Returns True on success."""
+    import base64 as _b64
+
+    if provider_key == 'openai':
+        r = requests.post("https://api.openai.com/v1/images/generations",
+            headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
+            json={"model": "gpt-image-1", "prompt": prompt, "size": "1024x1024",
+                  "quality": "medium", "output_format": "png"},
+            timeout=120)
+        data = r.json()
+        if r.status_code != 200:
+            raise Exception(f"OpenAI: {data.get('error', {}).get('message', str(data))}")
+        with open(fpath, 'wb') as f:
+            f.write(_b64.b64decode(data['data'][0]['b64_json']))
+        return True
+
+    elif provider_key == 'gemini':
+        # Gemini Bildgenerierung: Imagen 4 zuerst (predict API), dann Gemini-Native Fallbacks
+        import base64 as _img_b64
+
+        # Versuch 1: Imagen 4 (beste Qualitaet, predict API)
+        imagen_models = ["imagen-4.0-generate-001", "imagen-4.0-fast-generate-001"]
+        for imodel in imagen_models:
+            try:
+                url = f"https://generativelanguage.googleapis.com/v1beta/models/{imodel}:predict?key={api_key}"
+                r = requests.post(url,
+                    headers={"Content-Type": "application/json"},
+                    json={
+                        "instances": [{"prompt": prompt}],
+                        "parameters": {"sampleCount": 1, "aspectRatio": "1:1"}
+                    },
+                    timeout=120)
+                data = r.json()
+                if r.status_code == 200:
+                    predictions = data.get('predictions', [])
+                    if predictions and predictions[0].get('bytesBase64Encoded'):
+                        with open(fpath, 'wb') as f:
+                            f.write(_img_b64.b64decode(predictions[0]['bytesBase64Encoded']))
+                        print(f"  Imagen {imodel}: Bild generiert")
+                        return True
+                print(f"  Imagen {imodel}: {data.get('error', {}).get('message', 'Kein Bild')}")
+            except Exception as ie:
+                print(f"  Imagen {imodel} Fehler: {ie}")
+
+        # Versuch 2: Gemini-Native Image-Modelle (generateContent API mit responseModalities)
+        gemini_models = ["gemini-2.5-flash-image", "gemini-3.1-flash-image-preview", "gemini-3-pro-image-preview"]
+        last_err = None
+        for gmodel in gemini_models:
+            url = f"https://generativelanguage.googleapis.com/v1beta/models/{gmodel}:generateContent?key={api_key}"
+            r = requests.post(url,
+                headers={"Content-Type": "application/json"},
+                json={
+                    "contents": [{"parts": [{"text": "Generate an image: " + prompt}]}],
+                    "generationConfig": {"responseModalities": ["TEXT", "IMAGE"]}
+                },
+                timeout=120)
+            data = r.json()
+            if r.status_code != 200:
+                last_err = f"Gemini ({gmodel}): {data.get('error', {}).get('message', str(data))}"
+                print(f"  Gemini Image {gmodel} fehlgeschlagen: {last_err}")
+                continue
+            parts = data.get('candidates', [{}])[0].get('content', {}).get('parts', [])
+            for p in parts:
+                if 'inlineData' in p:
+                    with open(fpath, 'wb') as f:
+                        f.write(_b64.b64decode(p['inlineData']['data']))
+                    return True
+            last_err = f"Gemini ({gmodel}): Kein Bild generiert (moeglicherweise Content-Filter)"
+            print(f"  {last_err}")
+            continue
+        raise Exception(last_err or "Gemini: Bildgenerierung fehlgeschlagen (alle Modelle versucht)")
+
+    raise Exception(f"Unbekannter Image-Provider: {provider_key}")
+
+
+def generate_image(prompt, agent_name, provider_key=None, task_id=None):
+    """Generate an image with the selected provider. No fallback to other providers.
+    If task_id is provided, progress is written to TASK_STATUS so the frontend
+    can show a spinner / progress bar until the request completes.
+    """
+    config = load_models()
+    os.makedirs(OUTPUT_DIR, exist_ok=True)
+    ts = datetime.datetime.now().strftime('%Y-%m-%d_%H-%M-%S')
+    fname = f"{agent_name}_image_{ts}.png"
+    fpath = os.path.join(OUTPUT_DIR, fname)
+
+    # Strikte Provider-Pruefung – kein Fallback
+    if not provider_key or provider_key not in IMAGE_PROVIDERS:
+        supported = ', '.join(IMAGE_PROVIDERS.keys())
+        provider_name = provider_key or 'keiner'
+        raise Exception(
+            f"Bildgenerierung nicht verfuegbar mit {provider_name}. "
+            f"Wechsle zu Google Gemini oder OpenAI fuer Bildgenerierung"
+        )
+
+    api_key = config['providers'].get(provider_key, {}).get('api_key', '')
+    if not api_key:
+        raise Exception(f"Kein API-Key fuer {provider_key} konfiguriert.")
+
+    task_update(task_id, progress=15, message='Sende Anfrage an Bildmodell...')
+    try:
+        _generate_image_single(prompt, fpath, provider_key, api_key)
+    except Exception as e:
+        raise Exception(f"Fehler bei Bildgenerierung mit {provider_key}: {e}")
+
+    task_done(task_id, message='Bild fertig')
+    return fname, fpath, ""
+
+
+def generate_video(prompt, agent_name, provider_key=None, task_id=None):
+    """Generate a video using Gemini Veo 3.1. Returns (filename, filepath).
+    If task_id is provided, progress is written to TASK_STATUS during the
+    long-running poll loop so the frontend can display a live progress bar.
+    """
+    config = load_models()
+    os.makedirs(OUTPUT_DIR, exist_ok=True)
+    ts = datetime.datetime.now().strftime('%Y-%m-%d_%H-%M-%S')
+    fname = f"{agent_name}_video_{ts}.mp4"
+    fpath = os.path.join(OUTPUT_DIR, fname)
+
+    # Strikte Provider-Pruefung – kein Fallback auf Gemini
+    if not provider_key or provider_key not in VIDEO_PROVIDERS:
+        provider_name = provider_key or 'keiner'
+        raise Exception(
+            f"Videogenerierung ist nur mit Google Gemini verfuegbar. "
+            f"Bitte wechsle zu Gemini fuer Videogenerierung"
+        )
+    api_key = config['providers'].get(provider_key, {}).get('api_key')
+    if not api_key:
+        raise Exception("Video-Generierung benoetigt einen Gemini API-Key")
+
+    # VEO_RETRY_V3: Retry-Schleife fuer transiente Fehler (code 13/14/429)
+    # Retry 0: default (16:9, 8s)
+    # Retry 1: durationSeconds=5 (kuerzer)
+    # Retry 2: aspectRatio flip + stable fallback-model (veo-2.0-generate-001)
+    default_model = VIDEO_PROVIDERS.get(provider_key, 'veo-3.1-generate-preview')
+    STABLE_FALLBACK_MODEL = 'veo-2.0-generate-001'
+    MAX_RETRIES = 3
+    RETRYABLE_CODES = {13, 14, 429}
+    BACKOFF = [0, 10, 20]  # seconds before retry 0/1/2
+    import time as _vt
+
+    op_name = None
+    last_error_text = ''
+    for _retry in range(MAX_RETRIES):
+        # Retry-spezifische Parameter
+        video_model = default_model
+        aspect = "16:9"
+        duration = 8
+        retry_label = ''
+        if _retry == 1:
+            duration = 5
+            retry_label = ' (kuerzere Dauer)'
+        elif _retry == 2:
+            aspect = "9:16"  # flipped
+            video_model = STABLE_FALLBACK_MODEL
+            retry_label = f' (Fallback {STABLE_FALLBACK_MODEL})'
+
+        if _retry == 0:
+            task_update(task_id, progress=2, message='Sende Anfrage an Gemini Veo...')
+        else:
+            wait_s = BACKOFF[_retry]
+            task_update(
+                task_id,
+                progress=2,
+                message=f'Retry [{_retry+1}/{MAX_RETRIES}]{retry_label}... warte {wait_s}s',
+            )
+            print(f"[VEO] Retry {_retry+1}/{MAX_RETRIES}{retry_label}: backoff {wait_s}s", flush=True)
+            _vt.sleep(wait_s)
+
+        url = f"https://generativelanguage.googleapis.com/v1beta/models/{video_model}:predictLongRunning?key={api_key}"
+        payload = {
+            "instances": [{"prompt": prompt}],
+            "parameters": {"aspectRatio": aspect, "durationSeconds": duration},
+        }
+        print(f"[VEO] POST model={video_model} aspect={aspect} dur={duration}s", flush=True)
+        try:
+            r = requests.post(url,
+                headers={"Content-Type": "application/json"},
+                json=payload,
+                timeout=30)
+        except Exception as post_ex:
+            last_error_text = f"Netzwerk-Fehler: {post_ex}"
+            print(f"[VEO] POST Exception: {post_ex}", flush=True)
+            task_update(task_id, progress=3, message=f'Netzwerk-Fehler - wird erneut versucht ({_retry+1}/{MAX_RETRIES})...')
+            continue
+
+        try:
+            data = r.json()
+        except Exception:
+            data = {}
+
+        if r.status_code == 200 and data.get('name'):
+            op_name = data['name']
+            print(f"[VEO] Operation gestartet: {op_name}", flush=True)
+            break
+
+        # Fehler analysieren
+        err_obj = data.get('error', {}) or {}
+        err_code = err_obj.get('code', r.status_code)
+        err_msg = err_obj.get('message', str(data) if data else f'HTTP {r.status_code}')
+        last_error_text = f"code {err_code}: {err_msg}"
+        print(f"[VEO] POST-Fehler code={err_code}: {err_msg}", flush=True)
+
+        # User-facing Status je Error-Code
+        try:
+            err_code_int = int(err_code)
+        except Exception:
+            err_code_int = 0
+
+        if err_code_int == 13:
+            status_msg = f'Gemini Veo Server-Fehler - wird erneut versucht ({_retry+1}/{MAX_RETRIES})...'
+        elif err_code_int == 429:
+            status_msg = f'Gemini Veo Rate Limit - warte {BACKOFF[min(_retry+1, MAX_RETRIES-1)]}s und versuche erneut ({_retry+1}/{MAX_RETRIES})...'
+        elif err_code_int == 14:
+            status_msg = f'Gemini Veo kurz nicht verfuegbar - wird erneut versucht ({_retry+1}/{MAX_RETRIES})...'
+        else:
+            status_msg = f'Unbekannter Fehler [{err_code}] - wird erneut versucht ({_retry+1}/{MAX_RETRIES})...'
+        task_update(task_id, progress=3, message=status_msg)
+
+        # Nicht-retryable Fehler bubbeln sofort hoch
+        if err_code_int not in RETRYABLE_CODES and r.status_code not in (500, 502, 503, 504):
+            raise Exception(f"Gemini Veo API-Fehler (code {err_code}): {err_msg}")
+        # Sonst weiter in die naechste Retry-Runde
+
+    if not op_name:
+        raise Exception(
+            f"Video-Generierung nach {MAX_RETRIES} Versuchen fehlgeschlagen. "
+            f"Bitte spaeter erneut versuchen. Letzter Fehler: {last_error_text}"
+        )
+
+    task_update(task_id, progress=5, message='Video wird generiert...')
+
+    # Poll for completion (max 6 minutes: 72 Versuche x 5 Sekunden = 360 s)
+    # VEO_PATCH_V2: 6-Minuten-Timeout, detailliertes Logging, Content-Filter-Erkennung
+    import base64
+    import json as _vjson
+    poll_url = f"https://generativelanguage.googleapis.com/v1beta/{op_name}?key={api_key}"
+    MAX_ATTEMPTS = 72
+    POLL_INTERVAL = 5  # seconds → 72 * 5 = 360 s (6 min)
+    TOTAL_SECS = MAX_ATTEMPTS * POLL_INTERVAL
+    print(f"[VEO] Poll gestartet: op={op_name} max_attempts={MAX_ATTEMPTS} interval={POLL_INTERVAL}s total={TOTAL_SECS}s", flush=True)
+
+    last_api_snapshot = ''
+    for _attempt in range(MAX_ATTEMPTS):
+        import time as _t
+        _t.sleep(POLL_INTERVAL)
+        # Simulated progress (5 -> 95) based on attempt number, clamped
+        pct = min(95, 5 + int((_attempt + 1) * 90 / MAX_ATTEMPTS))
+        if _attempt < 8:
+            phase = 'Video wird initialisiert...'
+        elif _attempt < 28:
+            phase = 'Video wird gerendert...'
+        elif _attempt < 56:
+            phase = 'Rendering laeuft, fast fertig...'
+        else:
+            phase = 'Letzte Schritte...'
+        task_update(task_id, progress=pct, message=phase)
+
+        try:
+            pr = requests.get(poll_url, timeout=30)
+            pdata = pr.json()
+        except Exception as poll_ex:
+            # Transient network error — log and keep trying
+            print(f"[VEO] Poll #{_attempt+1}/{MAX_ATTEMPTS} Netzwerk-Fehler: {poll_ex}", flush=True)
+            continue
+
+        # Compact log for every attempt with current state
+        _state_keys = sorted(list(pdata.keys()))
+        _done_flag = pdata.get('done')
+        _has_err = bool(pdata.get('error'))
+        print(f"[VEO] Poll #{_attempt+1}/{MAX_ATTEMPTS} done={_done_flag} err={_has_err} keys={_state_keys}", flush=True)
+        last_api_snapshot = _vjson.dumps(pdata)[:600]
+
+        if pdata.get('error'):
+            err_obj = pdata['error']
+            err_msg = err_obj.get('message', str(err_obj))
+            err_code = err_obj.get('code', '?')
+            print(f"[VEO] API-Fehler code={err_code}: {err_msg}", flush=True)
+            raise Exception(f"Gemini Veo API-Fehler (code {err_code}): {err_msg}")
+
+        if not pdata.get('done'):
+            continue
+
+        # done=True — response auswerten
+        response = pdata.get('response', {}) or {}
+        gvr = response.get('generateVideoResponse', {}) or {}
+
+        # Content-Filter: raiMediaFilteredCount > 0 → Video wurde von Safety-Filtern blockiert
+        rai_count = gvr.get('raiMediaFilteredCount', 0)
+        rai_reasons = gvr.get('raiMediaFilteredReasons', [])
+        if rai_count and not gvr.get('generatedSamples'):
+            reason_txt = '; '.join(str(r) for r in rai_reasons) if rai_reasons else 'Keine Details'
+            print(f"[VEO] CONTENT FILTER: rai_count={rai_count} reasons={reason_txt}", flush=True)
+            raise Exception(f"Gemini Veo: Video wurde vom Content-Filter blockiert ({reason_txt}). Bitte Prompt anpassen.")
+
+        # Samples in allen bekannten Formaten suchen
+        samples = gvr.get('generatedSamples', [])
+        if not samples:
+            samples = response.get('predictions', response.get('generatedVideos', []))
+        if not samples:
+            # Log full response for debugging
+            resp_preview = _vjson.dumps(response)[:800]
+            print(f"[VEO] done=true aber keine samples gefunden. Response: {resp_preview}", flush=True)
+            raise Exception(
+                f"Gemini Veo: Kein Video generiert (done=true, leere Response). "
+                f"Details: {resp_preview[:200]}"
+            )
+
+        # Try URI download first (current API returns download URL)
+        vid_uri = samples[0].get('video', {}).get('uri', '')
+        if vid_uri:
+            print(f"[VEO] Erfolgreich: Download-URI erhalten, lade Video...", flush=True)
+            task_update(task_id, progress=97, message='Lade Video herunter...')
+            dl_url = vid_uri + ('&' if '?' in vid_uri else '?') + f'key={api_key}'
+            vr = requests.get(dl_url, timeout=180)
+            if vr.status_code != 200:
+                raise Exception(f"Gemini Veo: Video-Download fehlgeschlagen (HTTP {vr.status_code})")
+            with open(fpath, 'wb') as f:
+                f.write(vr.content)
+            print(f"[VEO] Video gespeichert: {fpath} ({len(vr.content)} bytes)", flush=True)
+            task_done(task_id, message='Video fertig')
+            return fname, fpath
+
+        # Fallback: base64 encoded video
+        vid_b64 = samples[0].get('bytesBase64Encoded', samples[0].get('video', {}).get('bytesBase64Encoded', ''))
+        if vid_b64:
+            print(f"[VEO] Erfolgreich: base64-Video erhalten, dekodiere...", flush=True)
+            task_update(task_id, progress=97, message='Dekodiere Video...')
+            with open(fpath, 'wb') as f:
+                f.write(base64.b64decode(vid_b64))
+            task_done(task_id, message='Video fertig')
+            return fname, fpath
+
+        # Bekanntes Format nicht erkannt → volle Debug-Ausgabe
+        sample_preview = _vjson.dumps(samples[0])[:500]
+        print(f"[VEO] Sample-Format nicht erkannt. Erstes Sample: {sample_preview}", flush=True)
+        raise Exception(f"Gemini Veo: Video-Format nicht erkannt. Sample: {sample_preview[:200]}")
+
+    print(f"[VEO] TIMEOUT nach {TOTAL_SECS}s (letzte API-Snapshot: {last_api_snapshot[:300]})", flush=True)
+    raise Exception(f"Gemini Veo: Timeout nach {TOTAL_SECS//60} Minuten ({MAX_ATTEMPTS} Versuche * {POLL_INTERVAL}s). Letzter Status: {last_api_snapshot[:150]}")
+
+
+# ─── SLACK API INTEGRATION (SLACK_API_V1) ──────────────────────────────────────
+# Echter Slack-API-Client via Bot-Token. Ersetzt den Clipboard-Paste-Hack fuer
+# Outbound und fuegt Lese-Faehigkeiten hinzu (Channels, History, Users).
+# Docs: https://docs.slack.dev/reference/methods/chat.postMessage/
+
+def _get_slack_config():
+    """Laedt Slack-Config aus models.json. Gibt dict oder None zurueck."""
+    config = load_models()
+    sc = config.get('slack')
+    if not sc or not sc.get('bot_token'):
+        return None
+    return sc
+
+def _slack_api(method, params=None, json_body=None):
+    """Generischer Slack Web API Aufruf. Returns (ok, data_dict)."""
+    sc = _get_slack_config()
+    if not sc:
+        return False, {'error': 'Kein Slack bot_token in models.json konfiguriert'}
+    token = sc['bot_token']
+    url = f"https://slack.com/api/{method}"
+    headers = {'Authorization': f'Bearer {token}'}
+    try:
+        if json_body is not None:
+            headers['Content-Type'] = 'application/json'
+            r = requests.post(url, headers=headers, json=json_body, timeout=15)
+        elif params:
+            r = requests.get(url, headers=headers, params=params, timeout=15)
+        else:
+            r = requests.get(url, headers=headers, timeout=15)
+        data = r.json()
+        return data.get('ok', False), data
+    except Exception as e:
+        return False, {'error': str(e)}
+
+def slack_send_message(channel, text, thread_ts=None):
+    """Sendet eine Nachricht an einen Slack-Channel oder User.
+    channel: '#channel-name' oder Channel-ID oder User-ID
+    Returns: (ok, response_dict)
+    """
+    body = {'channel': channel.lstrip('#'), 'text': text}
+    if thread_ts:
+        body['thread_ts'] = thread_ts
+    return _slack_api('chat.postMessage', json_body=body)
+
+def slack_list_channels(limit=100):
+    """Listet alle Channels auf die der Bot Zugriff hat."""
+    return _slack_api('conversations.list', params={
+        'types': 'public_channel,private_channel',
+        'limit': limit, 'exclude_archived': True,
+    })
+
+def slack_list_users(limit=200):
+    """Listet alle User im Workspace."""
+    return _slack_api('users.list', params={'limit': limit})
+
+def slack_channel_history(channel_id, limit=20):
+    """Liest die letzten N Nachrichten aus einem Channel."""
+    return _slack_api('conversations.history', params={
+        'channel': channel_id, 'limit': limit,
+    })
+
+def slack_find_channel_id(name):
+    """Sucht Channel-ID anhand des Namens."""
+    ok, data = slack_list_channels(limit=500)
+    if not ok:
+        return None
+    for ch in data.get('channels', []):
+        if ch.get('name') == name.lstrip('#') or ch.get('name_normalized') == name.lstrip('#'):
+            return ch['id']
+    return None
+
+def slack_find_user_id(name):
+    """Sucht User-ID anhand des Display-Namens oder Real-Namens."""
+    ok, data = slack_list_users(limit=500)
+    if not ok:
+        return None
+    name_low = name.lower()
+    for u in data.get('members', []):
+        rn = (u.get('real_name') or '').lower()
+        dn = (u.get('profile', {}).get('display_name') or '').lower()
+        un = (u.get('name') or '').lower()
+        if name_low in (rn, dn, un) or name_low in rn:
+            return u['id']
+    return None
+
+
+# ─── CANVA API INTEGRATION (CANVA_API_V1) ─────────────────────────────────────
+# Canva Connect REST API fuer Design-Operationen.
+# Docs: https://www.canva.dev/docs/connect/
+
+def _get_canva_config():
+    """Laedt Canva-Config aus models.json. Gibt dict oder None zurueck."""
+    config = load_models()
+    cc = config.get('canva')
+    if not cc or not cc.get('access_token'):
+        return None
+    return cc
+
+def _canva_refresh_token():
+    """CANVA_TOKEN_REFRESH: Erneuert den Access Token via Refresh Token."""
+    import base64 as _cb64
+    config = load_models()
+    cc = config.get('canva', {})
+    rt = cc.get('refresh_token', '')
+    cid = cc.get('client_id', '')
+    csec = cc.get('client_secret', '')
+    if not rt or not cid or not csec:
+        return False
+    creds = _cb64.b64encode(f"{cid}:{csec}".encode()).decode()
+    try:
+        r = requests.post(
+            'https://api.canva.com/rest/v1/oauth/token',
+            headers={'Authorization': f'Basic {creds}', 'Content-Type': 'application/x-www-form-urlencoded'},
+            data={'grant_type': 'refresh_token', 'refresh_token': rt},
+            timeout=15,
+        )
+        if r.status_code != 200:
+            print(f"[CANVA] Token-Refresh fehlgeschlagen: HTTP {r.status_code}", flush=True)
+            return False
+        td = r.json()
+        # In models.json speichern
+        config['canva']['access_token'] = td['access_token']
+        if td.get('refresh_token'):
+            config['canva']['refresh_token'] = td['refresh_token']
+        config['canva']['expires_in'] = td.get('expires_in', 0)
+        config['canva']['scope'] = td.get('scope', cc.get('scope', ''))
+        with open(MODELS_FILE, 'w') as f:
+            json.dump(config, f, indent=4)
+        print(f"[CANVA] Token erfolgreich erneuert (expires_in={td.get('expires_in')}s)", flush=True)
+        return True
+    except Exception as e:
+        print(f"[CANVA] Token-Refresh Exception: {e}", flush=True)
+        return False
+
+
+def _canva_api(method, path, json_body=None, params=None):
+    """Generischer Canva Connect API Aufruf mit automatischem Token-Refresh."""
+    cc = _get_canva_config()
+    if not cc:
+        return False, {'error': 'Kein Canva access_token in models.json konfiguriert'}
+    token = cc['access_token']
+    base = cc.get('api_base', 'https://api.canva.com/rest/v1')
+    url = f"{base}{path}"
+    headers = {'Authorization': f'Bearer {token}'}
+    try:
+        if method == 'GET':
+            r = requests.get(url, headers=headers, params=params or {}, timeout=30)
+        elif method == 'POST':
+            headers['Content-Type'] = 'application/json'
+            r = requests.post(url, headers=headers, json=json_body or {}, timeout=30)
+        else:
+            return False, {'error': f'Unbekannte Methode: {method}'}
+        # CANVA_TOKEN_REFRESH: Bei 401 automatisch Token erneuern und Retry
+        if r.status_code == 401:
+            print("[CANVA] 401 — versuche Token-Refresh...", flush=True)
+            if _canva_refresh_token():
+                cc2 = _get_canva_config()
+                headers['Authorization'] = f'Bearer {cc2["access_token"]}'
+                if method == 'GET':
+                    r = requests.get(url, headers=headers, params=params or {}, timeout=30)
+                else:
+                    r = requests.post(url, headers=headers, json=json_body or {}, timeout=30)
+        data = r.json() if r.content else {}
+        if r.status_code >= 400:
+            return False, {'error': data.get('message', f'HTTP {r.status_code}'), 'status': r.status_code}
+        return True, data
+    except Exception as e:
+        return False, {'error': str(e)}
+
+def canva_list_designs(query=None, count=20):
+    """Sucht Designs im Canva-Account."""
+    params = {'count': count}
+    if query:
+        params['query'] = query
+    return _canva_api('GET', '/designs', params=params)
+
+def canva_get_design(design_id):
+    """Gibt Details zu einem Design zurueck."""
+    return _canva_api('GET', f'/designs/{design_id}')
+
+def canva_create_design(title, design_type='doc', width=None, height=None):
+    """Erstellt ein neues leeres Canva-Design."""
+    body = {'title': title}
+    if design_type:
+        body['design_type'] = {'type': design_type}
+    if width and height:
+        body['design_type'] = {'type': 'custom', 'width': width, 'height': height}
+    return _canva_api('POST', '/designs', json_body=body)
+
+def canva_export_design(design_id, format_type='pdf'):
+    """Exportiert ein Design als PDF/PNG/JPG."""
+    body = {'design_id': design_id, 'format': {'type': format_type}}
+    return _canva_api('POST', '/exports', json_body=body)
+
+def canva_list_folders(count=50):
+    """Listet Ordner im Canva-Account."""
+    return _canva_api('GET', '/folders', params={'count': count})
+
+
+# CANVA_CAMPAIGNS_V1: Brand Templates + Autofill fuer Ad-Kampagnen
+# Docs: https://www.canva.dev/docs/connect/api-reference/autofills/
+
+def canva_list_brand_templates(query=None, count=50):
+    """Listet alle Brand Templates des Users (erfordert Canva Enterprise oder Team)."""
+    params = {'count': count}
+    if query:
+        params['query'] = query
+    return _canva_api('GET', '/brand-templates', params=params)
+
+def canva_get_brand_template(template_id):
+    """Gibt Metadaten eines Brand Templates zurueck."""
+    return _canva_api('GET', f'/brand-templates/{template_id}')
+
+def canva_get_template_dataset(template_id):
+    """Gibt die ausfuellbaren Felder (Dataset) eines Brand Templates zurueck.
+    Zeigt welche Platzhalter (Text, Bild, Chart) befuellt werden koennen."""
+    return _canva_api('GET', f'/brand-templates/{template_id}/dataset')
+
+def canva_autofill(template_id, data, title=None):
+    """Erstellt ein neues Design aus einem Brand Template mit automatisch
+    befuellten Feldern (Texte, Bilder, Charts).
+
+    template_id: Brand Template ID
+    data: dict mit Feld-Mappings, z.B.:
+      {
+        "headline": {"type": "text", "text": "Summer Sale 50% Off"},
+        "body": {"type": "text", "text": "Shop now at example.com"},
+        "hero_image": {"type": "image", "asset_id": "abc123"}
+      }
+    title: Name des generierten Designs (optional)
+
+    Returns: (ok, job_data) — Job ist async, Status via canva_get_autofill_job()
+    """
+    body = {'brand_template_id': template_id, 'data': data}
+    if title:
+        body['title'] = title[:255]
+    return _canva_api('POST', '/autofills', json_body=body)
+
+def canva_get_autofill_job(job_id):
+    """Prueft den Status eines Autofill-Jobs (in_progress/success/failed)."""
+    return _canva_api('GET', f'/autofills/{job_id}')
+
+def canva_upload_asset(url, name='uploaded_image'):
+    """Laedt ein Bild/Asset von einer URL in Canva hoch. Gibt asset_id zurueck."""
+    body = {
+        'asset_upload': {
+            'type': 'external_url',
+            'url': url,
+            'name': name,
+        }
+    }
+    return _canva_api('POST', '/assets/upload', json_body=body)
+
+def canva_batch_campaign(template_id, rows, title_prefix='Campaign'):
+    """Generiert mehrere Designs aus einem Template mit verschiedenen Daten.
+    rows: list of dicts, jeder dict = ein Design mit Feld-Mappings
+    Gibt Liste von Job-IDs zurueck.
+
+    Beispiel:
+      rows = [
+        {"headline": {"type":"text","text":"Ad Variant A"}, "cta": {"type":"text","text":"Buy Now"}},
+        {"headline": {"type":"text","text":"Ad Variant B"}, "cta": {"type":"text","text":"Shop Now"}},
+      ]
+    """
+    jobs = []
+    for i, row in enumerate(rows):
+        title = f"{title_prefix} {i+1}"
+        ok, data = canva_autofill(template_id, row, title=title)
+        if ok:
+            job_id = data.get('job', {}).get('id', data.get('id', ''))
+            jobs.append({'index': i, 'ok': True, 'job_id': job_id, 'title': title})
+        else:
+            jobs.append({'index': i, 'ok': False, 'error': data.get('error', '?'), 'title': title})
+    return jobs
+
+
+# ─── CALENDAR INTEGRATION (CALENDAR_INTEGRATION_V1) ────────────────────────────
+# AppleScript-basiertes Auslesen von Fantastical/Apple Calendar Events.
+# Fantastical teilt den macOS CalendarStore, deshalb funktioniert Apple Calendar
+# AppleScript direkt mit Fantastical-Daten.
+
+_CALENDAR_TARGETS = ["Arbeit", "Privat", "Familie"]
+_cal_cache = {'events': [], 'cals': set(), 'ts': 0, 'key': ''}
+
+_CALENDAR_INTENT_DE = [
+    "kalender", "termin", "termine", "meeting", "meetings", "heute", "morgen",
+    "diese woche", "naechste woche", "wann", "agenda", "tagesplan", "zeitplan",
+    "verfuegbar", "verfügbar", "frei", "besetzt", "schedule",
+]
+_CALENDAR_INTENT_EN = [
+    "calendar", "schedule", "today", "tomorrow", "appointment", "appointments",
+    "meeting", "meetings", "when", "agenda", "free", "busy", "available",
+    "this week", "next week",
+]
+_CALENDAR_KEYWORDS = set(_CALENDAR_INTENT_DE + _CALENDAR_INTENT_EN)
+
+
+def _has_calendar_intent(msg):
+    """Prueft ob eine User-Nachricht nach Kalender-Daten fragt."""
+    low = msg.lower()
+    return any(kw in low for kw in _CALENDAR_KEYWORDS)
+
+
+def get_calendar_events(days_back=0, days_ahead=7, calendars=None, search=None):
+    """Liest Events aus Apple Calendar via AppleScript.
+    Returns: (events_list, calendars_found_set, error_str_or_None)
+
+    Jedes Event: {title, start, end, location, calendar_name, notes, all_day}
+    Events sind chronologisch nach start sortiert.
+    """
+    target_cals = calendars if calendars else _CALENDAR_TARGETS
+
+    # Cache pruefen (120s Gueltigkeitsdauer)
+    import time as _cal_time
+    cache_key = f"{days_back}:{days_ahead}:{','.join(target_cals)}:{search or ''}"
+    if _cal_cache['key'] == cache_key and (_cal_time.time() - _cal_cache['ts']) < 120:
+        return list(_cal_cache['events']), set(_cal_cache['cals']), None
+
+    # AppleScript bauen: pro Kalender einen try-Block
+    cal_blocks = []
+    for cname in target_cals:
+        safe = cname.replace('"', '\\"')
+        cal_blocks.append(f"""
+        try
+            set c to calendar "{safe}"
+            set es to (every event of c whose start date >= startD and start date <= endD)
+            repeat with e in es
+                set t to summary of e
+                set s to start date of e
+                set eEnd to end date of e
+                set loc to ""
+                try
+                    set loc to location of e
+                end try
+                set nt to ""
+                try
+                    set nt to description of e
+                end try
+                set ad to allday event of e
+                set out to out & t & "|||" & (s as string) & "|||" & (eEnd as string) & "|||" & loc & "|||" & "{safe}" & "|||" & (ad as string) & "|||" & nt & "\n"
+            end repeat
+        end try""")
+
+    script = f"""
+set today to current date
+set startD to today - ({days_back} * days)
+set endD to today + ({days_ahead} * days)
+tell application "Calendar"
+    set out to ""
+    {"".join(cal_blocks)}
+    return out
+end tell
+"""
+
+    try:
+        import subprocess as _cal_sp
+        r = _cal_sp.run(
+            ['osascript', '-e', script],
+            capture_output=True, text=True, timeout=45,
+        )
+        if r.returncode != 0:
+            err = (r.stderr or '').strip()
+            if 'not allowed' in err.lower() or 'permission' in err.lower():
+                return [], set(), "Keine Kalender-Berechtigung. Bitte in Systemeinstellungen > Datenschutz > Kalender erlauben."
+            return [], set(), f"AppleScript-Fehler: {err[:200]}"
+        raw = r.stdout.strip()
+    except Exception as e:
+        return [], set(), f"Kalender-Zugriff fehlgeschlagen: {e}"
+
+    if not raw:
+        return [], set(), None  # keine Events, kein Fehler
+
+    events = []
+    cals_found = set()
+    for line in raw.split("\n"):
+        line = line.strip()
+        if not line or '|||' not in line:
+            continue
+        parts = line.split('|||')
+        if len(parts) < 6:
+            continue
+        title = parts[0].strip()
+        start_str = parts[1].strip()
+        end_str = parts[2].strip()
+        location = parts[3].strip()
+        cal_name = parts[4].strip()
+        all_day = parts[5].strip().lower() == 'true'
+        notes = parts[6].strip() if len(parts) > 6 else ''
+        # AppleScript gibt 'missing value' statt leer zurueck
+        if location == 'missing value':
+            location = ''
+        if notes == 'missing value':
+            notes = ''
+
+        # Freitext-Suche
+        if search:
+            s = search.lower()
+            if s not in title.lower() and s not in notes.lower() and s not in location.lower():
+                continue
+
+        # Datum parsen (macOS AppleScript Format: "Monday, 14 April 2026 at 07:30:00")
+        dt_start = _parse_applescript_date(start_str)
+        dt_end = _parse_applescript_date(end_str)
+
+        events.append({
+            'title': title,
+            'start': dt_start.isoformat() if dt_start else start_str,
+            'end': dt_end.isoformat() if dt_end else end_str,
+            'location': location,
+            'calendar_name': cal_name,
+            'notes': notes[:500],
+            'all_day': all_day,
+            '_sort_key': dt_start.timestamp() if dt_start else 0,
+        })
+        cals_found.add(cal_name)
+
+    events.sort(key=lambda e: e['_sort_key'])
+    for e in events:
+        e.pop('_sort_key', None)
+    # Cache aktualisieren
+    _cal_cache['events'] = list(events)
+    _cal_cache['cals'] = set(cals_found)
+    _cal_cache['ts'] = _cal_time.time()
+    _cal_cache['key'] = cache_key
+    return events, cals_found, None
+
+
+def _parse_applescript_date(s):
+    """Parst ein macOS AppleScript Datum wie 'Monday, 14 April 2026 at 07:30:00'."""
+    if not s:
+        return None
+    import re as _cal_re
+    # Format: "Weekday, DD Month YYYY at HH:MM:SS"
+    m = _cal_re.search(r'(\d{1,2})\s+(\w+)\s+(\d{4})\s+(?:at|um)?\s*(\d{1,2}):(\d{2}):(\d{2})', s)
+    if m:
+        day, month_str, year, h, mi, sec = m.group(1), m.group(2), m.group(3), m.group(4), m.group(5), m.group(6)
+        months = {
+            'january': 1, 'february': 2, 'march': 3, 'april': 4, 'may': 5, 'june': 6,
+            'july': 7, 'august': 8, 'september': 9, 'october': 10, 'november': 11, 'december': 12,
+            'januar': 1, 'februar': 2, 'maerz': 3, 'märz': 3, 'mai': 5, 'juni': 6,
+            'juli': 7, 'oktober': 10, 'dezember': 12,
+        }
+        month = months.get(month_str.lower())
+        if month:
+            try:
+                return datetime.datetime(int(year), month, int(day), int(h), int(mi), int(sec))
+            except Exception:
+                pass
+    return None
+
+
+def format_calendar_context(events, max_items=15):
+    """Formatiert Events als Kontext-Block fuer den System-Prompt."""
+    if not events:
+        return ""
+    lines = ["--- KALENDER (kommende Termine) ---"]
+    for e in events[:max_items]:
+        start = e.get('start', '')
+        title = e.get('title', '')
+        cal = e.get('calendar_name', '')
+        loc = e.get('location', '')
+        ad = ' (ganztaegig)' if e.get('all_day') else ''
+        line = f"[{start}] {title}{ad}"
+        if cal:
+            line += f" | Kalender: {cal}"
+        if loc:
+            line += f" | Ort: {loc}"
+        lines.append(line)
+    lines.append("--- ENDE KALENDER ---")
+    return "\n".join(lines)
+
+
+# ─── STATE (SESSION-BASED) ─────────────────────────────────────────────────────
+
+import time as _time
+
+queue_lock = threading.Lock()
+sessions = {}  # session_id -> state dict
+
+def _new_state():
+    return {
+        "agent": None, "system_prompt": None, "speicher": None,
+        "verlauf": [], "dateiname": None, "kontext_items": [],
+        "provider": "anthropic", "model_id": "claude-sonnet-4-6",
+        "session_files": [],
+        "queue": [], "processing": False, "stop_requested": False,
+        "completed_responses": [], "current_prompt": "",
+        "last_active": _time.time(),
+    }
+
+def get_session(session_id=None):
+    if not session_id:
+        session_id = 'default'
+    if session_id not in sessions:
+        sessions[session_id] = _new_state()
+    sessions[session_id]['last_active'] = _time.time()
+    return sessions[session_id]
+
+def cleanup_old_sessions():
+    cutoff = _time.time() - (24 * 60 * 60)
+    to_delete = [sid for sid, s in sessions.items() if s.get('last_active', 0) < cutoff]
+    for sid in to_delete:
+        try:
+            auto_save_session(sid)
+        except Exception:
+            pass
+        del sessions[sid]
+
+
+# ─── TASK STATUS (PROGRESS TRACKING FOR LONG-RUNNING OPERATIONS) ───────────────
+# In-memory registry for tracking the progress of long-running tasks
+# like video and image generation. Frontend polls /task_status/<task_id>.
+
+TASK_STATUS = {}
+task_lock = threading.Lock()
+
+
+def task_create(kind, session_id, estimated_total=180, initial_message=None):
+    """Create a new task entry and return its task_id.
+    kind: 'video' | 'image' | generic label
+    estimated_total: rough expected duration in seconds (used for ETA)
+    """
+    task_id = str(uuid.uuid4())
+    now = _time.time()
+    default_msg = {
+        'video': 'Video-Generierung gestartet...',
+        'image': 'Bild-Generierung gestartet...',
+    }.get(kind, 'Aufgabe gestartet...')
+    with task_lock:
+        TASK_STATUS[task_id] = {
+            'task_id': task_id,
+            'kind': kind,
+            'session_id': session_id or 'default',
+            'status': 'running',
+            'progress': 0,
+            'message': initial_message or default_msg,
+            'started_at': now,
+            'updated_at': now,
+            'finished_at': None,
+            'estimated_total_seconds': estimated_total,
+            'error': None,
+        }
+    return task_id
+
+
+def task_update(task_id, progress=None, message=None):
+    """Update a task's progress and message. Silently ignored if task_id unknown."""
+    if not task_id:
+        return
+    with task_lock:
+        t = TASK_STATUS.get(task_id)
+        if not t or t['status'] in ('done', 'error'):
+            return
+        if progress is not None:
+            try:
+                t['progress'] = max(0, min(99, int(progress)))
+            except Exception:
+                pass
+        if message is not None:
+            t['message'] = str(message)
+        t['updated_at'] = _time.time()
+
+
+def task_done(task_id, message='Fertig'):
+    if not task_id:
+        return
+    with task_lock:
+        t = TASK_STATUS.get(task_id)
+        if not t:
+            return
+        t['status'] = 'done'
+        t['progress'] = 100
+        t['message'] = message
+        t['finished_at'] = _time.time()
+        t['updated_at'] = t['finished_at']
+
+
+def task_error(task_id, err):
+    if not task_id:
+        return
+    with task_lock:
+        t = TASK_STATUS.get(task_id)
+        if not t:
+            return
+        t['status'] = 'error'
+        t['message'] = f"Fehler: {err}"
+        t['error'] = str(err)
+        t['finished_at'] = _time.time()
+        t['updated_at'] = t['finished_at']
+
+
+def task_get(task_id):
+    """Return a JSON-serializable snapshot of a task, or None."""
+    with task_lock:
+        t = TASK_STATUS.get(task_id)
+        if not t:
+            return None
+        out = dict(t)
+    now = _time.time()
+    end_t = out.get('finished_at') or now
+    out['elapsed_seconds'] = round(end_t - out['started_at'], 1)
+    est = out.get('estimated_total_seconds') or 0
+    if est and out['status'] == 'running':
+        out['eta_seconds'] = max(0, round(est - out['elapsed_seconds'], 1))
+    elif out['status'] == 'done':
+        out['eta_seconds'] = 0
+    else:
+        out['eta_seconds'] = None
+    return out
+
+
+def tasks_for_session(session_id, max_done_age=15):
+    """Return all active tasks for a session, plus recently-finished ones
+    (so the frontend can display completion state briefly).
+    """
+    now = _time.time()
+    ids = []
+    with task_lock:
+        for tid, t in TASK_STATUS.items():
+            if t['session_id'] != session_id:
+                continue
+            if t['status'] in ('done', 'error'):
+                fin = t.get('finished_at') or 0
+                if (now - fin) > max_done_age:
+                    continue
+            ids.append(tid)
+    return [task_get(tid) for tid in ids if task_get(tid)]
+
+
+def tasks_cleanup(max_age=3600):
+    """Drop tasks finished longer than max_age seconds ago."""
+    now = _time.time()
+    with task_lock:
+        stale = [tid for tid, t in TASK_STATUS.items()
+                 if t.get('finished_at') and (now - t['finished_at']) > max_age]
+        for tid in stale:
+            TASK_STATUS.pop(tid, None)
+
+
+def auto_save_session(session_id):
+    """Auto-save the full conversation of a session to its konversation file.
+    Overwrites the file with the complete conversation (header + all messages).
+    Silent fail — logs errors but never raises."""
+    try:
+        if session_id not in sessions:
+            return
+        st = sessions[session_id]
+        if not st.get('agent') or not st.get('verlauf') or not st.get('dateiname'):
+            return
+        dateiname = st['dateiname']
+        agent = st['agent']
+        provider_key = st.get('provider', 'anthropic')
+        model_id = st.get('model_id', 'claude-sonnet-4-6')
+
+        # Build full file content: header + all messages
+        # Extract date from dateiname (konversation_2026-04-06_08-45.txt)
+        import re
+        basename = os.path.basename(dateiname).replace('.txt', '').replace('konversation_', '')
+        lines = ['Agent: ' + agent, 'Datum: ' + basename, '']
+
+        for i, m in enumerate(st['verlauf']):
+            role = m.get('role', '')
+            text = m.get('content', '')
+            if isinstance(text, list):
+                # Vision content — extract text parts
+                text = ' '.join(p.get('text', '') for p in text if isinstance(p, dict) and p.get('type') == 'text')
+            if role == 'user':
+                lines.append('[' + provider_key + '/' + model_id + ']')
+                lines.append('Du: ' + text)
+            elif role == 'assistant':
+                lines.append('Assistant: ' + text)
+                lines.append('')  # blank line after each exchange
+
+        # Append context files block if any are loaded
+        ctx_items = st.get('kontext_items', [])
+        if ctx_items:
+            ctx_entries = []
+            for ci in ctx_items:
+                entry = {'name': ci.get('name', ''), 'type': 'file'}
+                if ci.get('image_b64'):
+                    entry['type'] = 'image'
+                ctx_entries.append(entry)
+            lines.append('')
+            lines.append('[KONTEXT_DATEIEN:' + json.dumps(ctx_entries, ensure_ascii=False) + ']')
+
+        # Atomic write: write to .tmp then rename
+        tmp_path = dateiname + '.tmp'
+        with open(tmp_path, 'w', encoding='utf-8') as f:
+            f.write('\n'.join(lines))
+        os.replace(tmp_path, dateiname)
+        print(f'[AUTO-SAVE] Session {session_id[:12]} gesichert -> {os.path.basename(dateiname)}')
+    except Exception as e:
+        print(f'[AUTO-SAVE] Fehler bei {session_id[:12]}: {e}')
+
+def load_models():
+    if os.path.exists(MODELS_FILE):
+        with open(MODELS_FILE) as f:
+            return json.load(f)
+    return {"providers": {}}
+
+# ─── FILE EXTRACTION ──────────────────────────────────────────────────────────
+
+def extract_file_content(raw, filename):
+    fname = filename.lower()
+    if fname.endswith('.pdf'):
+        try:
+            import PyPDF2, io
+            reader = PyPDF2.PdfReader(io.BytesIO(raw))
+            return "\n".join(p.extract_text() or "" for p in reader.pages)
+        except Exception as e:
+            return "[PDF Fehler: " + str(e) + "]"
+    if fname.endswith('.docx'):
+        try:
+            import zipfile, io
+            from xml.etree import ElementTree as ET
+            z = zipfile.ZipFile(io.BytesIO(raw))
+            xml = z.read('word/document.xml')
+            tree = ET.fromstring(xml)
+            ns = '{http://schemas.openxmlformats.org/wordprocessingml/2006/main}'
+            return ' '.join(node.text for node in tree.iter(ns+'t') if node.text)
+        except Exception as e:
+            return "[DOCX Fehler: " + str(e) + "]"
+    if fname.endswith('.xlsx'):
+        try:
+            import zipfile, io
+            from xml.etree import ElementTree as ET
+            z = zipfile.ZipFile(io.BytesIO(raw))
+            strings = []
+            if 'xl/sharedStrings.xml' in z.namelist():
+                tree = ET.fromstring(z.read('xl/sharedStrings.xml'))
+                for si in tree.iter('{http://schemas.openxmlformats.org/spreadsheetml/2006/main}t'):
+                    strings.append(si.text or '')
+            result = []
+            if 'xl/worksheets/sheet1.xml' in z.namelist():
+                tree = ET.fromstring(z.read('xl/worksheets/sheet1.xml'))
+                ns = '{http://schemas.openxmlformats.org/spreadsheetml/2006/main}'
+                for row in tree.iter(ns+'row'):
+                    vals = []
+                    for cell in row.iter(ns+'c'):
+                        v = cell.find(ns+'v')
+                        if v is not None and v.text:
+                            if cell.get('t','') == 's':
+                                vals.append(strings[int(v.text)] if int(v.text) < len(strings) else '')
+                            else:
+                                vals.append(v.text)
+                    if vals: result.append('\t'.join(vals))
+            return '\n'.join(result)
+        except Exception as e:
+            return "[XLSX Fehler: " + str(e) + "]"
+    if fname.endswith('.eml'):
+        try:
+            import email
+            msg = email.message_from_bytes(raw)
+            parts = ["Von: " + str(msg.get('From','')), "An: " + str(msg.get('To','')),
+                     "Betreff: " + str(msg.get('Subject','')), "Datum: " + str(msg.get('Date','')), ""]
+            if msg.is_multipart():
+                for part in msg.walk():
+                    if part.get_content_type() == 'text/plain':
+                        parts.append(part.get_payload(decode=True).decode('utf-8', errors='ignore'))
+            else:
+                parts.append(msg.get_payload(decode=True).decode('utf-8', errors='ignore'))
+            return '\n'.join(parts)
+        except Exception as e:
+            return "[EML Fehler: " + str(e) + "]"
+    if any(fname.endswith(ext) for ext in ['.mp4','.mov','.avi','.mkv','.mp3','.wav','.m4a']):
+        return "[Mediendatei: " + filename + " — Inhalt kann nicht als Text gelesen werden.]"
+    return raw.decode('utf-8', errors='ignore')
+
+# ─── MEMORY SYSTEM ────────────────────────────────────────────────────────────
+
+def load_index(speicher):
+    """Load session index for an agent."""
+    index_file = os.path.join(speicher, '_index.json')
+    if os.path.exists(index_file):
+        with open(index_file) as f:
+            return json.load(f)
+    return []
+
+def save_index(speicher, index):
+    """Save session index."""
+    index_file = os.path.join(speicher, '_index.json')
+    with open(index_file, 'w') as f:
+        json.dump(index, f, ensure_ascii=False, indent=2)
+
+def migrate_old_conversations(speicher):
+    """Import existing conversation files that aren't yet in the index."""
+    index = load_index(speicher)
+    indexed_files = {e.get('file','') for e in index}
+
+    conv_files = sorted([
+        f for f in os.listdir(speicher)
+        if f.startswith('konversation_') and f.endswith('.txt')
+    ])
+
+    new_entries = []
+    for fname in conv_files:
+        if fname in indexed_files:
+            continue
+        fpath = os.path.join(speicher, fname)
+        try:
+            with open(fpath) as f:
+                content = f.read()
+            # Extract date from filename: konversation_2026-03-31_15-27.txt
+            parts = fname.replace('konversation_','').replace('.txt','').split('_')
+            if len(parts) >= 2:
+                date_str = parts[0] + ' ' + parts[1].replace('-',':')
+            else:
+                date_str = fname
+            # Build a short summary from content (first 800 chars)
+            summary = "[Importiert] " + content[:400].replace('\n',' ').strip()
+            new_entries.append({
+                "date": date_str,
+                "file": fname,
+                "summary": summary,
+                "referenced_files": []
+            })
+        except:
+            pass
+
+    if new_entries:
+        # Insert old entries at beginning, sorted by date
+        combined = new_entries + index
+        save_index(speicher, combined)
+        return len(new_entries)
+    return 0
+
+def summarize_conversation(verlauf, agent_prompt):
+    """Ask Claude to summarize the current conversation in 2-3 sentences."""
+    if not verlauf or len(verlauf) < 2:
+        return None
+    try:
+        config = load_models()
+        api_key = config['providers']['anthropic']['api_key']
+        from anthropic import Anthropic
+        client = Anthropic(api_key=api_key)
+        conv_text = "\n".join(
+            ("User: " if m['role'] == 'user' else "Assistant: ") + str(m['content'])[:500]
+            for m in verlauf[-10:]  # last 10 messages max
+        )
+        r = client.messages.create(
+            model="claude-haiku-4-5-20251001",
+            max_tokens=200,
+            system="Fasse die folgende Konversation in 2-3 praezisen Saetzen zusammen. Nur die Zusammenfassung, kein Kommentar.",
+            messages=[{"role": "user", "content": conv_text}]
+        )
+        return r.content[0].text
+    except:
+        return None
+
+def close_current_session(state=None):
+    """Summarize and index the current session before switching agents."""
+    if state is None:
+        state = get_session()
+    if not state['agent'] or not state['verlauf']:
+        return
+    summary = summarize_conversation(state['verlauf'], state['system_prompt'])
+    if not summary:
+        return
+    speicher = state['speicher']
+    index = load_index(speicher)
+    entry = {
+        "date": datetime.datetime.now().strftime("%Y-%m-%d %H:%M"),
+        "file": os.path.basename(state['dateiname']) if state['dateiname'] else "",
+        "summary": summary,
+        "referenced_files": list(state['session_files'])
+    }
+    index.append(entry)
+    # Keep max 50 entries
+    if len(index) > 50:
+        index = index[-50:]
+    save_index(speicher, index)
+
+HTML = """<!DOCTYPE html>
+<html>
+<head>
+<meta charset="UTF-8">
+<title>Assistant</title>
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='6' fill='%23111'/%3E%3Ctext x='16' y='24' text-anchor='middle' font-family='system-ui' font-weight='700' font-size='22' fill='%23f0c060'%3EA%3C/text%3E%3C/svg%3E">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
+<style>
+  * { margin:0; padding:0; box-sizing:border-box; }
+  body { font-family:'Inter',sans-serif; background:#1a1a1a; color:#e0e0e0; height:100vh; display:flex; flex-direction:column; overflow:hidden; }
+  #header { background:#111; border-bottom:1px solid #333; padding:10px 20px; display:flex; align-items:center; gap:12px; flex-shrink:0; z-index:10; }
+  #header h1 { font-size:11px; font-weight:700; color:#aaa; letter-spacing:2.5px; text-transform:uppercase; margin-right:8px; }
+  .hdr-btn { background:none; border:1px solid #444; color:#aaa; padding:5px 12px; cursor:pointer; font-size:12px; border-radius:6px; font-family:Inter,sans-serif; transition:all 0.15s; }
+  .hdr-btn:hover { border-color:#666; color:#eee; }
+  #agent-label { font-size:13px; color:#f0c060; font-weight:600; }
+  #prompt-btn { background:none; border:1px solid #444; color:#aaa; padding:5px 12px; cursor:pointer; font-size:12px; border-radius:6px; font-family:Inter,sans-serif; }
+  #prompt-btn:hover { border-color:#f0c060; color:#f0c060; }
+  select.hdr-select { background:#1a1a1a; border:1px solid #444; color:#aaa; padding:5px 10px; font-size:12px; border-radius:6px; font-family:Inter,sans-serif; cursor:pointer; }
+  select.hdr-select:hover { border-color:#666; }
+  select.hdr-select option { background:#1a1a1a; color:#e0e0e0; padding:4px 8px; }
+  select.hdr-select { -webkit-appearance:menulist; appearance:menulist; min-width:120px; }
+  #main { display:flex; flex:1; overflow:hidden; }
+  #sidebar { width:30%; min-width:280px; background:#141414; border-right:1px solid #2a2a2a; display:flex; flex-direction:column; overflow:hidden; transition:width 0.2s,min-width 0.2s; flex-shrink:0; }
+  #sidebar-header { padding:12px 16px; border-bottom:1px solid #333; display:flex; align-items:center; justify-content:space-between; flex-shrink:0; }
+  #prompt-editor { flex:1; background:#111; color:#e0e0e0; border:none; padding:16px; font-size:12px; font-family:Inter,sans-serif; resize:none; outline:none; line-height:1.6; min-height:0; }
+  #sidebar-btns { padding:10px 16px; border-top:1px solid #333; display:flex; gap:8px; flex-shrink:0; }
+  #history-section { border-top:2px solid #333; flex:1; min-height:0; display:flex; flex-direction:column; padding:10px 16px 6px; }
+  #history-section span { font-size:11px; color:#aaa; font-weight:600; letter-spacing:1.5px; text-transform:uppercase; }
+  #history-list { overflow-y:auto; flex:1; min-height:0; padding:0 8px 8px; }
+  .history-item { display:block; width:100%; background:none; border:none; border-radius:6px; padding:7px 10px; cursor:pointer; text-align:left; font-family:Inter,sans-serif; margin-bottom:3px; }
+  .history-item:hover { background:#222; }
+  .history-item.active { background:#2a3a2a; }
+  .h-date { font-size:10px; color:#666; display:block; margin-bottom:2px; }
+  .h-summary { font-size:11px; color:#bbb; display:block; line-height:1.4; }
+  #chat-area { flex:1; display:flex; flex-direction:column; overflow:hidden; }
+  #ctx-bar { background:#161616; border-bottom:1px solid #252525; padding:6px 16px; display:flex; align-items:center; gap:8px; flex-wrap:wrap; flex-shrink:0; min-height:36px; }
+  #ctx-bar .ctx-label { font-size:10px; color:#555; text-transform:uppercase; letter-spacing:1px; font-weight:600; }
+  .ctx-item { background:#202020; border:1px solid #333; border-radius:5px; padding:3px 8px; font-size:11px; color:#888; display:flex; align-items:center; gap:5px; }
+  .ctx-item.auto-loaded { border-color:#4a8a4a; background:#1a2a1a; color:#8aba8a; }
+  .ctx-item button { background:none; border:none; color:#555; cursor:pointer; font-size:11px; padding:0; line-height:1; }
+  .ctx-item button:hover { color:#f0c060; }
+  #search-overlay { display:none; position:fixed; top:0; left:0; width:100%; height:100%; background:rgba(0,0,0,0.7); z-index:1000; justify-content:center; align-items:center; }
+  #search-overlay.show { display:flex; }
+  #search-panel { background:#1a1a1a; border:1px solid #444; border-radius:12px; width:min(600px,90%); max-height:80vh; display:flex; flex-direction:column; box-shadow:0 8px 32px rgba(0,0,0,0.5); }
+  #search-panel-header { padding:14px 18px; border-bottom:1px solid #333; display:flex; align-items:center; justify-content:space-between; }
+  #search-panel-header h3 { font-size:13px; color:#e0e0e0; font-weight:600; margin:0; }
+  #search-panel-header span { font-size:11px; color:#888; }
+  #search-results-list { flex:1; overflow-y:auto; padding:6px 0; max-height:50vh; }
+  .search-result-item { padding:10px 18px; border-bottom:1px solid #222; display:flex; gap:10px; align-items:flex-start; cursor:pointer; transition:background 0.1s; }
+  .search-result-item:hover { background:#252525; }
+  .search-result-item input[type=checkbox] { margin-top:3px; accent-color:#f0c060; flex-shrink:0; }
+  .search-result-info { flex:1; min-width:0; }
+  .search-result-name { font-size:12px; color:#ccc; font-weight:500; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+  .search-result-meta { font-size:11px; color:#777; margin-top:2px; }
+  .search-result-meta .from-person { color:#6aba6a; font-weight:500; }
+  .search-result-meta .from-auto { color:#666; }
+  .search-result-preview { font-size:11px; color:#555; margin-top:3px; line-height:1.4; display:-webkit-box; -webkit-line-clamp:2; -webkit-box-orient:vertical; overflow:hidden; }
+  #search-panel-footer { padding:12px 18px; border-top:1px solid #333; display:flex; gap:8px; justify-content:flex-end; }
+  #search-panel-footer button { padding:7px 16px; border-radius:6px; font-size:12px; font-weight:600; cursor:pointer; font-family:Inter,sans-serif; border:none; }
+  .search-result-item.notification .search-result-name { color:#777; font-style:italic; }
+  .search-result-item.notification .search-result-meta { color:#555; }
+  .search-result-item.notification { opacity:0.7; }
+  .search-section-divider { padding:6px 18px; font-size:11px; color:#888; font-weight:600; letter-spacing:0.5px; border-bottom:1px solid #333; background:#141414; }
+  #search-selection-counter { font-size:11px; color:#f0c060; font-weight:600; margin-right:auto; align-self:center; }
+  #search-filter-bar { padding:8px 18px; display:flex; gap:6px; flex-wrap:wrap; border-bottom:1px solid #333; }
+  .search-filter-btn { padding:4px 10px; border-radius:4px; font-size:11px; cursor:pointer; border:1px solid #333; background:#1a1a1a; color:#888; font-family:Inter,sans-serif; transition:all 0.15s; }
+  .search-filter-btn:hover { border-color:#666; color:#ccc; }
+  .search-filter-btn.active { border-color:#f0c060; color:#f0c060; background:#2a2200; }
+  #search-subfilter-bar { padding:4px 18px 6px; display:none; gap:4px; flex-wrap:wrap; border-bottom:1px solid #2a2a2a; }
+  #search-subfilter-bar.show { display:flex; }
+  .search-subfilter-btn { padding:3px 8px; border-radius:3px; font-size:10px; cursor:pointer; border:1px solid #2a2a2a; background:#111; color:#666; font-family:Inter,sans-serif; }
+  .search-subfilter-btn:hover { border-color:#555; color:#aaa; }
+  .search-subfilter-btn.active { border-color:#f0c060; color:#f0c060; }
+  .search-btn-primary { background:#f0c060; color:#111; }
+  .search-btn-primary:hover { background:#f5d080; }
+  .search-btn-secondary { background:#2a2a2a; color:#aaa; border:1px solid #444 !important; }
+  .search-btn-secondary:hover { color:#eee; border-color:#666 !important; }
+  .search-btn-cancel { background:none; color:#666; }
+  .search-btn-cancel:hover { color:#aaa; }
+  #messages { flex:1; overflow-y:auto; padding:20px 24px; display:flex; flex-direction:column; gap:12px; max-width:900px; width:100%; margin:0 auto; }
+  .msg { max-width:72%; }
+  .msg.user { align-self:flex-end; }
+  .msg.assistant { align-self:flex-start; }
+  .bubble { padding:10px 16px; border-radius:10px; font-size:14px; line-height:1.65; }
+  .msg.user .bubble { background:#2d4a2d; color:#d8ecd8; border-radius:10px 10px 3px 10px; }
+  .msg.assistant .bubble { background:#1e1e1e; border:1px solid #2a2a2a; color:#d8d8d8; border-radius:10px 10px 10px 3px; }
+  .msg .meta { font-size:10px; color:#444; margin-top:4px; padding:0 4px; }
+  .msg.user .meta { text-align:right; }
+  .status-msg { text-align:center; color:#555; font-size:12px; font-style:italic; }
+  .memory-msg { text-align:center; color:#6a9a5a; font-size:12px; }
+  #typing-indicator { display:none; background:#141414; border-top:1px solid #2d3a2d; padding:8px 20px; align-items:center; gap:10px; flex-shrink:0; }
+  .typing-dots { display:flex; gap:4px; }
+  .typing-dots div { width:6px; height:6px; background:#f0c060; border-radius:50%; animation:bounce 1.2s infinite; }
+  .typing-dots div:nth-child(2) { animation-delay:0.2s; }
+  .typing-dots div:nth-child(3) { animation-delay:0.4s; }
+  @keyframes bounce { 0%,60%,100%{transform:translateY(0)} 30%{transform:translateY(-6px)} }
+  #typing-text { font-size:12px; color:#888; font-family:Inter,sans-serif; }
+  #send-btn.loading { position:relative; color:transparent; }
+  #send-btn.loading::after { content:''; position:absolute; width:16px; height:16px; top:50%; left:50%; margin:-8px 0 0 -8px; border:2px solid #111; border-top-color:transparent; border-radius:50%; animation:spin 0.8s linear infinite; }
+  @keyframes spin { to { transform:rotate(360deg); } }
+  /* Progress Bar fuer Video/Bild-Generierung */
+  .task-progress { background:#1a1a1a; border:1px solid #2a2a2a; border-radius:10px; padding:12px 16px; margin:10px auto; max-width:600px; font-family:Inter,sans-serif; }
+  .task-progress .tp-head { display:flex; align-items:center; gap:8px; margin-bottom:8px; font-size:12px; color:#e0e0e0; }
+  .task-progress .tp-pulse { width:8px; height:8px; border-radius:50%; background:#f0c060; animation:tpPulse 1.4s ease-in-out infinite; flex-shrink:0; }
+  .task-progress .tp-label { flex:1; color:#c0c0c0; }
+  .task-progress .tp-times { font-size:11px; color:#777; font-variant-numeric:tabular-nums; }
+  .task-progress .tp-bar-outer { background:#0d0d0d; border:1px solid #2a2a2a; border-radius:6px; height:10px; overflow:hidden; }
+  .task-progress .tp-bar-inner { height:100%; background:linear-gradient(90deg,#f0c060,#f5cc70); border-radius:5px; width:0%; transition:width 0.6s ease; position:relative; }
+  .task-progress .tp-bar-inner::after { content:''; position:absolute; top:0; left:0; right:0; bottom:0; background:linear-gradient(90deg,transparent,rgba(255,255,255,0.18),transparent); animation:tpShimmer 1.8s linear infinite; }
+  .task-progress.done .tp-bar-inner { background:#6a9a5a; }
+  .task-progress.done .tp-bar-inner::after { display:none; }
+  .task-progress.done .tp-pulse { background:#6a9a5a; animation:none; }
+  .task-progress.error .tp-bar-inner { background:#a05050; }
+  .task-progress.error .tp-bar-inner::after { display:none; }
+  .task-progress.error .tp-pulse { background:#a05050; animation:none; }
+  @keyframes tpPulse { 0%,100%{opacity:1;transform:scale(1)} 50%{opacity:0.45;transform:scale(0.82)} }
+  @keyframes tpShimmer { 0%{transform:translateX(-100%)} 100%{transform:translateX(100%)} }
+  #input-area { background:#111; border-top:1px solid #2a2a2a; padding:12px 16px; flex-shrink:0; }
+  #input-row { display:flex; gap:10px; align-items:flex-end; margin-bottom:8px; }
+  #msg-input { flex:1; background:#1e1e1e; border:1px solid #333; color:#e0e0e0; padding:10px 14px; font-size:14px; font-family:Inter,sans-serif; resize:none; border-radius:8px; min-height:44px; max-height:160px; outline:none; line-height:1.5; }
+  #msg-input:focus { border-color:#555; }
+  #send-btn { background:#f0c060; color:#111; border:none; padding:10px 20px; cursor:pointer; font-size:13px; border-radius:8px; height:44px; font-weight:700; font-family:Inter,sans-serif; flex-shrink:0; }
+  #send-btn:hover { background:#f5cc70; }
+  #send-btn:disabled { background:#333; color:#666; cursor:not-allowed; }
+  #stop-btn { background:#cc3333; color:#fff; border:none; padding:10px 16px; cursor:pointer; font-size:13px; border-radius:8px; height:44px; font-weight:700; font-family:Inter,sans-serif; flex-shrink:0; display:none; }
+  #stop-btn:hover { background:#dd4444; }
+  #queue-display { display:none; padding:6px 16px; background:#161616; border-top:1px solid #252525; font-size:12px; color:#888; font-family:Inter,sans-serif; }
+  .msg.queued .bubble { background:#1a1a1a; border:1px dashed #333; color:#666; font-size:12px; font-style:italic; }
+  #tools-row { display:flex; gap:8px; align-items:center; }
+  #url-input { width:160px; background:#1a1a1a; border:1px solid #2a2a2a; color:#888; padding:7px 12px; font-size:12px; border-radius:6px; outline:none; font-family:Inter,sans-serif; }
+  #url-input::placeholder { color:#444; }
+  #url-input:focus { border-color:#444; color:#ccc; }
+  #file-ac-wrap { position:relative; flex:1; }
+  #file-ac-input { width:100%; background:#1a1a1a; border:1px solid #2a2a2a; color:#888; padding:7px 12px; font-size:12px; border-radius:6px; outline:none; font-family:Inter,sans-serif; box-sizing:border-box; }
+  #file-ac-input::placeholder { color:#444; }
+  #file-ac-input:focus { border-color:#444; color:#ccc; }
+  #slash-ac-dropdown {
+  display:none; position:absolute; bottom:100%; left:0; right:0;
+  .slash-ac-group { padding:6px 12px 3px; font-size:10px; color:#f0c060; font-weight:700; letter-spacing:1px; text-transform:uppercase; border-top:1px solid #2a2a2a; margin-top:2px; }
+  .slash-ac-group:first-child { border-top:none; margin-top:0; }
+  background:#1a1a1a; border:1px solid #333; border-radius:8px;
+  max-height:400px; overflow-y:auto; z-index:200; margin-bottom:4px;
+  box-shadow: 0 -4px 12px rgba(0,0,0,0.4);
+}
+.slash-ac-item {
+  padding:10px 14px; cursor:pointer; font-size:13px; color:#ccc;
+  font-family:Inter,system-ui,sans-serif; border-bottom:1px solid #252525;
+}
+.slash-ac-item:last-child { border-bottom:none; }
+.slash-ac-item:hover, .slash-ac-item.active { background:#252525; color:#fff; }
+#type-ac-dropdown { display:none; position:absolute; bottom:100%; left:0; right:0; background:#1a1a1a; border:1px solid #333; border-radius:8px; margin-bottom:4px; max-height:220px; overflow-y:auto; z-index:201; font-family:Inter,sans-serif; font-size:13px; }
+.type-ac-item { padding:8px 14px; cursor:pointer; display:flex; justify-content:space-between; align-items:center; color:#ccc; transition:background 0.1s; }
+.type-ac-item:hover, .type-ac-item.active { background:#252525; color:#fff; }
+.type-ac-item .type-shortcut { color:#555; font-size:11px; font-weight:600; min-width:18px; text-align:center; }
+
+#file-ac-dropdown { display:none; position:absolute; bottom:100%; left:0; right:0; background:#1a1a1a; border:1px solid #444; border-radius:6px; margin-bottom:4px; max-height:280px; overflow-y:auto; z-index:150; box-shadow:0 -4px 12px rgba(0,0,0,0.5); }
+  .file-ac-item { padding:8px 12px; cursor:pointer; font-size:12px; color:#ccc; border-bottom:1px solid #252525; }
+  .file-ac-item:hover, .file-ac-item.selected { background:#2a2a2a; color:#f0c060; }
+  .file-ac-item .ac-filename { font-weight:500; }
+  .file-ac-item .ac-snippet { color:#666; font-size:10px; margin-top:2px; display:block; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+  .tool-btn { background:none; border:1px solid #333; color:#777; padding:6px 12px; cursor:pointer; font-size:12px; border-radius:6px; font-family:Inter,sans-serif; white-space:nowrap; }
+  .tool-btn:hover { border-color:#555; color:#bbb; }
+  #memory-search { flex:1; background:#1a1a1a; border:1px solid #2a2a2a; color:#888; padding:7px 12px; font-size:12px; border-radius:6px; outline:none; font-family:Inter,sans-serif; }
+  #memory-search::placeholder { color:#444; }
+  #file-input { display:none; }
+  #search-toggle { background:none; border:1px solid #333; padding:6px 10px; cursor:pointer; font-size:16px; border-radius:6px; line-height:1; }
+  #search-toggle.active { border-color:#f0c060; background:#2a2a1a; }
+  #agent-modal { display:none; position:fixed; inset:0; background:rgba(0,0,0,0.85); z-index:200; align-items:center; justify-content:center; }
+  #agent-modal.show { display:flex; }
+  #agent-box { background:#1a1a1a; border:1px solid #333; padding:28px; min-width:320px; border-radius:12px; max-height:80vh; overflow-y:auto; }
+  #agent-box h2 { font-size:11px; color:#666; text-transform:uppercase; letter-spacing:2px; margin-bottom:20px; font-weight:600; }
+  .agent-opt { display:block; width:100%; background:#222; border:1px solid #333; color:#ccc; padding:10px 14px; margin-bottom:8px; cursor:pointer; font-size:13px; text-align:left; border-radius:8px; font-family:Inter,sans-serif; }
+  .agent-opt:hover { border-color:#f0c060; color:#f0c060; }
+  .agent-parent-row { display:flex; align-items:center; gap:0; margin-bottom:8px; }
+  .agent-parent-row .agent-opt { flex:1; margin-bottom:0; border-radius:8px 0 0 8px; }
+  .agent-expand-btn { background:#222; border:1px solid #333; border-left:none; color:#666; padding:10px 12px; cursor:pointer; font-size:13px; border-radius:0 8px 8px 0; transition:transform 0.2s; font-family:Inter,sans-serif; }
+  .agent-expand-btn:hover { color:#f0c060; border-color:#f0c060; }
+  .agent-expand-btn.expanded { color:#f0c060; }
+  .agent-expand-btn .arrow { display:inline-block; transition:transform 0.2s; }
+  .agent-expand-btn.expanded .arrow { transform:rotate(90deg); }
+  .agent-subs { overflow:hidden; max-height:0; transition:max-height 0.25s ease-out; }
+  .agent-subs.open { max-height:300px; transition:max-height 0.3s ease-in; }
+  .agent-sub-opt { display:block; width:calc(100% - 16px); margin-left:16px; background:#1a1a1a; border:1px solid #2a2a2a; color:#999; padding:8px 14px; margin-bottom:4px; cursor:pointer; font-size:11px; text-align:left; border-radius:6px; font-family:Inter,sans-serif; }
+  .agent-sub-opt:hover { border-color:#f0c060; color:#f0c060; }
+  .agent-sub-opt::before { content:'\21b3 '; color:#555; }
+  .new-agent-row { display:flex; gap:8px; margin-top:12px; }
+  .new-agent-input { flex:1; background:#1a1a1a; border:1px solid #333; color:#ccc; padding:8px 12px; font-size:13px; border-radius:8px; outline:none; font-family:Inter,sans-serif; }
+  .new-agent-btn { background:#f0c060; color:#111; border:none; padding:8px 14px; cursor:pointer; font-size:12px; border-radius:8px; font-weight:700; font-family:Inter,sans-serif; }
+  #drop-overlay { display:none; position:fixed; inset:0; background:rgba(240,192,96,0.12); border:3px dashed #f0c060; z-index:500; pointer-events:none; align-items:center; justify-content:center; flex-direction:column; gap:12px; }
+  #drop-overlay.active { display:flex; }
+  pre { white-space:pre-wrap; word-wrap:break-word; font-family:Inter,sans-serif; font-size:14px; }
+  .history-item { display:block; width:100%; background:none; border:none; border-radius:6px; padding:7px 10px; cursor:pointer; text-align:left; font-family:Inter,sans-serif; margin-bottom:3px; transition:background 0.15s; }
+  .bubble { position:relative; }
+  .bubble.markdown-rendered h1, .bubble.markdown-rendered h2, .bubble.markdown-rendered h3, .bubble.markdown-rendered h4 { color:#e8e8e8; margin:14px 0 6px 0; font-family:Inter,sans-serif; }
+  .bubble.markdown-rendered h1 { font-size:18px; font-weight:700; }
+  .bubble.markdown-rendered h2 { font-size:16px; font-weight:700; }
+  .bubble.markdown-rendered h3 { font-size:15px; font-weight:600; }
+  .bubble.markdown-rendered h4 { font-size:14px; font-weight:600; }
+  .bubble.markdown-rendered p { margin:6px 0; }
+  .bubble.markdown-rendered ul, .bubble.markdown-rendered ol { margin:6px 0 6px 20px; padding:0; }
+  .bubble.markdown-rendered li { margin:3px 0; }
+  .bubble.markdown-rendered a { color:#6aafff; text-decoration:underline; }
+  .bubble.markdown-rendered a:hover { color:#8ac4ff; }
+  .bubble.markdown-rendered strong { color:#f0f0f0; }
+  .bubble.markdown-rendered code { background:#0d0d0d; padding:1px 5px; border-radius:3px; font-size:13px; font-family:monospace; }
+  .bubble.markdown-rendered pre { background:#0d0d0d; border:1px solid #333; border-radius:6px; padding:10px 12px; margin:8px 0; overflow-x:auto; }
+  .bubble.markdown-rendered pre code { background:none; padding:0; font-size:12px; }
+  .bubble.markdown-rendered table { border-collapse:collapse; margin:8px 0; width:100%; font-size:13px; }
+  .bubble.markdown-rendered th, .bubble.markdown-rendered td { border:1px solid #333; padding:6px 10px; text-align:left; }
+  .bubble.markdown-rendered th { background:#1a1a1a; color:#ccc; font-weight:600; }
+  .bubble.markdown-rendered blockquote { border-left:3px solid #444; padding-left:12px; margin:8px 0; color:#999; }
+  .bubble.markdown-rendered hr { border:none; border-top:1px solid #333; margin:12px 0; }
+  .bubble.markdown-rendered img { max-width:100%; border-radius:4px; }
+  .code-block-wrapper { position:relative; background:#0d0d0d; border:1px solid #333; border-radius:6px; margin:8px 0; padding:0; }
+  .code-block-wrapper pre { margin:0; padding:10px 12px; white-space:pre-wrap; word-wrap:break-word; font-size:12px; }
+  .code-block-lang { position:absolute; top:4px; left:10px; font-size:9px; color:#555; text-transform:uppercase; font-family:Inter,sans-serif; }
+  .code-copy-btn { position:absolute; top:4px; right:6px; background:rgba(255,255,255,0.06); border:1px solid rgba(255,255,255,0.12); border-radius:5px; color:#888; font-size:11px; padding:2px 8px; cursor:pointer; transition:background 0.15s, color 0.15s; z-index:10; font-family:Inter,sans-serif; }
+  .code-copy-btn:hover { background:rgba(255,255,255,0.14); color:#fff; }
+  .code-copy-btn.copied { color:#4caf50; border-color:#4caf50; }
+  .output-block { position:relative; background:#0f1a0f; border-left:3px solid #4a8a4a; border-radius:4px; padding:12px 16px; margin:8px 0; }
+  .output-block pre { margin:0; white-space:pre-wrap; word-wrap:break-word; }
+  .output-copy-btn { position:absolute; top:6px; right:6px; background:rgba(74,138,74,0.15); border:1px solid rgba(74,138,74,0.3); border-radius:5px; color:#6a9a5a; font-size:11px; padding:2px 8px; cursor:pointer; transition:background 0.15s, color 0.15s; z-index:10; font-family:Inter,sans-serif; }
+  .output-copy-btn:hover { background:rgba(74,138,74,0.3); color:#8fc87f; }
+  .output-copy-btn.copied { color:#4caf50; border-color:#4caf50; }
+  .snippet-copy-btn { position:absolute; top:6px; right:6px; background:rgba(255,255,255,0.04); border:1px solid rgba(255,255,255,0.08); border-radius:5px; color:#555; font-size:10px; padding:2px 8px; cursor:pointer; transition:background 0.15s, color 0.15s; z-index:10; font-family:Inter,sans-serif; }
+  .snippet-copy-btn:hover { background:rgba(255,255,255,0.14); color:#fff; }
+  .snippet-copy-btn.copied { color:#4caf50; border-color:#4caf50; }
+  .section-copy-marker { position:relative; height:0; overflow:visible; pointer-events:none; }
+  .section-copy-btn { position:absolute; right:0; top:2px; background:transparent; border:1px solid rgba(255,255,255,0.08); border-radius:4px; color:#555; font-size:10px; padding:1px 7px; cursor:pointer; transition:opacity 0.15s, color 0.15s, border-color 0.15s; z-index:5; font-family:Inter,sans-serif; opacity:0.4; pointer-events:auto; }
+  .section-copy-btn:hover { opacity:1; color:#f0c060; border-color:#f0c060; }
+  .shortcut-label { opacity:0.35; font-size:9px; font-weight:400; margin-left:2px; }
+  #find-chips-bar { display:none; padding:6px 0 4px; gap:6px; flex-wrap:wrap; align-items:center; }
+  #find-chips-bar.visible { display:flex; }
+  .find-chip { padding:4px 10px; background:#222; border:1px solid #444; border-radius:14px; font-size:12px; color:#aaa; cursor:pointer; font-family:Inter,sans-serif; transition:all 0.15s; white-space:nowrap; }
+  .find-chip:hover { border-color:#f0c060; color:#f0c060; }
+  .find-chip.active { border-color:#f0c060; color:#f0c060; background:#2a2a1a; }
+  .find-chip .chip-shortcut { opacity:0.4; font-size:9px; margin-left:3px; }
+  #find-live-dropdown { display:none; position:absolute; bottom:100%; left:0; right:0; background:#1a1a1a; border:1px solid #333; border-radius:8px; margin-bottom:4px; max-height:280px; overflow-y:auto; z-index:202; font-family:Inter,sans-serif; }
+  .find-live-item { padding:8px 14px; cursor:pointer; color:#ccc; font-size:13px; border-bottom:1px solid #222; display:flex; justify-content:space-between; }
+  .find-live-item:hover, .find-live-item.active { background:#252525; color:#fff; }
+  .find-live-item .flr-name { flex:1; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+  .find-live-item .flr-type { font-size:10px; color:#666; margin-left:8px; white-space:nowrap; }
+  .section-copy-btn.copied { color:#4caf50; border-color:#4caf50; opacity:1; }
+  /* TOOLTIPS_V1 — dezente Hover-Tooltips fuer Provider/Modell/Agent */
+  #tt-box { position:fixed; z-index:9999; background:#1a1a1a; color:#eaeaea; border:1px solid #3a3a3a; border-radius:8px; padding:8px 12px; font-size:12px; font-family:Inter,sans-serif; max-width:320px; line-height:1.4; box-shadow:0 6px 18px rgba(0,0,0,0.6); pointer-events:none; opacity:0; transition:opacity 0.12s ease; white-space:normal; }
+  #tt-box.show { opacity:1; }
+  #tt-box .tt-title { color:#f0c060; font-weight:700; margin-bottom:3px; font-size:12px; }
+  #tt-box .tt-body { color:#cfcfcf; font-size:11px; }
+</style>
+<script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
+</head>
+<body>
+<div id="tt-box"><div class="tt-title"></div><div class="tt-body"></div></div><!-- TOOLTIPS_V1 -->
+<div id="drop-overlay">
+  <div style="font-size:48px;">📂</div>
+  <div style="font-size:18px;font-weight:600;color:#f0c060;font-family:Inter,sans-serif;">Dateien hier ablegen</div>
+</div>
+
+<div id="header">
+  <h1>ASSISTANT</h1>
+  <button id="prompt-btn" onclick="toggleSidebar()">☰ Prompt <span class="shortcut-label">[P]</span></button>
+  <div id="header-spacer" style="flex:1;"></div><!-- AGENT_BTN_V1 -->
+  <button class="hdr-btn" onclick="newSession()" style="background:#2a3a2a;border-color:#4a6a4a;color:#a0d090;">+ Neu <span class="shortcut-label">[N]</span></button>
+  <button id="agent-btn" class="hdr-btn" data-tooltip-kind="agent" onclick="showAgentModal()"><span id="agent-label">Kein Agent</span> <span class="shortcut-label">[A]</span></button>
+  <select id="provider-select" class="hdr-select" onchange="onProviderChange()">
+    <option>Anthropic</option>
+  </select>
+  <select id="model-select" class="hdr-select" onchange="onModelChange()">
+    <option>Claude Sonnet 4.6</option>
+  </select>
+  <div id="token-indicator" style="position:relative;display:inline-block;">
+    <button id="token-btn" class="hdr-btn" onclick="toggleTokenPanel()" style="font-size:11px;padding:2px 8px;min-width:80px;">~0k tokens</button>
+    <div id="token-panel" style="display:none;position:absolute;right:0;top:100%;background:#1a1a1a;border:1px solid #333;border-radius:8px;padding:12px;min-width:280px;z-index:100;box-shadow:0 4px 12px rgba(0,0,0,0.5);margin-top:4px;">
+      <div style="font-size:11px;color:#888;margin-bottom:8px;font-weight:600;">KONTEXT-DETAILS</div>
+      <div id="token-details" style="font-size:12px;color:#ccc;"></div>
+      <button onclick="slimMode()" style="margin-top:8px;background:#2a2020;border:1px solid #6a3a3a;color:#d09090;border-radius:4px;padding:4px 10px;font-size:11px;cursor:pointer;width:100%;">Slim Mode — alle Memory-Dateien entfernen</button>
+    </div>
+  </div>
+</div>
+
+<div id="main">
+  <div id="sidebar">
+    <div id="sidebar-header">
+      <span style="font-size:11px;color:#aaa;font-weight:600;letter-spacing:1.5px;text-transform:uppercase;">System Prompt</span>
+      <div style="display:flex;align-items:center;gap:8px;">
+        <span id="memory-indicator" style="font-size:10px;color:#6a9a5a;display:none;">● inkl. Memory</span>
+        <span id="sidebar-agent-name" style="font-size:11px;color:#f0c060;font-style:italic;"></span>
+      </div>
+    </div>
+    <div id="memory-note" style="padding:6px 16px;background:#161616;border-bottom:1px solid #222;flex-shrink:0;display:none;">
+      <span style="font-size:10px;color:#666;">Hier wird der vollstaendige aktive System Prompt angezeigt. 'Basis speichern' speichert nur den oberen Teil (bis --- GEDAECHTNIS).</span>
+    </div>
+    <textarea id="prompt-editor" placeholder="Kein Agent aktiv..."></textarea>
+    <div id="sidebar-btns">
+      <button onclick="savePrompt()" style="flex:1;background:#f0c060;color:#111;border:none;padding:7px;border-radius:6px;font-size:12px;font-weight:700;cursor:pointer;font-family:Inter,sans-serif;">Basis speichern</button>
+      <button onclick="reloadPrompt()" style="background:#2a2a2a;color:#aaa;border:1px solid #444;padding:7px 12px;border-radius:6px;font-size:12px;cursor:pointer;font-family:Inter,sans-serif;">Neu laden</button>
+    </div>
+    <div id="history-section">
+      <span>Konversationen</span>
+      <div id="history-list">
+        <p style="font-size:11px;color:#555;padding:8px;font-style:italic;">Kein Agent aktiv</p>
+      </div>
+    </div>
+  </div>
+
+  <div id="chat-area">
+    <div id="ctx-bar">
+      <span class="ctx-label">Kontext</span>
+      <div id="ctx-items" style="display:flex;gap:6px;flex-wrap:wrap;"></div>
+    </div>
+    <div id="messages"></div>
+    <div id="typing-indicator">
+      <div class="typing-dots"><div></div><div></div><div></div></div>
+      <span id="typing-text">Denkt nach...</span>
+    </div>
+    <div id="queue-display"><span id="queue-text"></span></div>
+    <div id="input-area">
+      <div id="find-chips-bar">
+        <span style="font-size:10px;color:#555;margin-right:4px;">Typ:</span>
+        <span class="find-chip" data-cat="email" onclick="toggleFindChip('email')">✉ E-Mail<span class="chip-shortcut">[1]</span></span>
+        <span class="find-chip" data-cat="webclip" onclick="toggleFindChip('webclip')">🌐 Web Clip<span class="chip-shortcut">[2]</span></span>
+        <span class="find-chip" data-cat="document" onclick="toggleFindChip('document')">📄 Dokument<span class="chip-shortcut">[3]</span></span>
+        <span class="find-chip" data-cat="conversation" onclick="toggleFindChip('conversation')">💬 Konversation<span class="chip-shortcut">[4]</span></span>
+        <span class="find-chip" data-cat="screenshot" onclick="toggleFindChip('screenshot')">📸 Screenshot<span class="chip-shortcut">[5]</span></span>
+      </div>
+      <div id="input-row" style="position:relative;">
+        <div id="find-live-dropdown"></div>
+        <textarea id="msg-input" placeholder="Nachricht..." rows="1" disabled onkeydown="onKey(event)" oninput="autoResize(this); onInputHandler(this);"></textarea>
+        <button id="send-btn" title="Ctrl+Enter" onclick="sendMessage()" disabled>Senden</button>
+        <button id="stop-btn" onclick="stopQueue()">&#9209; Stop</button>
+      </div>
+      <div id="tools-row">
+        <input type="text" id="url-input" placeholder="URL..." onkeydown="if(event.key==='Enter')addUrl()" />
+        <button class="tool-btn" onclick="addUrl()">+ URL</button>
+
+        <button class="tool-btn" onclick="document.getElementById('file-input').click()">+ Datei <span class="shortcut-label">[U]</span></button>
+        <input type="file" id="file-input" multiple onchange="addFileFromInput()" />
+      </div>
+    </div>
+  </div>
+</div>
+
+<div id="agent-modal">
+  <div id="agent-box">
+    <h2>Agent auswaehlen</h2>
+    <div id="agent-list"></div>
+    <div class="new-agent-row">
+      <input type="text" class="new-agent-input" id="new-agent-name" placeholder="Neuer Agent..." />
+      <button class="new-agent-btn" onclick="createAgent()">+ Neu</button>
+    </div>
+  </div>
+</div>
+
+<div id="search-overlay">
+  <div id="search-panel">
+    <div id="search-panel-header">
+      <h3 id="search-panel-title">🔍 Suche</h3>
+      <span id="search-panel-count"></span>
+    </div>
+    <div id="search-filter-bar">
+      <button class="search-filter-btn active" data-filter="all" onclick="applySearchFilter('all')">Alle</button>
+      <button class="search-filter-btn" data-filter="email" onclick="applySearchFilter('email')">&#9993; E-Mail</button>
+      <button class="search-filter-btn" data-filter="webclip" onclick="applySearchFilter('webclip')">&#127760; Web Clip</button>
+      <button class="search-filter-btn" data-filter="document" onclick="applySearchFilter('document')">&#128196; Dokument</button>
+      <button class="search-filter-btn" data-filter="conversation" onclick="applySearchFilter('conversation')">&#128172; Konversation</button>
+      <button class="search-filter-btn" data-filter="screenshot" onclick="applySearchFilter('screenshot')">&#128248; Screenshot</button>
+      <button class="search-filter-btn" data-filter="whatsapp" onclick="applySearchFilter('whatsapp')">&#128172; WhatsApp</button>
+    </div>
+    <div id="search-subfilter-bar"></div>
+    <div id="search-info-bar" style="padding:4px 18px;display:flex;align-items:center;gap:12px;font-size:13px;color:#aaa;">
+      <span id="search-hit-count" style="font-weight:600;color:#e0e0e0;"></span>
+      <button id="search-toggle-all-btn" onclick="toggleAllSearchCheckboxes()" style="background:none;border:1px solid #555;color:#ccc;padding:3px 10px;border-radius:4px;font-size:12px;cursor:pointer;font-family:Inter,sans-serif;">Alle markieren</button>
+    </div>
+    <div id="search-results-list"></div>
+    <div id="search-panel-footer">
+      <span id="search-selection-counter">0 / 50 ausgewaehlt</span>
+      <button class="search-btn-cancel" onclick="closeSearchDialog(true)">Ohne Dateien senden</button>
+      <button class="search-btn-secondary" onclick="loadSelectedResults()">Auswahl laden</button>
+      <button class="search-btn-primary" onclick="loadAllResults()">Alle laden (max 50)</button>
+    </div>
+  </div>
+</div>
+
+<script>
+// ─── SESSION ID ──────────────────────────────────────────────────────────────
+function getSessionId() {
+  let sid = sessionStorage.getItem('assistant_session_id');
+  if (!sid) {
+    sid = 'sess_' + Date.now() + '_' + Math.random().toString(36).substr(2, 9);
+    sessionStorage.setItem('assistant_session_id', sid);
+  }
+  return sid;
+}
+const SESSION_ID = getSessionId();
+let sidebarOpen = true;
+let currentModel = {provider:'anthropic', model_id:'claude-sonnet-4-6', model_name:'Claude Sonnet 4.6'};
+let searchVisible = false;
+function getAgentName() { return document.getElementById('agent-label').dataset.agentName || document.getElementById('agent-label').textContent; }
+
+// ─── TOOLTIPS_V1 ─────────────────────────────────────────────────────────────
+var PROVIDER_TOOLTIPS = {
+  'Anthropic': 'Anthropic Claude — Stark in Analyse, Schreiben, Coding und komplexem Reasoning',
+  'OpenAI': 'OpenAI GPT — Vielseitig, stark in Coding, Bildgenerierung (gpt-image-1) und strukturierten Outputs',
+  'Google Gemini': 'Google Gemini — Stark in Multimodal, langer Kontext, Video- & Bildgenerierung (Veo, Imagen)',
+  'Gemini': 'Google Gemini — Stark in Multimodal, langer Kontext, Video- & Bildgenerierung (Veo, Imagen)',
+  'Mistral': 'Mistral — Schnell und effizient, stark in europaeischen Sprachen und Code',
+  'Perplexity': 'Perplexity — Spezialisiert auf Web-Suche und aktuelle Informationen'
+};
+var MODEL_TOOLTIPS = {
+  'Claude Sonnet 4.6': 'Bestes Preis-Leistungs-Verhaeltnis — schnell, intelligent, fuer taegliche Aufgaben',
+  'Claude Opus 4.6': 'Staerkstes Claude-Modell — fuer komplexe, anspruchsvolle Aufgaben',
+  'Claude Haiku 4.5': 'Schnellstes Claude-Modell — fuer einfache, schnelle Antworten',
+  'GPT-4o': 'OpenAIs Flagship — stark in Multimodal, Coding, strukturierten Outputs',
+  'GPT-4o Mini': 'Schnell und guenstig — fuer einfache Aufgaben und hohe Volumen',
+  'o1': 'OpenAI Reasoning-Modell — fuer komplexe logische und mathematische Probleme',
+  'Mistral Large': 'Mistral Flagship — stark in Mehrsprachigkeit und komplexen Aufgaben',
+  'Mistral Small': 'Mistral kompakt — effizient fuer einfachere Aufgaben',
+  'Mistral Nemo': 'Mistral Nemo — leichtgewichtig, sehr schnell',
+  'Gemini 2.0 Flash': 'Schnell und guenstig — fuer alltaegliche Aufgaben mit Multimodal-Unterstuetzung',
+  'Gemini 2.5 Pro': 'Googles staerkstes Modell — langer Kontext (1M tokens), komplexes Reasoning',
+  'Gemini 2.5 Flash': 'Googles schnellstes Flagship — ideal fuer Video/Bild-Generierung und schnelle Antworten',
+  'Gemini 3 Flash (Preview)': 'Gemini 3 Flash Preview — neue Generation, sehr schnell',
+  'Gemini 3 Pro (Preview)': 'Gemini 3 Pro Preview — neue Generation, fuer anspruchsvolle Aufgaben',
+  'Gemini 3.1 Pro (Preview)': 'Gemini 3.1 Pro Preview — neueste Generation mit Reasoning',
+  'Sonar': 'Perplexity Web-Suche — schnell, aktuelle Informationen',
+  'Sonar Pro': 'Perplexity Pro-Suche — tiefere Recherche, mehr Quellen',
+  'Sonar Reasoning': 'Perplexity mit Reasoning — Suche + logische Schlussfolgerung',
+  'Sonar Reasoning Pro': 'Perplexity Pro Reasoning — tiefste Analyse mit aktuellen Daten',
+  'Sonar Deep Research': 'Perplexity Deep Research — ausfuehrliche Recherche fuer komplexe Themen'
+};
+var AGENT_DESCRIPTIONS = {};  // befuellt durch loadAgents()
+var _ttTimer = null;
+
+function ttGetContent(el) {
+  var kind = el.getAttribute('data-tooltip-kind') || '';
+  if (kind === 'provider') {
+    var ps = document.getElementById('provider-select');
+    var name = ps ? (ps.selectedOptions[0] ? ps.selectedOptions[0].textContent : ps.value) : '';
+    var body = PROVIDER_TOOLTIPS[name] || ('KI-Provider: ' + name);
+    return {title: name, body: body};
+  }
+  if (kind === 'model') {
+    var ms = document.getElementById('model-select');
+    if (!ms || !ms.selectedOptions[0]) return {title: 'Modell', body: ''};
+    var txt = ms.selectedOptions[0].textContent;
+    // Capabilities-Emojis am Ende abtrennen
+    var name = txt.replace(/[^a-zA-Z0-9().\s-]+$/g, '').trim();
+    var body = MODEL_TOOLTIPS[name];
+    if (!body) {
+      var pv = document.getElementById('provider-select');
+      var pname = pv && pv.selectedOptions[0] ? pv.selectedOptions[0].textContent : '';
+      body = 'KI-Modell von ' + (pname || 'unbekannt');
+    }
+    return {title: name, body: body};
+  }
+  if (kind === 'agent') {
+    var lbl = document.getElementById('agent-label');
+    var name = lbl ? (lbl.dataset.agentName || lbl.textContent) : '';
+    if (!name || name === 'Kein Agent') {
+      return {title: 'Kein Agent aktiv', body: 'Waehle oben rechts einen Agenten aus.'};
+    }
+    var desc = AGENT_DESCRIPTIONS[name] || '';
+    return {title: 'Agent: ' + name, body: desc || 'Aktiver Agent - klicken zum Wechseln.'};
+  }
+  // Generic fallback
+  var t = el.getAttribute('data-tooltip') || '';
+  return {title: '', body: t};
+}
+
+function ttShow(el) {
+  var box = document.getElementById('tt-box');
+  if (!box) return;
+  var c = ttGetContent(el);
+  if (!c.body && !c.title) return;
+  box.querySelector('.tt-title').textContent = c.title || '';
+  box.querySelector('.tt-title').style.display = c.title ? 'block' : 'none';
+  box.querySelector('.tt-body').textContent = c.body || '';
+  var r = el.getBoundingClientRect();
+  // Zuerst sichtbar machen um Groesse zu messen
+  box.style.left = '-9999px'; box.style.top = '-9999px';
+  box.classList.add('show');
+  var bw = box.offsetWidth;
+  var bh = box.offsetHeight;
+  var left = r.left + r.width/2 - bw/2;
+  if (left < 8) left = 8;
+  if (left + bw > window.innerWidth - 8) left = window.innerWidth - bw - 8;
+  var top = r.bottom + 8;
+  if (top + bh > window.innerHeight - 8) top = r.top - bh - 8; // ueber dem Element
+  box.style.left = left + 'px';
+  box.style.top = top + 'px';
+}
+
+function ttHide() {
+  if (_ttTimer) { clearTimeout(_ttTimer); _ttTimer = null; }
+  var box = document.getElementById('tt-box');
+  if (box) box.classList.remove('show');
+}
+
+function ttAttach(el) {
+  if (!el || el.dataset.ttBound === '1') return;
+  el.dataset.ttBound = '1';
+  el.addEventListener('mouseenter', function(){
+    if (_ttTimer) clearTimeout(_ttTimer);
+    _ttTimer = setTimeout(function(){ ttShow(el); }, 300);
+  });
+  el.addEventListener('mouseleave', ttHide);
+  el.addEventListener('mousedown', ttHide);
+}
+
+function ttAttachAll() {
+  var ps = document.getElementById('provider-select');
+  if (ps) { ps.setAttribute('data-tooltip-kind','provider'); ttAttach(ps); }
+  var ms = document.getElementById('model-select');
+  if (ms) { ms.setAttribute('data-tooltip-kind','model'); ttAttach(ms); }
+  var ab = document.getElementById('agent-btn');
+  if (ab) ttAttach(ab);
+}
+
+// ─── PROVIDERS ────────────────────────────────────────────────────────────────
+async function loadProviders() {
+  const r = await fetch('/models');
+  const data = await r.json();
+  const ps = document.getElementById('provider-select');
+  const ms = document.getElementById('model-select');
+  ps.innerHTML = '';
+  data.forEach(p => {
+    const o = document.createElement('option');
+    o.value = p.provider; o.textContent = p.name;
+    ps.appendChild(o);
+  });
+  if (data.length) populateModels(data[0]);
+  const saved = localStorage.getItem('claude_model');
+  if (saved) {
+    try {
+      const m = JSON.parse(saved);
+      currentModel = m;
+      for (let o of ps.options) { if (o.value === m.provider) { ps.value = m.provider; break; } }
+      const pd = data.find(p => p.provider === m.provider);
+      if (pd) { populateModels(pd); ms.value = m.model_id; }
+    } catch(e) {}
+  }
+  ttAttachAll(); // TOOLTIPS_V1
+  // Initiales Laden der Agent-Descriptions fuer Tooltip auf Agent-Button
+  try { fetch('/agents').then(function(r){return r.json();}).then(function(ags){
+    ags.forEach(function(a){
+      if (a.description) AGENT_DESCRIPTIONS[a.name] = a.description;
+      if (a.subagents) a.subagents.forEach(function(s){ if (s.description) AGENT_DESCRIPTIONS[s.name] = s.description; });
+    });
+  }); } catch(e) {}
+}
+
+function populateModels(providerData) {
+  const ms = document.getElementById('model-select');
+  ms.innerHTML = '';
+  (providerData.models || []).forEach(m => {
+    const o = document.createElement('option');
+    o.value = m.id; o.textContent = m.name + (m.capabilities && m.capabilities.length ? ' ' + m.capabilities.join('') : '');
+    ms.appendChild(o);
+  });
+}
+
+function onProviderChange() {
+  fetch('/models').then(r=>r.json()).then(data => {
+    const pv = document.getElementById('provider-select').value;
+    const pd = data.find(p => p.provider === pv);
+    if (pd) populateModels(pd);
+    onModelChange();
+  });
+}
+
+async function onModelChange() {
+  const pv = document.getElementById('provider-select').value;
+  const mv = document.getElementById('model-select').value;
+  const mt = document.getElementById('model-select').selectedOptions[0]?.textContent || mv;
+  const r = await fetch('/select_model', {method:'POST', headers:{'Content-Type':'application/json'},
+    body: JSON.stringify({provider: pv, model_id: mv, model_name: mt, session_id: SESSION_ID})});
+  const data = await r.json();
+  if (data.ok) {
+    currentModel = {provider: pv, model_id: mv, model_name: mt};
+    localStorage.setItem('claude_model', JSON.stringify(currentModel));
+    var agName = document.getElementById('agent-label').dataset.agentName; if (agName) fetch('/api/agent-model-preference', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({agent:agName, provider:pv, model:mv})});
+  }
+}
+
+// ─── AGENTS ────────────────────────────────────────────────────────────────────
+async function loadAgents() {
+  const r = await fetch('/agents');
+  const agents = await r.json();
+  // TOOLTIPS_V1: Agent-Beschreibungen in globaler Map cachen
+  try {
+    agents.forEach(function(a){
+      if (a.description) AGENT_DESCRIPTIONS[a.name] = a.description;
+      if (a.subagents) a.subagents.forEach(function(s){ if (s.description) AGENT_DESCRIPTIONS[s.name] = s.description; });
+    });
+  } catch(e) {}
+  const list = document.getElementById('agent-list');
+  list.innerHTML = '';
+  const expandedAgent = localStorage.getItem('agent_expanded') || '';
+  agents.forEach(a => {
+    if (a.has_subagents) {
+      // Parent row with expand button
+      const row = document.createElement('div');
+      row.className = 'agent-parent-row';
+      const btn = document.createElement('button');
+      btn.className = 'agent-opt';
+      btn.textContent = a.label;
+      btn.onclick = () => selectAgent(a.name);
+      row.appendChild(btn);
+      const expBtn = document.createElement('button');
+      expBtn.className = 'agent-expand-btn' + (expandedAgent === a.name ? ' expanded' : '');
+      expBtn.innerHTML = '<span class="arrow">\u25B6</span>';
+      const subsDiv = document.createElement('div');
+      subsDiv.className = 'agent-subs' + (expandedAgent === a.name ? ' open' : '');
+      expBtn.onclick = (e) => {
+        e.stopPropagation();
+        const isOpen = subsDiv.classList.contains('open');
+        // Close all others
+        document.querySelectorAll('.agent-subs.open').forEach(s => s.classList.remove('open'));
+        document.querySelectorAll('.agent-expand-btn.expanded').forEach(b => b.classList.remove('expanded'));
+        if (!isOpen) {
+          subsDiv.classList.add('open');
+          expBtn.classList.add('expanded');
+          localStorage.setItem('agent_expanded', a.name);
+        } else {
+          localStorage.removeItem('agent_expanded');
+        }
+      };
+      row.appendChild(expBtn);
+      list.appendChild(row);
+      // Sub-agents
+      a.subagents.forEach(sub => {
+        const subBtn = document.createElement('button');
+        subBtn.className = 'agent-sub-opt';
+        subBtn.textContent = sub.label;
+        subBtn.onclick = () => selectAgent(sub.name);
+        subsDiv.appendChild(subBtn);
+      });
+      list.appendChild(subsDiv);
+    } else {
+      // Simple agent without sub-agents
+      const btn = document.createElement('button');
+      btn.className = 'agent-opt';
+      btn.textContent = a.label;
+      btn.onclick = () => selectAgent(a.name);
+      btn.style.marginBottom = '8px';
+      list.appendChild(btn);
+    }
+  });
+}
+
+function showAgentModal() { loadAgents(); const m = document.getElementById('agent-modal'); m.classList.add('show'); m.style.display = 'flex'; }
+
+async function selectAgent(name) {
+  const m = document.getElementById('agent-modal'); m.classList.remove('show'); m.style.display = 'none';
+  // Display name: "signicat > outbound" for sub-agents
+  const displayName = name.includes('_') ? name.split('_')[0]+' \u203a '+name.split('_').slice(1).join('_') : name;
+  addStatusMsg('Lade Gedaechtnis fuer ' + displayName + '...');
+  const r = await fetch('/select_agent', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({agent:name, session_id:SESSION_ID})});
+  const data = await r.json();
+  document.getElementById('agent-label').textContent = displayName;
+  document.getElementById('agent-label').dataset.agentName = name;
+  document.getElementById('msg-input').disabled = false;
+  document.getElementById('send-btn').disabled = false;
+  document.getElementById('msg-input').placeholder = 'Nachricht an ' + displayName + '...';
+  document.getElementById('messages').innerHTML = '';
+  document.getElementById('ctx-items').innerHTML = '';
+  // Restore saved provider/model preference for this agent (synchronous from response)
+  if (data.pref_provider && data.pref_model) {
+    try {
+      var ps = document.getElementById('provider-select');
+      ps.value = data.pref_provider;
+      var mdata = await fetch('/models').then(r=>r.json());
+      var pd = mdata.find(p => p.provider === data.pref_provider);
+      if (pd) {
+        populateModels(pd);
+        var ms = document.getElementById('model-select');
+        ms.value = data.pref_model;
+        await onModelChange();
+      }
+    } catch(e) { console.log('Preference restore error:', e); }
+  }
+  addStatusMsg('Agent "' + displayName + '" \u2014 ' + currentModel.model_name);
+  if (data.memory_info) addMemoryMsg(data.memory_info);
+  if (data.base_prompt) updateSidebar(name, data.base_prompt);
+  loadHistory(name);
+}
+
+async function createAgent() {
+  const name = document.getElementById('new-agent-name').value.trim();
+  if (!name) return;
+  await fetch('/create_agent', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({name, session_id:SESSION_ID})});
+  document.getElementById('new-agent-name').value = '';
+  selectAgent(name);
+}
+
+// ─── TOKEN/KONTEXT MANAGER ──────────────────────────────────────────────────
+async function updateTokenCount() {
+  try {
+    const r = await fetch('/api/context-info?session_id=' + SESSION_ID);
+    const d = await r.json();
+    var total = d.total_tokens || 0;
+    var btn = document.getElementById('token-btn');
+    if (!btn) return;
+    var label = total >= 1000 ? '~' + (total / 1000).toFixed(1) + 'k tokens' : '~' + total + ' tokens';
+    btn.textContent = label;
+    if (d.limit_warning) {
+      btn.style.borderColor = '#d09050';
+      btn.style.color = '#d09050';
+    } else {
+      btn.style.borderColor = '';
+      btn.style.color = '';
+    }
+    // Update details panel
+    var det = document.getElementById('token-details');
+    if (det) {
+      var html = '<div style="margin-bottom:6px;">System-Prompt: <b>' + d.system_prompt_tokens + '</b></div>';
+      html += '<div style="margin-bottom:6px;">Konversation: <b>' + d.conversation_tokens + '</b></div>';
+      if (d.memory_files_loaded && d.memory_files_loaded.length > 0) {
+        html += '<div style="margin-bottom:4px;color:#888;">Memory-Dateien:</div>';
+        for (var i = 0; i < d.memory_files_loaded.length; i++) {
+          var mf = d.memory_files_loaded[i];
+          html += '<div style="display:flex;justify-content:space-between;padding:2px 0;font-size:11px;">';
+          html += '<span style="max-width:180px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">' + escHtml(mf.name) + '</span>';
+          html += '<span style="color:#888;">' + mf.tokens + '</span>';
+          html += '</div>';
+        }
+      }
+      html += '<div style="margin-top:8px;border-top:1px solid #333;padding-top:6px;font-weight:600;">Gesamt: ' + total + ' tokens</div>';
+      det.innerHTML = html;
+    }
+  } catch(e) {}
+}
+function toggleTokenPanel() {
+  var panel = document.getElementById('token-panel');
+  if (!panel) return;
+  var visible = panel.style.display !== 'none';
+  panel.style.display = visible ? 'none' : 'block';
+  if (!visible) updateTokenCount();
+}
+async function slimMode() {
+  try {
+    await fetch('/remove_all_ctx', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({session_id:SESSION_ID})});
+    document.getElementById('ctx-items').innerHTML = '';
+    updateTokenCount();
+    addStatusMsg('Alle Memory-Dateien aus dem Kontext entfernt.');
+  } catch(e) {}
+}
+// Update token count after each message
+setInterval(function() {
+  var btn = document.getElementById('token-btn');
+  if (btn) updateTokenCount();
+}, 30000);
+
+async function newSession() {
+  await fetch('/close_session', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({session_id:SESSION_ID})});
+  document.getElementById('messages').innerHTML = '';
+  document.getElementById('ctx-items').innerHTML = '';
+  addStatusMsg('Neue Session gestartet.');
+  const name = getAgentName();
+  if (name && name !== 'Kein Agent') {
+    const r = await fetch('/select_agent', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({agent:name, session_id:SESSION_ID})});
+    const data = await r.json();
+    if (data.memory_info) addMemoryMsg(data.memory_info);
+    loadHistory(name);
+  }
+}
+
+// ─── SIDEBAR ────────────────────────────────────────────────────────────────────
+let currentBasePrompt = '';
+async function toggleSidebar() {
+  sidebarOpen = !sidebarOpen;
+  const sb = document.getElementById('sidebar');
+  sb.style.width = sidebarOpen ? '30%' : '0';
+  sb.style.minWidth = sidebarOpen ? '280px' : '0';
+  if (sidebarOpen) {
+    const name = getAgentName();
+    if (name && name !== 'Kein Agent') {
+      const r = await fetch('/get_prompt?agent=' + encodeURIComponent(name) + '&session_id=' + SESSION_ID);
+      const data = await r.json();
+      if (data.ok) updateSidebar(name, data.prompt);
+    }
+  }
+}
+
+function updateSidebar(agentName, prompt) {
+  document.getElementById('sidebar-agent-name').textContent = agentName;
+  document.getElementById('prompt-editor').value = prompt;
+  currentBasePrompt = prompt;
+  const hasMemory = prompt.includes('--- GEDAECHTNIS:');
+  document.getElementById('memory-indicator').style.display = hasMemory ? 'inline' : 'none';
+  document.getElementById('memory-note').style.display = hasMemory ? 'block' : 'none';
+}
+
+async function savePrompt() {
+  const fullText = document.getElementById('prompt-editor').value;
+  const name = getAgentName();
+  if (!name || name === 'Kein Agent') return;
+  const r = await fetch('/save_prompt', {method:'POST', headers:{'Content-Type':'application/json'},
+    body: JSON.stringify({agent: name, prompt: fullText, session_id: SESSION_ID})});
+  const data = await r.json();
+  if (data.ok) { addStatusMsg('System Prompt gespeichert.'); }
+}
+
+async function reloadPrompt() {
+  const name = getAgentName();
+  if (!name || name === 'Kein Agent') return;
+  const r = await fetch('/get_prompt?agent=' + encodeURIComponent(name) + '&session_id=' + SESSION_ID);
+  const data = await r.json();
+  if (data.ok) { document.getElementById('prompt-editor').value = data.prompt; addStatusMsg('Neu geladen.'); }
+}
+
+// ─── HISTORY ────────────────────────────────────────────────────────────────────
+async function loadHistory(agentName) {
+  const r = await fetch('/get_history?agent=' + encodeURIComponent(agentName) + '&session_id=' + SESSION_ID);
+  const data = await r.json();
+  const list = document.getElementById('history-list');
+  if (!data.sessions || !data.sessions.length) {
+    list.innerHTML = '<p style="font-size:11px;color:#555;padding:8px;font-style:italic;">Keine Konversationen</p>';
+    return;
+  }
+  list.innerHTML = '';
+  data.sessions.forEach((s, i) => {
+    const btn = document.createElement('button');
+    btn.className = 'history-item' + (i===0?' active':'');
+    btn.dataset.file = s.file;
+    btn.innerHTML = '<span class="h-date">' + escHtml(s.date) + '</span><span class="h-summary">' + escHtml(s.title || s.date) + '</span>';
+    btn.onclick = () => loadConversation(s, btn);
+    list.appendChild(btn);
+  });
+}
+
+async function loadConversation(session, btn) {
+  document.querySelectorAll('.history-item').forEach(b => b.classList.remove('active'));
+  btn.classList.add('active');
+  const name = getAgentName();
+  const r = await fetch('/load_conversation', {method:'POST', headers:{'Content-Type':'application/json'},
+    body: JSON.stringify({agent: name, file: session.file, session_id: SESSION_ID, resume: true})});
+  const data = await r.json();
+  if (data.ok) {
+    document.getElementById('messages').innerHTML = '';
+    if (data.messages) data.messages.forEach(m => addMessage(m.role, m.content, m.role==='assistant'?name:null));
+    // Restore model selector from conversation
+    if (data.provider && data.model_id) {
+      var ps = document.getElementById('provider-select');
+      if (ps) {
+        ps.value = data.provider;
+        fetch('/models').then(r=>r.json()).then(mdata => {
+          var pd = mdata.find(p => p.provider === data.provider);
+          if (pd) {
+            populateModels(pd);
+            var ms = document.getElementById('model-select');
+            if (ms) ms.value = data.model_id;
+          }
+        });
+      }
+    }
+    // Restore context files from saved conversation
+    document.getElementById('ctx-items').innerHTML = '';
+    if (data.restored_ctx && data.restored_ctx.length) {
+      data.restored_ctx.forEach(n => addCtxItem(n, 'file', true));
+      addStatusMsg('Konversation geladen — ' + data.restored_ctx.length + ' Kontext-Datei(en) wiederhergestellt.');
+    } else {
+      addStatusMsg('Konversation geladen — deine naechste Nachricht wird hier fortgesetzt.');
+    }
+    if (data.missing_ctx && data.missing_ctx.length) {
+      addStatusMsg('\u26A0 ' + data.missing_ctx.length + ' Kontext-Datei(en) nicht mehr verfuegbar: ' + data.missing_ctx.join(', '));
+    }
+  }
+}
+
+// ─── MESSAGES ────────────────────────────────────────────────────────────────────
+function addStatusMsg(text) {
+  const div = document.createElement('p');
+  div.className = 'status-msg'; div.textContent = text;
+  document.getElementById('messages').appendChild(div);
+  scrollDown();
+}
+
+function addMemoryMsg(text) {
+  const div = document.createElement('p');
+  div.className = 'memory-msg'; div.textContent = '🧠 ' + text;
+  document.getElementById('messages').appendChild(div);
+  scrollDown();
+}
+
+function renderCodeBlocks(text) {
+  // Split text into code blocks (```) and regular text
+  var parts = text.split(/```/);
+  if (parts.length < 3) {
+    return '<pre>' + escHtml(text) + '</pre>';
+  }
+  var html = '';
+  for (var i = 0; i < parts.length; i++) {
+    if (i % 2 === 0) {
+      var t = parts[i].trim();
+      if (t) html += '<pre>' + escHtml(t) + '</pre>';
+    } else {
+      var lines = parts[i].split('\\n');
+      var lang = '';
+      var code = parts[i];
+      if (lines[0] && /^[a-zA-Z0-9_+-]+$/.test(lines[0].trim())) {
+        lang = lines[0].trim();
+        code = lines.slice(1).join('\\n');
+      }
+      var langLabel = lang ? '<span class="code-block-lang">' + escHtml(lang) + '</span>' : '';
+      html += '<div class="code-block-wrapper" data-code="' + escHtml(code).replace(/"/g, '&quot;') + '">' + langLabel + '<pre>' + escHtml(code) + '</pre></div>';
+    }
+  }
+  return html;
+}
+
+function renderMessageContent(text) {
+  // Parse <output>...</output> blocks first
+  var outputMatch = text.match(/<output>([\s\S]*?)<\/output>/);
+  if (outputMatch) {
+    var before = text.substring(0, outputMatch.index).trim();
+    var outputContent = outputMatch[1].trim();
+    var after = text.substring(outputMatch.index + outputMatch[0].length).trim();
+    var html = '';
+    if (before) html += renderMarkdown(before);
+    html += '<div class="output-block" data-output="' + escHtml(outputContent).replace(/"/g, '&quot;') + '">' + renderCodeBlocks(outputContent) + '</div>';
+    if (after) html += renderMarkdown(after);
+    return html;
+  }
+  // No output block — render with Markdown
+  return renderMarkdown(text);
+}
+
+function renderMarkdown(text) {
+  // Use marked.js if available, otherwise fall back to renderCodeBlocks
+  if (typeof marked !== 'undefined') {
+    try {
+      marked.setOptions({
+        breaks: true,
+        gfm: true,
+        headerIds: false,
+        mangle: false,
+      });
+      // Let marked handle everything including code blocks
+      var html = marked.parse(text);
+      // Make links open in new tab
+      html = html.replace(/<a /g, '<a target="_blank" rel="noopener" ');
+      return html;
+    } catch(e) {
+      console.warn('Markdown parse error, falling back:', e);
+    }
+  }
+  return renderCodeBlocks(text);
+}
+
+function addMessage(role, text, modelName, providerDisplay, modelDisplay) {
+  var msgs = document.getElementById('messages');
+  var div = document.createElement('div');
+  div.className = 'msg ' + role;
+  var time = new Date().toLocaleTimeString('de-DE', {hour:'2-digit', minute:'2-digit'});
+  var meta = time;
+  if (providerDisplay && modelDisplay) {
+    meta += ' · <span style="color:#888;font-style:italic">' + escHtml(providerDisplay) + ' / ' + escHtml(modelDisplay) + '</span>';
+  } else if (modelName) {
+    meta += ' · ' + escHtml(modelName);
+  }
+  if (role === 'assistant') {
+    div.innerHTML = '<div class="bubble markdown-rendered">' + renderMessageContent(text) + '</div><div class="meta">' + meta + '</div>';
+    addCodeCopyButtons(div);
+    addCopyButton(div, text);
+    addSectionCopyButtons(div, text);
+  } else {
+    div.innerHTML = '<div class="bubble"><pre>' + escHtml(text) + '</pre></div><div class="meta">' + meta + '</div>';
+  }
+  msgs.appendChild(div);
+  scrollDown();
+}
+
+function copyToClipboard(text, btn, label) {
+  navigator.clipboard.writeText(text).then(function() {
+    btn.textContent = 'Kopiert';
+    btn.classList.add('copied');
+    setTimeout(function() { btn.textContent = label; btn.classList.remove('copied'); }, 2000);
+  }).catch(function() {
+    var ta = document.createElement('textarea');
+    ta.value = text; document.body.appendChild(ta); ta.select(); document.execCommand('copy'); document.body.removeChild(ta);
+    btn.textContent = 'Kopiert';
+    setTimeout(function() { btn.textContent = label; }, 2000);
+  });
+}
+
+function addCodeCopyButtons(msgEl) {
+  var blocks = msgEl.querySelectorAll('.code-block-wrapper');
+  blocks.forEach(function(wrapper) {
+    var code = wrapper.getAttribute('data-code');
+    if (!code) return;
+    var btn = document.createElement('button');
+    btn.className = 'code-copy-btn';
+    btn.textContent = 'Kopieren';
+    btn.onclick = function() { copyToClipboard(code, btn, 'Kopieren'); };
+    wrapper.appendChild(btn);
+  });
+}
+
+function addCopyButton(msgEl, rawText) {
+  if (!rawText || rawText.length < 80) return;
+  var bubble = msgEl.querySelector('.bubble');
+  if (!bubble) return;
+  // Output block gets its own prominent copy button
+  var outputBlock = bubble.querySelector('.output-block');
+  if (outputBlock && !outputBlock.querySelector('.output-copy-btn')) {
+    var outputText = outputBlock.getAttribute('data-output') || outputBlock.innerText;
+    var obtn = document.createElement('button');
+    obtn.className = 'output-copy-btn';
+    obtn.textContent = 'Kopieren';
+    obtn.onclick = function() { copyToClipboard(outputText, obtn, 'Kopieren'); };
+    outputBlock.appendChild(obtn);
+  }
+  // Small "Alles" button on bubble level (for copying everything)
+  if (!bubble.querySelector('.snippet-copy-btn')) {
+    var hasBlocks = bubble.querySelectorAll('.code-block-wrapper, .output-block').length > 0;
+    if (hasBlocks) {
+      var btn = document.createElement('button');
+      btn.className = 'snippet-copy-btn';
+      btn.textContent = 'Alles';
+      btn.onclick = function() { copyToClipboard(rawText, btn, 'Alles'); };
+      bubble.appendChild(btn);
+    } else {
+      var btn = document.createElement('button');
+      btn.className = 'snippet-copy-btn';
+      btn.textContent = 'Kopieren';
+      btn.onclick = function() { copyToClipboard(rawText, btn, 'Kopieren'); };
+      bubble.appendChild(btn);
+    }
+  }
+}
+
+function addSectionCopyButtons(msgEl, rawText) {
+  if (!rawText || rawText.length < 40) return;
+  var bubble = msgEl.querySelector('.bubble');
+  if (!bubble) return;
+  // Find ## headings in rawText, but only outside code blocks
+  var codeParts = rawText.split('```');
+  var headingPositions = [];
+  var charPos = 0;
+  for (var ci = 0; ci < codeParts.length; ci++) {
+    if (ci % 2 === 0) {
+      var re = /^## .+/gm;
+      var m;
+      while ((m = re.exec(codeParts[ci])) !== null) {
+        headingPositions.push(charPos + m.index);
+      }
+    }
+    charPos += codeParts[ci].length + 3;
+  }
+  if (headingPositions.length === 0) return;
+  // Build rest-texts for each heading position
+  var restTexts = headingPositions.map(function(p) { return rawText.substring(p).trim(); });
+  // Find content <pre> elements (not in code-block-wrapper or output-block)
+  var allPres = Array.from(bubble.querySelectorAll('pre'));
+  var contentPres = allPres.filter(function(pre) {
+    return !pre.closest('.code-block-wrapper') && !pre.closest('.output-block');
+  });
+  var restIdx = 0;
+  contentPres.forEach(function(pre) {
+    var preText = pre.textContent;
+    var preLines = preText.split('\\n');
+    var headingLineIdxs = [];
+    for (var li = 0; li < preLines.length; li++) {
+      if (/^## /.test(preLines[li]) && restIdx < restTexts.length) {
+        headingLineIdxs.push({ lineIdx: li, restText: restTexts[restIdx] });
+        restIdx++;
+      }
+    }
+    if (headingLineIdxs.length === 0) return;
+    // Split <pre> at heading boundaries and insert buttons
+    var frag = document.createDocumentFragment();
+    var lastCut = 0;
+    headingLineIdxs.forEach(function(h) {
+      if (h.lineIdx > lastCut) {
+        var beforeText = preLines.slice(lastCut, h.lineIdx).join('\\n').trim();
+        if (beforeText) {
+          var p = document.createElement('pre');
+          p.textContent = beforeText;
+          frag.appendChild(p);
+        }
+      }
+      var marker = document.createElement('div');
+      marker.className = 'section-copy-marker';
+      var btn = document.createElement('button');
+      btn.className = 'section-copy-btn';
+      btn.textContent = '\u2193 Kopieren';
+      (function(rt, b) {
+        b.onclick = function() { copyToClipboard(rt, b, '\u2193 Kopieren'); };
+      })(h.restText, btn);
+      marker.appendChild(btn);
+      frag.appendChild(marker);
+      lastCut = h.lineIdx;
+    });
+    if (lastCut < preLines.length) {
+      var rest = preLines.slice(lastCut).join('\\n').trim();
+      if (rest) {
+        var p = document.createElement('pre');
+        p.textContent = rest;
+        frag.appendChild(p);
+      }
+    }
+    pre.parentNode.replaceChild(frag, pre);
+  });
+}
+
+function addDownloadButton(file) {
+  const msgs = document.getElementById('messages');
+  const div = document.createElement('div');
+  div.style.cssText = 'text-align:center;padding:8px 0;';
+  const icon = file.type==='xlsx'?'📊':file.type==='pdf'?'📕':file.type==='pptx'?'📊':'📄';
+  const agentName = getAgentName();
+  div.innerHTML = icon + ' <strong style="color:#f0f0f0;font-size:13px;">' + file.filename + '</strong><br>' +
+    '<a href="/download_file?path=' + encodeURIComponent(file.path) + '" download="' + file.filename + '" ' +
+    'style="display:inline-block;margin-top:6px;background:#f0c060;color:#111;padding:6px 20px;border-radius:6px;font-size:12px;font-weight:700;text-decoration:none;font-family:Inter,sans-serif;">⬇ Herunterladen</a>' +
+    ' <button onclick="openInFinder(' + JSON.stringify(agentName) + ',' + JSON.stringify(file.filename) + ')" ' +
+    'style="background:#2a2a2a;border:1px solid #444;color:#888;padding:6px 14px;border-radius:6px;font-size:12px;cursor:pointer;font-family:Inter,sans-serif;margin-left:6px;">Im Finder zeigen</button>';
+  msgs.appendChild(div);
+  scrollDown();
+}
+
+function addImagePreview(img) {
+  const msgs = document.getElementById('messages');
+  const div = document.createElement('div');
+  div.style.cssText = 'text-align:center;padding:12px 0;';
+  div.innerHTML = '<img src="/download_file?path=' + encodeURIComponent(img.path) + '" style="max-width:600px;max-height:500px;border-radius:8px;border:1px solid #333;" /><br>' +
+    '<span style="font-size:11px;color:#888;font-family:Inter,sans-serif;">' + img.filename + '</span><br>' +
+    '<a href="/download_file?path=' + encodeURIComponent(img.path) + '" download="' + img.filename + '" ' +
+    'style="display:inline-block;margin-top:6px;background:#f0c060;color:#111;padding:6px 20px;border-radius:6px;font-size:12px;font-weight:700;text-decoration:none;font-family:Inter,sans-serif;">\u2b07 Bild herunterladen</a>';
+  msgs.appendChild(div);
+  scrollDown();
+}
+
+// ── Progress Bar fuer Video-/Bild-Generierung ────────────────────────────────
+// progressBars: task_id -> { el, pollTimer, kind, finished }
+var progressBars = {};
+
+function fmtDuration(sec) {
+  if (sec == null || isNaN(sec)) return '--:--';
+  sec = Math.max(0, Math.round(sec));
+  var m = Math.floor(sec / 60);
+  var s = sec % 60;
+  return m + ':' + (s < 10 ? '0' + s : s);
+}
+
+function createProgressBar(taskId, kind) {
+  if (progressBars[taskId]) return progressBars[taskId].el;
+  const msgs = document.getElementById('messages');
+  const wrap = document.createElement('div');
+  wrap.className = 'task-progress';
+  wrap.dataset.taskId = taskId;
+  const label = kind === 'video' ? 'Video wird generiert' : 'Bild wird erstellt';
+  wrap.innerHTML =
+    '<div class="tp-head">' +
+      '<span class="tp-pulse"></span>' +
+      '<span class="tp-label">' + label + '...</span>' +
+      '<span class="tp-times">0:00</span>' +
+    '</div>' +
+    '<div class="tp-bar-outer"><div class="tp-bar-inner"></div></div>';
+  msgs.appendChild(wrap);
+  progressBars[taskId] = { el: wrap, pollTimer: null, kind: kind, finished: false };
+  scrollDown();
+  // Start dedicated per-task polling (2 s) so progress keeps updating even
+  // while the /chat request is still pending.
+  pollTaskStatus(taskId);
+  progressBars[taskId].pollTimer = setInterval(function(){ pollTaskStatus(taskId); }, 2000);
+  return wrap;
+}
+
+function updateProgressBar(taskId, data) {
+  const entry = progressBars[taskId];
+  if (!entry || !data) return;
+  const el = entry.el;
+  const bar = el.querySelector('.tp-bar-inner');
+  const lbl = el.querySelector('.tp-label');
+  const tms = el.querySelector('.tp-times');
+  const pct = Math.max(0, Math.min(100, data.progress || 0));
+  bar.style.width = pct + '%';
+  if (data.message) lbl.textContent = data.message;
+  var elapsed = fmtDuration(data.elapsed_seconds);
+  var timeStr = elapsed;
+  if (data.status === 'running' && data.eta_seconds != null && data.eta_seconds > 0) {
+    timeStr = elapsed + ' · ~' + fmtDuration(data.eta_seconds) + ' verbleibend';
+  }
+  tms.textContent = timeStr;
+  if (data.status === 'done') {
+    el.classList.add('done');
+    entry.finished = true;
+    if (entry.pollTimer) { clearInterval(entry.pollTimer); entry.pollTimer = null; }
+    // Remove the bar shortly after completion — the actual media preview
+    // (addImagePreview / addVideoPreview) is inserted by the chat response.
+    setTimeout(function(){ removeProgressBar(taskId); }, 800);
+  } else if (data.status === 'error') {
+    el.classList.add('error');
+    entry.finished = true;
+    if (entry.pollTimer) { clearInterval(entry.pollTimer); entry.pollTimer = null; }
+    setTimeout(function(){ removeProgressBar(taskId); }, 5000);
+  }
+}
+
+function removeProgressBar(taskId) {
+  const entry = progressBars[taskId];
+  if (!entry) return;
+  if (entry.pollTimer) { clearInterval(entry.pollTimer); }
+  if (entry.el && entry.el.parentNode) entry.el.parentNode.removeChild(entry.el);
+  delete progressBars[taskId];
+}
+
+async function pollTaskStatus(taskId) {
+  try {
+    const r = await fetch('/task_status/' + encodeURIComponent(taskId));
+    if (!r.ok) return;
+    const data = await r.json();
+    if (data && !data.error) updateProgressBar(taskId, data);
+  } catch(e) {}
+}
+
+function addVideoPreview(vid) {
+  const msgs = document.getElementById('messages');
+  const div = document.createElement('div');
+  div.style.cssText = 'text-align:center;padding:12px 0;';
+  div.innerHTML = '<video controls style="max-width:600px;border-radius:8px;border:1px solid #333;"><source src="/download_file?path=' + encodeURIComponent(vid.path) + '" type="video/mp4"></video><br>' +
+    '<span style="font-size:11px;color:#888;font-family:Inter,sans-serif;">' + vid.filename + '</span><br>' +
+    '<a href="/download_file?path=' + encodeURIComponent(vid.path) + '" download="' + vid.filename + '" ' +
+    'style="display:inline-block;margin-top:6px;background:#f0c060;color:#111;padding:6px 20px;border-radius:6px;font-size:12px;font-weight:700;text-decoration:none;font-family:Inter,sans-serif;">\u2b07 Video herunterladen</a>';
+  msgs.appendChild(div);
+  scrollDown();
+}
+
+function addMailtoFallback(e) {
+  const msgs = document.getElementById('messages');
+  const div = document.createElement('div');
+  div.style.cssText = 'text-align:center;padding:10px 0;';
+  const to = e.to||'', subject = e.subject||'', body = e.body||'';
+  const mailto = 'mailto:' + encodeURIComponent(to) + '?subject=' + encodeURIComponent(subject) + '&body=' + encodeURIComponent(body);
+  div.innerHTML = '<span style="font-size:12px;color:#aaa;font-family:Inter,sans-serif;">✉ ' + subject + '</span><br>' +
+    '<a href="' + mailto + '" style="display:inline-block;margin-top:6px;background:#f0c060;color:#111;padding:7px 20px;border-radius:6px;font-size:12px;font-weight:700;text-decoration:none;font-family:Inter,sans-serif;">✉ In Apple Mail oeffnen</a>';
+  msgs.appendChild(div);
+  scrollDown();
+}
+
+function addFinderLink(agent, filename) {
+  const msgs = document.getElementById('messages');
+  const div = document.createElement('div');
+  div.style.cssText = 'text-align:center;padding:4px 0;';
+  div.innerHTML = '📄 <span style="font-size:12px;color:#aaa;font-family:Inter,sans-serif;">' + filename + '</span> ' +
+    '<button onclick="openInFinder(' + JSON.stringify(agent) + ',' + JSON.stringify(filename) + ')" ' +
+    'style="background:#2a3a2a;border:1px solid #4a6a4a;color:#a0d090;padding:3px 10px;border-radius:5px;font-size:11px;cursor:pointer;font-family:Inter,sans-serif;margin-left:6px;">Im Finder zeigen</button> ' +
+    '<button onclick="openMemoryFolder(' + JSON.stringify(agent) + ')" ' +
+    'style="background:#2a2a2a;border:1px solid #444;color:#888;padding:3px 10px;border-radius:5px;font-size:11px;cursor:pointer;font-family:Inter,sans-serif;margin-left:4px;">Memory Ordner oeffnen</button>';
+  msgs.appendChild(div);
+  scrollDown();
+}
+
+async function openInFinder(agent, filename) {
+  await fetch('/open_in_finder', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({agent, filename, session_id:SESSION_ID})});
+}
+async function openMemoryFolder(agent) {
+  await fetch('/open_in_finder', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({agent, filename:'', session_id:SESSION_ID})});
+}
+
+function handleChatResponse(data) {
+  if (data.error) { addStatusMsg('Fehler: '+data.error); return; }
+  if (data.type === 'subagent_confirmation_required') {
+    showSubagentConfirmation(data);
+    return;
+  }
+  if (data.delegated_to) {
+    addStatusMsg('\u2192 Delegiert an ' + (data.delegated_display || data.delegated_to));
+  }
+  if (data.auto_search_info) addStatusMsg(data.auto_search_info);
+  if (data.auto_loaded && data.auto_loaded.length) {
+    const agent = data.agent || getAgentName();
+    data.auto_loaded.forEach(n => { addCtxItem(n,'file',true); addFinderLink(agent,n); });
+  }
+  addMessage('assistant', data.response, data.model_name, data.provider_display, data.model_display);
+  if (data.created_files && data.created_files.length) data.created_files.forEach(f => addDownloadButton(f));
+  if (data.created_images && data.created_images.length) data.created_images.forEach(img => addImagePreview(img));
+  if (data.created_videos && data.created_videos.length) data.created_videos.forEach(vid => addVideoPreview(vid));
+  if (data.created_emails && data.created_emails.length) {
+    data.created_emails.forEach(e => {
+      if (e && e.ok) addStatusMsg('\u2709 Apple Mail geoeffnet: '+e.subject);
+      else addMailtoFallback(e||{});
+    });
+  }
+  if (data.created_whatsapps && data.created_whatsapps.length) {
+    data.created_whatsapps.forEach(wa => {
+      if (wa && wa.ok && wa.clipboard_fallback) addStatusMsg('\u260E WhatsApp geoeffnet \u2014 Keine Nummer fuer \u201c'+wa.to+'\u201d gefunden. Nachricht in Zwischenablage \u2014 bitte manuell einfuegen.');
+      else if (wa && wa.ok) addStatusMsg('\u260E WhatsApp geoeffnet \u2014 Chat mit '+wa.to+' wird geoeffnet. Bitte auf Senden klicken.');
+      else addStatusMsg('\u26A0 WhatsApp-Fehler: '+(wa.error||'Unbekannt'));
+    });
+  }
+  if (data.created_slacks && data.created_slacks.length) {
+    data.created_slacks.forEach(sl => {
+      if (sl && sl.ok) addStatusMsg('\U0001f4ac Slack geoeffnet: ' + (sl.target || ''));
+      else addStatusMsg('\u26A0 Slack-Fehler: '+(sl.error||'Unbekannt'));
+    });
+  }
+}
+
+function showSubagentConfirmation(data) {
+  var msgs = document.getElementById('messages');
+  var div = document.createElement('div');
+  div.className = 'msg assistant';
+  var kws = data.matched_keywords ? data.matched_keywords.join(', ') : '';
+  var inner = '<div class="bubble" style="background:#1a2a1a;border:1px solid #4a8a4a;padding:12px;">';
+  inner += '<div style="margin-bottom:8px;">&#128256; <b>Sub-Agent erkannt:</b> ' + escHtml(data.subagent_display || data.suggested_subagent) + '</div>';
+  if (kws) inner += '<div style="margin-bottom:8px;color:#888;">Keywords: ' + escHtml(kws) + '</div>';
+  inner += '<div style="margin-bottom:8px;color:#888;font-size:12px;">Nachricht: \u201c' + escHtml(data.original_message || '') + '\u201d</div>';
+  inner += '<div id="subagent-btns-' + data.confirmation_id + '">';
+  inner += '<button onclick="confirmSubagent(&apos;' + data.confirmation_id + '&apos;,true)" style="background:#4a8a4a;color:#fff;border:none;padding:6px 16px;border-radius:4px;cursor:pointer;margin-right:8px;">\u2713 Ja, weiterleiten</button>';
+  inner += '<button onclick="confirmSubagent(&apos;' + data.confirmation_id + '&apos;,false)" style="background:#555;color:#fff;border:none;padding:6px 16px;border-radius:4px;cursor:pointer;">\u2717 Nein, selbst antworten</button>';
+  inner += '</div></div>';
+  var time = new Date().toLocaleTimeString('de-DE', {hour:'2-digit', minute:'2-digit'});
+  div.innerHTML = inner + '<div class="meta">' + time + '</div>';
+  msgs.appendChild(div);
+  scrollDown();
+  // Auto-decline after 5 minutes
+  setTimeout(function() {
+    var btns = document.getElementById('subagent-btns-' + data.confirmation_id);
+    if (btns && btns.querySelector('button')) {
+      confirmSubagent(data.confirmation_id, false);
+    }
+  }, 300000);
+}
+
+async function confirmSubagent(confirmationId, confirmed) {
+  var btnsDiv = document.getElementById('subagent-btns-' + confirmationId);
+  if (btnsDiv) {
+    btnsDiv.innerHTML = confirmed
+      ? '<span style="color:#8aba8a;">\u2713 Weiterleitung bestaetigt</span>'
+      : '<span style="color:#888;">\u2717 Aktueller Agent antwortet</span>';
+  }
+  addStatusMsg(confirmed ? 'Wird an Sub-Agent weitergeleitet...' : 'Aktueller Agent verarbeitet die Anfrage...');
+  try {
+    var r = await fetch('/api/subagent_confirm', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({session_id: SESSION_ID, confirmation_id: confirmationId, confirmed: confirmed})
+    });
+    var data = await r.json();
+    if (data.error) {
+      addStatusMsg('Fehler: ' + data.error);
+      return;
+    }
+    handleChatResponse(data);
+  } catch(e) {
+    addStatusMsg('Fehler bei Sub-Agent Verarbeitung: ' + e.message);
+  }
+}
+
+function addCtxItem(name, type, autoLoaded) {
+  const bar = document.getElementById('ctx-items');
+  if ([...bar.children].some(c => c.dataset.name === name)) return;
+  const div = document.createElement('div');
+  div.className = 'ctx-item' + (autoLoaded ? ' auto-loaded' : ''); div.dataset.name = name;
+  const icon = autoLoaded ? '🔍' : (type==='url'?'🔗':'📄');
+  const span = document.createElement('span');
+  span.textContent = icon + ' ' + name.substring(0, 40) + (name.length > 40 ? '...' : '');
+  div.title = name;
+  const btn = document.createElement('button');
+  btn.textContent = '\u2715';
+  btn.onclick = () => removeCtx(name, div);
+  div.appendChild(span);
+  div.appendChild(btn);
+  bar.appendChild(div);
+}
+
+async function removeCtx(name, el) {
+  el.remove();
+  await fetch('/remove_ctx', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({name, session_id:SESSION_ID})});
+}
+
+function escHtml(t) { return (t||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;'); }
+function scrollDown() { const m = document.getElementById('messages'); m.scrollTop = m.scrollHeight; }
+function autoResize(el) { el.style.height='auto'; el.style.height=Math.min(el.scrollHeight,160)+'px'; }
+function onKey(e) {
+  const input = document.getElementById('msg-input');
+  if (onFindLiveKey(e)) return;
+  if (onTypeAcKey(e, input)) return;
+  if (onSlashAcKey(e, input)) return;
+  if (e.key==='Enter' && !e.shiftKey) { e.preventDefault(); sendMessage(); }
+}
+
+// ─── KEYBOARD SHORTCUTS (GLOBAL) ─────────────────────────────────────────────
+let _findActiveChip = null;
+let _findDebounceTimer = null;
+let _findLiveIdx = -1;
+let _findLiveResults = [];
+
+document.addEventListener('keydown', function(e) {
+  // Skip if inside input fields (except for our specific shortcuts)
+  const tag = document.activeElement.tagName;
+  const inInput = (tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT');
+
+  if (e.altKey && !e.ctrlKey && !e.metaKey) {
+    switch(e.key.toLowerCase()) {
+      case 'p': e.preventDefault(); toggleSidebar(); return;
+      case 'n': e.preventDefault(); newSession(); return;
+      case 'a': e.preventDefault(); showAgentModal(); return;
+      case 'm': e.preventDefault(); document.getElementById('model-select').focus(); return;
+      case 'f': e.preventDefault(); var inp=document.getElementById('msg-input'); inp.focus(); inp.value='/find '; onInputHandler(inp); return;
+      case 'u': e.preventDefault(); document.getElementById('file-input').click(); return;
+      case 'c': e.preventDefault(); copyLastAssistantMessage(); return;
+      case 's': e.preventDefault(); saveConversation(); return;
+      case '1': if (isFindChipsVisible()) { e.preventDefault(); toggleFindChip('email'); } return;
+      case '2': if (isFindChipsVisible()) { e.preventDefault(); toggleFindChip('webclip'); } return;
+      case '3': if (isFindChipsVisible()) { e.preventDefault(); toggleFindChip('document'); } return;
+      case '4': if (isFindChipsVisible()) { e.preventDefault(); toggleFindChip('conversation'); } return;
+      case '5': if (isFindChipsVisible()) { e.preventDefault(); toggleFindChip('screenshot'); } return;
+    }
+  }
+  // Ctrl+Enter to send from anywhere
+  if (e.ctrlKey && e.key === 'Enter' && !e.altKey && !e.metaKey) {
+    e.preventDefault();
+    sendMessage();
+  }
+});
+
+function copyLastAssistantMessage() {
+  var msgs = document.querySelectorAll('.msg.assistant .bubble');
+  if (msgs.length) {
+    var last = msgs[msgs.length-1];
+    navigator.clipboard.writeText(last.innerText).catch(function(){});
+    addStatusMsg('Letzte Antwort kopiert');
+  }
+}
+
+function isFindChipsVisible() {
+  var bar = document.getElementById('find-chips-bar');
+  return bar && bar.classList.contains('visible');
+}
+
+function showFindChips() {
+  var bar = document.getElementById('find-chips-bar');
+  if (bar) bar.classList.add('visible');
+}
+
+function hideFindChips() {
+  var bar = document.getElementById('find-chips-bar');
+  if (bar) bar.classList.remove('visible');
+  _findActiveChip = null;
+  document.querySelectorAll('.find-chip').forEach(c => c.classList.remove('active'));
+  hideFindLiveDropdown();
+}
+
+function toggleFindChip(cat) {
+  if (_findActiveChip === cat) {
+    _findActiveChip = null;
+    document.querySelectorAll('.find-chip').forEach(c => c.classList.remove('active'));
+  } else {
+    _findActiveChip = cat;
+    document.querySelectorAll('.find-chip').forEach(c => {
+      c.classList.toggle('active', c.dataset.cat === cat);
+    });
+  }
+  // Update the input if in /find mode
+  var inp = document.getElementById('msg-input');
+  var val = inp.value;
+  var m = val.match(/^\/find(?:_global)?/);
+  if (m) {
+    var prefix = m[0];
+    var knownTypes = ['email','webclip','screenshot','contact','document','conversation'];
+    var rest = val.substring(prefix.length).trim();
+    var firstWord = rest.split(/\s+/)[0]||'';
+    if (knownTypes.includes(firstWord.toLowerCase())) rest = rest.substring(firstWord.length).trim();
+    inp.value = prefix + (_findActiveChip ? ' ' + _findActiveChip : '') + (rest ? ' ' + rest : ' ');
+    inp.focus();
+    triggerFindLiveSearch();
+  }
+}
+
+function hideFindLiveDropdown() {
+  var dd = document.getElementById('find-live-dropdown');
+  if (dd) dd.style.display = 'none';
+  _findLiveIdx = -1;
+  _findLiveResults = [];
+}
+
+function triggerFindLiveSearch() {
+  clearTimeout(_findDebounceTimer);
+  _findDebounceTimer = setTimeout(doFindLiveSearch, 300);
+}
+
+async function doFindLiveSearch() {
+  var inp = document.getElementById('msg-input');
+  var val = inp.value;
+  var m = val.match(/^\/find(_global)?(?:-(email|webclip|screenshot|document|conversation))?\s+(.*)/i);
+  if (!m) { hideFindLiveDropdown(); return; }
+  var isGlobal = !!m[1];
+  var typePart = (m[2]||'').trim();
+  var queryPart = (m[3]||'').trim();
+  // Strip old-style type prefix from query if present
+  var knTypes = ['email','webclip','screenshot','contact','document','conversation'];
+  var qFirst = queryPart.split(/\s+/)[0];
+  if (knTypes.includes(qFirst.toLowerCase())) queryPart = queryPart.substring(qFirst.length).trim();
+  if (!queryPart || queryPart.length < 2) { hideFindLiveDropdown(); return; }
+
+  try {
+    var agent = getAgentName();
+    var url = '/api/memory-files-search?q=' + encodeURIComponent(queryPart) + '&agent=' + encodeURIComponent(agent);
+    var r = await fetch(url);
+    var data = await r.json();
+    if (!data || !data.length) { hideFindLiveDropdown(); return; }
+
+    _findLiveResults = data.slice(0, 8);
+    _findLiveIdx = -1;
+    var dd = document.getElementById('find-live-dropdown');
+    dd.innerHTML = '<div style="padding:4px 14px;font-size:10px;color:#555;">' + _findLiveResults.length + ' Treffer | ↑↓ navigieren, Enter auswaehlen, Esc schliessen</div>';
+    _findLiveResults.forEach(function(item, i) {
+      var div = document.createElement('div');
+      div.className = 'find-live-item';
+      div.innerHTML = '<span class="flr-name">' + escHtml(item.filename || item.name || '') + '</span><span class="flr-type">' + escHtml(item.snippet || '').substring(0,40) + '</span>';
+      div.onmousedown = function(e) { e.preventDefault(); selectFindLiveItem(i); };
+      dd.appendChild(div);
+    });
+    dd.style.display = 'block';
+  } catch(e) {
+    hideFindLiveDropdown();
+  }
+}
+
+function selectFindLiveItem(idx) {
+  if (idx < 0 || idx >= _findLiveResults.length) return;
+  var item = _findLiveResults[idx];
+  var inp = document.getElementById('msg-input');
+  var val = inp.value;
+  var m = val.match(/^\/find(?:_global)?/);
+  var prefix = m ? m[0] : '/find';
+  var typePart = _findActiveChip ? ' ' + _findActiveChip : '';
+  inp.value = prefix + typePart + ' ' + (item.filename || item.name || '');
+  hideFindLiveDropdown();
+  inp.focus();
+}
+
+function onFindLiveKey(e) {
+  var dd = document.getElementById('find-live-dropdown');
+  if (!dd || dd.style.display === 'none' || !_findLiveResults.length) return false;
+  var items = dd.querySelectorAll('.find-live-item');
+  if (e.key === 'ArrowDown') { e.preventDefault(); _findLiveIdx = Math.min(_findLiveIdx+1, items.length-1); items.forEach(function(it,i){it.classList.toggle('active', i===_findLiveIdx);}); return true; }
+  if (e.key === 'ArrowUp') { e.preventDefault(); _findLiveIdx = Math.max(_findLiveIdx-1, 0); items.forEach(function(it,i){it.classList.toggle('active', i===_findLiveIdx);}); return true; }
+  if (e.key === 'Tab' && _findLiveResults.length > 0) { e.preventDefault(); selectFindLiveItem(_findLiveIdx >= 0 ? _findLiveIdx : 0); return true; }
+  if (e.key === 'Enter' && _findLiveIdx >= 0) { e.preventDefault(); selectFindLiveItem(_findLiveIdx); return true; }
+  if (e.key === 'Escape') { hideFindLiveDropdown(); return true; }
+  return false;
+}
+
+// ─── SEND ────────────────────────────────────────────────────────────────────────
+// ─── QUEUE SYSTEM ──────────────────────────────────────────────────────────
+let pollInterval = null;
+let typingInterval = null;
+let queuedPlaceholders = {};  // queue_id -> DOM element
+
+function handleResponse(data) {
+  if (data.error) { addStatusMsg('Fehler: '+data.error); return; }
+  if (data.auto_search_info) {
+    addStatusMsg(data.auto_search_info);
+  }
+  if (data.auto_loaded && data.auto_loaded.length) {
+    const agent = data.agent || getAgentName();
+    data.auto_loaded.forEach(n => { addCtxItem(n,'file',true); addFinderLink(agent,n); });
+  }
+  if (data.type === 'subagent_confirmation_required') {
+    showSubagentConfirmation(data);
+    return;
+  }
+  if (data.delegated_to) {
+    addStatusMsg('\u2192 Delegiert an ' + (data.delegated_display || data.delegated_to));
+  }
+  addMessage('assistant', data.response, data.model_name, data.provider_display, data.model_display);
+  if (data.created_files && data.created_files.length) data.created_files.forEach(f => addDownloadButton(f));
+  if (data.created_images && data.created_images.length) data.created_images.forEach(img => addImagePreview(img));
+  if (data.created_videos && data.created_videos.length) data.created_videos.forEach(vid => addVideoPreview(vid));
+  if (data.created_emails && data.created_emails.length) {
+    data.created_emails.forEach(e => {
+      if (e && e.ok) addStatusMsg('\u2709 Apple Mail geoeffnet: '+e.subject);
+      else addMailtoFallback(e||{});
+    });
+  }
+  if (data.created_whatsapps && data.created_whatsapps.length) {
+    data.created_whatsapps.forEach(wa => {
+      if (wa && wa.ok && wa.clipboard_fallback) addStatusMsg('\u260E WhatsApp geoeffnet \u2014 Keine Nummer fuer \u201c'+wa.to+'\u201d gefunden. Nachricht in Zwischenablage \u2014 bitte manuell einfuegen.');
+      else if (wa && wa.ok) addStatusMsg('\u260E WhatsApp geoeffnet \u2014 Chat mit '+wa.to+' wird geoeffnet. Bitte auf Senden klicken.');
+      else addStatusMsg('\u26A0 WhatsApp-Fehler: '+(wa.error||'Unbekannt'));
+    });
+  }
+  if (data.created_slacks && data.created_slacks.length) {
+    data.created_slacks.forEach(sl => {
+      if (sl && sl.ok && sl.clipboard_only) addStatusMsg('\U0001f4ac Slack geoeffnet \u2014 Nachricht in Zwischenablage. Bitte mit Cmd+V einfuegen und absenden.');
+      else if (sl && sl.ok) addStatusMsg('\U0001f4ac Slack geoeffnet \u2014 Nachricht an '+sl.target+' eingefuegt. Bitte manuell absenden.');
+      else addStatusMsg('\u26A0 Slack-Fehler: '+(sl.error||'Unbekannt'));
+    });
+  }
+  updateTokenCount();
+}
+
+function addQueuedMessage(text, position, queueId) {
+  const msgs = document.getElementById('messages');
+  const div = document.createElement('div');
+  div.className = 'msg queued';
+  div.dataset.queueId = queueId;
+  div.innerHTML = '<div class="bubble">\u23f3 In Warteschlange (Position '+position+'): '+escHtml(text.substring(0,80))+'</div>';
+  msgs.appendChild(div);
+  scrollDown();
+  return div;
+}
+
+function updateQueueDisplay(count) {
+  const el = document.getElementById('queue-display');
+  const txt = document.getElementById('queue-text');
+  if (count > 0) {
+    el.style.display = 'block';
+    txt.textContent = '\u23f3 '+count+' Prompt'+(count>1?'s':'')+' in der Warteschlange';
+  } else {
+    el.style.display = 'none';
+  }
+}
+
+function showStopBtn(show) {
+  document.getElementById('stop-btn').style.display = show ? 'inline-block' : 'none';
+}
+
+function startTyping(prompt) {
+  const indicator = document.getElementById('typing-indicator');
+  const typingText = document.getElementById('typing-text');
+  indicator.style.display = 'flex';
+  showStopBtn(true);
+  if (prompt) {
+    typingText.textContent = 'Verarbeite: '+prompt+'...';
+  }
+  const msgs = ['Denkt nach...','Verarbeitet...','Analysiert...','Arbeitet...','Formuliert Antwort...','Noch einen Moment...'];
+  let mi = 0;
+  if (typingInterval) clearInterval(typingInterval);
+  typingInterval = setInterval(() => {
+    mi = (mi+1)%msgs.length;
+    typingText.textContent = prompt ? 'Verarbeite: '+prompt+'...' : msgs[mi];
+  }, 2500);
+}
+
+function stopTyping() {
+  document.getElementById('typing-indicator').style.display = 'none';
+  if (typingInterval) { clearInterval(typingInterval); typingInterval = null; }
+}
+
+function startPolling() {
+  if (pollInterval) return;
+  pollInterval = setInterval(async () => {
+    try {
+      const r = await fetch('/poll_responses?session_id=' + SESSION_ID);
+      const data = await r.json();
+      if (data.responses && data.responses.length) {
+        data.responses.forEach(resp => {
+          if (queuedPlaceholders[resp.queue_id]) {
+            queuedPlaceholders[resp.queue_id].remove();
+            delete queuedPlaceholders[resp.queue_id];
+          }
+          handleResponse(resp);
+        });
+      }
+    } catch(e) {}
+    try {
+      const r2 = await fetch('/queue_status?session_id=' + SESSION_ID);
+      const st = await r2.json();
+      updateQueueDisplay(st.queue_length);
+      if (st.processing && st.current_prompt) {
+        const typingText = document.getElementById('typing-text');
+        typingText.textContent = 'Verarbeite: '+st.current_prompt+'...';
+      }
+      // Discover active video/image generation tasks and spawn progress bars
+      if (st && Array.isArray(st.active_tasks)) {
+        st.active_tasks.forEach(function(t){
+          if (!progressBars[t.task_id]) createProgressBar(t.task_id, t.kind || 'video');
+          updateProgressBar(t.task_id, t);
+        });
+      }
+      if (!st.processing && st.queue_length === 0) {
+        stopPolling();
+      }
+    } catch(e) {}
+  }, 2000);
+}
+
+function stopPolling() {
+  if (pollInterval) { clearInterval(pollInterval); pollInterval = null; }
+  stopTyping();
+  showStopBtn(false);
+  updateQueueDisplay(0);
+}
+
+async function stopQueue() {
+  try {
+    const r = await fetch('/stop_queue', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({session_id:SESSION_ID})});
+    const data = await r.json();
+    if (data.cancelled > 0) addStatusMsg(data.cancelled+' Prompt(s) abgebrochen.');
+    Object.values(queuedPlaceholders).forEach(el => el.remove());
+    queuedPlaceholders = {};
+    stopPolling();
+  } catch(e) { addStatusMsg('Stop Fehler: '+e.message); }
+}
+
+// ─── SLASH COMMAND AUTOCOMPLETE ──────────────────────────────────────────────
+const _SLASH_COMMANDS = [
+  // SLASH_CLUSTER_V1: Gruppierte Slash Commands
+  // ─── Kommunikation ───
+  {cmd: '/create-email', label: '/create-email', desc: 'E-Mail Draft erstellen', template: 'Erstelle eine E-Mail an [Empfaenger] zum Thema: ', group: 'Kommunikation'},
+  {cmd: '/create-whatsapp', label: '/create-whatsapp', desc: 'WhatsApp-Nachricht', template: 'Schreibe eine WhatsApp-Nachricht an [Name]: ', group: 'Kommunikation'},
+  {cmd: '/create-slack', label: '/create-slack', desc: 'Slack-Nachricht', template: 'Schreibe eine Slack-Nachricht an [#channel oder Name]: ', group: 'Kommunikation'},
+  // ─── Kalender ───
+  {cmd: '/calendar-today', label: '/calendar-today', desc: 'Heutige Termine', template: '', group: 'Kalender'},
+  {cmd: '/calendar-tomorrow', label: '/calendar-tomorrow', desc: 'Termine morgen', template: '', group: 'Kalender'},
+  {cmd: '/calendar-week', label: '/calendar-week', desc: 'Naechste 7 Tage', template: '', group: 'Kalender'},
+  {cmd: '/calendar-search', label: '/calendar-search [query]', desc: 'Termine durchsuchen', template: 'Suche Termin: ', group: 'Kalender'},
+  // ─── Medien ───
+  {cmd: '/create-image', label: '/create-image', desc: 'Bild generieren (Gemini/OpenAI)', template: 'Erstelle ein Bild: ', group: 'Medien'},
+  {cmd: '/create-video', label: '/create-video', desc: 'Video generieren (Gemini Veo)', template: 'Erstelle ein Video: ', group: 'Medien'},
+  // ─── Dokumente ───
+  {cmd: '/create-file-docx', label: '/create-file-docx', desc: 'Word-Dokument', template: 'Erstelle ein Word-Dokument: ', group: 'Dokumente'},
+  {cmd: '/create-file-xlsx', label: '/create-file-xlsx', desc: 'Excel-Tabelle', template: 'Erstelle eine Excel-Tabelle: ', group: 'Dokumente'},
+  {cmd: '/create-file-pdf', label: '/create-file-pdf', desc: 'PDF erstellen', template: 'Erstelle ein PDF: ', group: 'Dokumente'},
+  {cmd: '/create-file-pptx', label: '/create-file-pptx', desc: 'PowerPoint', template: 'Erstelle eine PowerPoint-Praesentation: ', group: 'Dokumente'},
+  // ─── Canva ───
+  {cmd: '/canva-search', label: '/canva-search [query]', desc: 'Designs durchsuchen', template: 'Suche in Canva nach: ', group: 'Canva'},
+  {cmd: '/canva-create', label: '/canva-create [titel]', desc: 'Neues Design', template: 'Erstelle ein Canva Design: ', group: 'Canva'},
+  {cmd: '/canva-templates', label: '/canva-templates', desc: 'Brand Templates', template: '', group: 'Canva'},
+  {cmd: '/canva-campaign', label: '/canva-campaign', desc: 'Ad-Kampagne generieren', template: 'Erstelle eine Canva Kampagne mit Template: ', group: 'Canva'},
+  {cmd: '/canva-export', label: '/canva-export [id] [format]', desc: 'Design exportieren', template: 'Exportiere Canva Design: ', group: 'Canva'},
+  // ─── Suche (Agent) ───
+  {cmd: '/find', label: '/find [query]', desc: 'Alle Dateien durchsuchen', group: 'Suche'},
+  {cmd: '/find-email', label: '/find-email [query]', desc: 'Nur E-Mails', group: 'Suche'},
+  {cmd: '/find-whatsapp', label: '/find-whatsapp [query]', desc: 'Nur WhatsApp', group: 'Suche'},
+  {cmd: '/find-webclip', label: '/find-webclip [query]', desc: 'Web Clips', group: 'Suche'},
+  {cmd: '/find-slack', label: '/find-slack [query]', desc: 'Slack Nachrichten', group: 'Suche'},
+  {cmd: '/find-salesforce', label: '/find-salesforce [query]', desc: 'Salesforce Records', group: 'Suche'},
+  {cmd: '/find-document', label: '/find-document [query]', desc: 'Dokumente', group: 'Suche'},
+  {cmd: '/find-conversation', label: '/find-conversation [query]', desc: 'Konversationen', group: 'Suche'},
+  {cmd: '/find-screenshot', label: '/find-screenshot [query]', desc: 'Screenshots', group: 'Suche'},
+  // ─── Suche (Global) ───
+  {cmd: '/find_global', label: '/find_global [query]', desc: 'Alle Agenten', group: 'Globale Suche'},
+  {cmd: '/find_global-email', label: '/find_global-email [query]', desc: 'E-Mails global', group: 'Globale Suche'},
+  {cmd: '/find_global-webclip', label: '/find_global-webclip [query]', desc: 'Web Clips global', group: 'Globale Suche'},
+  {cmd: '/find_global-document', label: '/find_global-document [query]', desc: 'Dokumente global', group: 'Globale Suche'},
+  {cmd: '/find_global-conversation', label: '/find_global-conversation [query]', desc: 'Konversationen global', group: 'Globale Suche'},
+  {cmd: '/find_global-screenshot', label: '/find_global-screenshot [query]', desc: 'Screenshots global', group: 'Globale Suche'},
+];
+let _slashAcIdx = -1;
+
+function onInputHandler(el) {
+  autoResize(el);
+  const val = el.value;
+  // Show/filter slash dropdown when typing "/"
+  if (val.startsWith('/') && !val.includes(' ')) {
+    showSlashAutocomplete(el, val);
+    hideTypeAutocomplete();
+    hideFindChips();
+    return;
+  }
+  // Show find chips after any /find variant (with trailing space)
+  const isFindMode = /^\/find(?:_global)?(?:-\w+)?(?:\s|$)/i.test(val);
+  if (isFindMode) {
+    hideSlashAutocomplete();
+    hideTypeAutocomplete();
+    showFindChips();
+    // Trigger live search if there's query text
+    const queryMatch = val.match(/^\/find(?:_global)?(?:-\w+)?\s+(.*)/i);
+    if (queryMatch && queryMatch[1] && queryMatch[1].trim().length >= 2) {
+      triggerFindLiveSearch();
+    } else {
+      hideFindLiveDropdown();
+    }
+    return;
+  }
+  // Hide everything when not in slash/find context
+  if (!val.startsWith('/')) { hideSlashAutocomplete(); hideTypeAutocomplete(); hideFindChips(); }
+}
+
+function showSlashAutocomplete(inputEl, filterText) {
+  let dd = document.getElementById('slash-ac-dropdown');
+  if (!dd) {
+    dd = document.createElement('div');
+    dd.id = 'slash-ac-dropdown';
+    inputEl.parentElement.style.position = 'relative';
+    inputEl.parentElement.appendChild(dd);
+  }
+  dd.innerHTML = '';
+  _slashAcIdx = -1;
+  const filter = (filterText || '/').toLowerCase();
+  const filtered = _SLASH_COMMANDS.filter(c => c.cmd.toLowerCase().startsWith(filter));
+  if (!filtered.length) { dd.style.display = 'none'; return; }
+  var lastGroup = '';
+  filtered.forEach((c, i) => {
+    // Gruppen-Header anzeigen wenn neue Gruppe beginnt
+    if (c.group && c.group !== lastGroup) {
+      lastGroup = c.group;
+      var hdr = document.createElement('div');
+      hdr.className = 'slash-ac-group';
+      hdr.textContent = c.group;
+      dd.appendChild(hdr);
+    }
+    const item = document.createElement('div');
+    item.className = 'slash-ac-item';
+    item.dataset.cmd = c.cmd;
+    item.innerHTML = '<strong>' + c.label + '</strong><span style="margin-left:8px;color:#888;font-size:12px">' + c.desc + '</span>';
+    item.onmousedown = (e) => { e.preventDefault(); selectSlashCmd(inputEl, c.cmd); };
+    dd.appendChild(item);
+  });
+  dd.style.display = 'block';
+}
+
+function hideSlashAutocomplete() {
+  const dd = document.getElementById('slash-ac-dropdown');
+  if (dd) dd.style.display = 'none';
+  _slashAcIdx = -1;
+}
+
+function selectSlashCmd(inputEl, cmd) {
+  var entry = _SLASH_COMMANDS.find(c => c.cmd === cmd);
+  if (entry && entry.template) {
+    inputEl.value = entry.template;
+    hideSlashAutocomplete();
+    inputEl.focus();
+    onInputHandler(inputEl);
+  } else {
+    inputEl.value = cmd + ' ';
+    hideSlashAutocomplete();
+    inputEl.focus();
+    onInputHandler(inputEl);
+  }
+}
+
+function onSlashAcKey(e, inputEl) {
+  const dd = document.getElementById('slash-ac-dropdown');
+  if (!dd || dd.style.display === 'none') return false;
+  const items = dd.querySelectorAll('.slash-ac-item');
+  if (e.key === 'ArrowDown') { e.preventDefault(); _slashAcIdx = Math.min(_slashAcIdx+1, items.length-1); items.forEach((it,i) => it.classList.toggle('active', i===_slashAcIdx)); return true; }
+  if (e.key === 'ArrowUp') { e.preventDefault(); _slashAcIdx = Math.max(_slashAcIdx-1, 0); items.forEach((it,i) => it.classList.toggle('active', i===_slashAcIdx)); return true; }
+  if (e.key === 'Tab' && items.length > 0) { e.preventDefault(); var idx = _slashAcIdx >= 0 ? _slashAcIdx : 0; var selItem = items[idx]; if (selItem) selectSlashCmd(inputEl, selItem.dataset.cmd); return true; }
+  if (e.key === 'Enter' && _slashAcIdx >= 0) { e.preventDefault(); var selItem = items[_slashAcIdx]; if (selItem) selectSlashCmd(inputEl, selItem.dataset.cmd); return true; }
+  if (e.key === 'Escape') { hideSlashAutocomplete(); return true; }
+  return false;
+}
+
+// ─── TYPE FILTER DROPDOWN ────────────────────────────────────────────────────
+const _SEARCH_TYPES = [
+  {key: 'all', label: '\U0001f50d Alles', shortcut: 'A'},
+  {key: 'email', label: '\u2709 E-Mail', shortcut: 'E'},
+  {key: 'webclip', label: '\U0001f310 Web Clip', shortcut: 'W'},
+  {key: 'screenshot', label: '\U0001f4f8 Screenshot', shortcut: 'S'},
+  {key: 'contact', label: '\U0001f464 Kontakt', shortcut: 'K'},
+  {key: 'document', label: '\U0001f4c4 Dokument', shortcut: 'D'},
+  {key: 'conversation', label: '\U0001f4ac Konversation', shortcut: 'G'},
+];
+let _typeAcIdx = -1;
+let _typeAcVisible = false;
+
+function showTypeAutocomplete(inputEl) {
+  let dd = document.getElementById('type-ac-dropdown');
+  if (!dd) {
+    dd = document.createElement('div');
+    dd.id = 'type-ac-dropdown';
+    inputEl.parentElement.style.position = 'relative';
+    inputEl.parentElement.appendChild(dd);
+  }
+  dd.innerHTML = '';
+  _typeAcIdx = -1;
+  _typeAcVisible = true;
+  _SEARCH_TYPES.forEach((t, i) => {
+    const item = document.createElement('div');
+    item.className = 'type-ac-item';
+    item.innerHTML = '<span>' + t.label + '</span><span class="type-shortcut">' + t.shortcut + '</span>';
+    item.onmousedown = (e) => { e.preventDefault(); selectTypeCmd(inputEl, t.key); };
+    dd.appendChild(item);
+  });
+  dd.style.display = 'block';
+}
+
+function hideTypeAutocomplete() {
+  const dd = document.getElementById('type-ac-dropdown');
+  if (dd) dd.style.display = 'none';
+  _typeAcIdx = -1;
+  _typeAcVisible = false;
+}
+
+function selectTypeCmd(inputEl, typeKey) {
+  const val = inputEl.value;
+  // Find the /find or /find_global prefix
+  const prefix = val.match(/^\/find_global\s*|\/find\s*/);
+  if (prefix) {
+    if (typeKey === 'all') {
+      inputEl.value = prefix[0];
+    } else {
+      inputEl.value = prefix[0] + typeKey + ' ';
+    }
+  }
+  hideTypeAutocomplete();
+  inputEl.focus();
+}
+
+function onTypeAcKey(e, inputEl) {
+  if (!_typeAcVisible) return false;
+  const dd = document.getElementById('type-ac-dropdown');
+  if (!dd || dd.style.display === 'none') return false;
+  const items = dd.querySelectorAll('.type-ac-item');
+
+  if (e.key === 'ArrowDown') { e.preventDefault(); _typeAcIdx = Math.min(_typeAcIdx+1, items.length-1); items.forEach((it,i) => it.classList.toggle('active', i===_typeAcIdx)); return true; }
+  if (e.key === 'ArrowUp') { e.preventDefault(); _typeAcIdx = Math.max(_typeAcIdx-1, 0); items.forEach((it,i) => it.classList.toggle('active', i===_typeAcIdx)); return true; }
+  if (e.key === 'Tab' && items.length > 0) { e.preventDefault(); var tidx = _typeAcIdx >= 0 ? _typeAcIdx : 0; selectTypeCmd(inputEl, _SEARCH_TYPES[tidx].key); return true; }
+  if (e.key === 'Enter' && _typeAcIdx >= 0) { e.preventDefault(); selectTypeCmd(inputEl, _SEARCH_TYPES[_typeAcIdx].key); return true; }
+  if (e.key === 'Escape') { hideTypeAutocomplete(); return true; }
+
+  // Shortcut keys
+  const key = e.key.toUpperCase();
+  const match = _SEARCH_TYPES.find(t => t.shortcut === key);
+  if (match && key.length === 1) { e.preventDefault(); selectTypeCmd(inputEl, match.key); return true; }
+
+  return false;
+}
+
+// ─── SEARCH DIALOG ──────────────────────────────────────────────────────────
+let _pendingSearchMsg = null;
+let _searchResults = [];
+let _currentSearchFilter = 'all';
+let _isGlobalSearch = false;
+
+const _SOURCE_SUBTYPES = {
+  'webclip': ['webclip_salesforce', 'webclip_slack', 'webclip_general'],
+  'document': ['document_word', 'document_excel', 'document_pdf', 'document_pptx'],
+  'whatsapp': ['whatsapp_direct', 'whatsapp_group'],
+};
+const _SOURCE_SUBLABELS = {
+  'webclip_salesforce': 'Salesforce', 'webclip_slack': 'Slack', 'webclip_general': 'Web',
+  'document_word': 'Word', 'document_excel': 'Excel', 'document_pdf': 'PDF', 'document_pptx': 'PowerPoint',
+  'whatsapp_direct': 'Direktnachricht', 'whatsapp_group': 'Gruppenchat',
+};
+const _SOURCE_PARENTS = {
+  'notification': 'email', 'webclip_salesforce': 'webclip', 'webclip_slack': 'webclip',
+  'webclip_general': 'webclip', 'document_word': 'document', 'document_excel': 'document',
+  'document_pdf': 'document', 'document_pptx': 'document',
+  'whatsapp_direct': 'whatsapp', 'whatsapp_group': 'whatsapp',
+};
+
+function applySearchFilter(filter) {
+  _currentSearchFilter = filter;
+  // Update button states
+  document.querySelectorAll('.search-filter-btn').forEach(b => b.classList.toggle('active', b.dataset.filter === filter));
+  // Show subfilter bar if applicable
+  const subbar = document.getElementById('search-subfilter-bar');
+  if (_SOURCE_SUBTYPES[filter]) {
+    subbar.innerHTML = '';
+    const allBtn = document.createElement('button');
+    allBtn.className = 'search-subfilter-btn active';
+    allBtn.textContent = 'Alle';
+    allBtn.onclick = () => { _currentSearchFilter = filter; rerenderSearchResults(); document.querySelectorAll('.search-subfilter-btn').forEach(b => b.classList.remove('active')); allBtn.classList.add('active'); };
+    subbar.appendChild(allBtn);
+    _SOURCE_SUBTYPES[filter].forEach(sub => {
+      const btn = document.createElement('button');
+      btn.className = 'search-subfilter-btn';
+      btn.textContent = _SOURCE_SUBLABELS[sub] || sub;
+      btn.onclick = () => { _currentSearchFilter = sub; rerenderSearchResults(); document.querySelectorAll('.search-subfilter-btn').forEach(b => b.classList.remove('active')); btn.classList.add('active'); };
+      subbar.appendChild(btn);
+    });
+    subbar.classList.add('show');
+  } else {
+    subbar.classList.remove('show');
+  }
+  rerenderSearchResults();
+}
+
+function getFilteredResults() {
+  if (_currentSearchFilter === 'all') {
+    // Hide notifications in 'all' view
+    return _searchResults.filter(r => !r.is_notification && r.source_type !== 'notification');
+  }
+  const filter = _currentSearchFilter;
+  const subs = _SOURCE_SUBTYPES[filter];
+  const validTypes = subs ? new Set([filter, ...subs]) : new Set([filter]);
+  // For email filter, include notifications
+  if (filter === 'email') validTypes.add('notification');
+  return _searchResults.filter(r => {
+    const st = r.source_type || r.type || 'file';
+    const parent = _SOURCE_PARENTS[st] || st;
+    return validTypes.has(st) || validTypes.has(parent);
+  });
+}
+
+function rerenderSearchResults() {
+  const filtered = getFilteredResults();
+  const list = document.getElementById('search-results-list');
+  list.innerHTML = '';
+  let checkedCount = 0;
+
+  function addItem(r) {
+    const origIdx = _searchResults.indexOf(r);
+    const div = document.createElement('div');
+    const isNotif = r.is_notification || r.source_type === 'notification';
+    div.className = 'search-result-item' + (isNotif ? ' notification' : '');
+    const cb = document.createElement('input');
+    cb.type = 'checkbox'; cb.dataset.idx = origIdx;
+    // All unchecked by default — user selects manually
+    cb.onchange = function() { onSearchCheckboxChange(this); };
+    if (r.is_notification) cb.dataset.notif = '1';
+    div.onclick = (e) => { if (e.target.tagName !== 'INPUT') { cb.checked = !cb.checked; onSearchCheckboxChange(cb); }};
+    const info = document.createElement('div');
+    info.className = 'search-result-info';
+    const nameEl = document.createElement('div');
+    nameEl.className = 'search-result-name';
+    let prefix = '';
+    if (isNotif) prefix = '[Notif] ';
+    else if ((r.source_type||r.type) === 'email') prefix = '\u2709 ';
+    else if ((r.source_type||r.type||'').startsWith('webclip')) prefix = '\U0001f310 ';
+    else if ((r.source_type||r.type||'').startsWith('document')) prefix = '\U0001f4c4 ';
+    else if ((r.source_type||r.type) === 'conversation') prefix = '\U0001f4ac ';
+    else if ((r.source_type||r.type) === 'screenshot') prefix = '\U0001f4f8 ';
+    else prefix = '\U0001f4c4 ';
+    if (_isGlobalSearch && r.agent) prefix = '\U0001f310[' + r.agent + '] ' + prefix;
+    nameEl.textContent = prefix + r.name;
+    const meta = document.createElement('div');
+    meta.className = 'search-result-meta';
+    let metaParts = [];
+    if (isNotif) metaParts.push('<span style="color:#999;font-style:italic">Notifikation</span>');
+    if (r.from) { const cls = r.from_person ? 'from-person' : 'from-auto'; metaParts.push('<span class="'+cls+'">Von: '+r.from.substring(0,40)+'</span>'); }
+    if (r.subject) metaParts.push(r.subject.substring(0,50));
+    if (r.date) metaParts.push(r.date);
+    meta.innerHTML = metaParts.join(' \u00b7 ');
+    const prev = document.createElement('div');
+    prev.className = 'search-result-preview';
+    prev.textContent = r.preview || '';
+    info.appendChild(nameEl);
+    info.appendChild(meta);
+    info.appendChild(prev);
+    div.appendChild(cb);
+    div.appendChild(info);
+    list.appendChild(div);
+  }
+
+  if (_isGlobalSearch && _currentSearchFilter === 'all') {
+    // Group by agent
+    const groups = {};
+    filtered.forEach(r => {
+      const key = r.agent || 'global';
+      if (!groups[key]) groups[key] = [];
+      groups[key].push(r);
+    });
+    Object.keys(groups).sort().forEach(agent => {
+      const items = groups[agent];
+      const d = document.createElement('div');
+      d.className = 'search-section-divider';
+      d.textContent = '\u2500\u2500 ' + agent + ' (' + items.length + ' Treffer) \u2500\u2500';
+      list.appendChild(d);
+      items.forEach(r => addItem(r));
+    });
+  } else if (_currentSearchFilter === 'email') {
+    // Email filter: show emails first, notifications last
+    const emails = filtered.filter(r => !r.is_notification && r.source_type !== 'notification');
+    const notifs = filtered.filter(r => r.is_notification || r.source_type === 'notification');
+    emails.forEach(r => addItem(r));
+    if (notifs.length > 0) {
+      const d = document.createElement('div');
+      d.className = 'search-section-divider';
+      d.textContent = '\u2500\u2500 Notifikationen (' + notifs.length + ') \u2500\u2500';
+      list.appendChild(d);
+      notifs.forEach(r => addItem(r));
+    }
+  } else {
+    // Group by source_type subcategory
+    const groups = {};
+    filtered.forEach(r => {
+      const st = r.source_type || r.type || 'file';
+      if (!groups[st]) groups[st] = [];
+      groups[st].push(r);
+    });
+    const keys = Object.keys(groups).sort();
+    if (keys.length > 1) {
+      keys.forEach(st => {
+        const label = _SOURCE_SUBLABELS[st] || st;
+        const d = document.createElement('div');
+        d.className = 'search-section-divider';
+        d.textContent = '\u2500\u2500 ' + label + ' (' + groups[st].length + ') \u2500\u2500';
+        list.appendChild(d);
+        groups[st].forEach(r => addItem(r));
+      });
+    } else {
+      filtered.forEach(r => addItem(r));
+    }
+  }
+  updateSelectionCounter();
+}
+
+function updateSelectionCounter() {
+  const checked = document.querySelectorAll('#search-results-list input[type=checkbox]:checked').length;
+  const counter = document.getElementById('search-selection-counter');
+  if (counter) counter.textContent = checked + ' ausgewaehlt (max 50)';
+  updateToggleAllBtn();
+}
+
+function onSearchCheckboxChange(cb) {
+  const checked = document.querySelectorAll('#search-results-list input[type=checkbox]:checked').length;
+  if (cb.checked && checked > 50) { cb.checked = false; return; }
+  updateSelectionCounter();
+}
+
+function showSearchDialog(results, query, isGlobal) {
+  _searchResults = results;
+  _isGlobalSearch = isGlobal || false;
+  _currentSearchFilter = 'all';
+  const overlay = document.getElementById('search-overlay');
+  if (isGlobal) {
+    document.getElementById('search-panel-title').textContent = '🌐 Globale Suche \u2014 ' + results.length + ' Datei(en)';
+  } else {
+    document.getElementById('search-panel-title').textContent = '🔍 ' + results.length + ' Datei(en) gefunden';
+  }
+  document.getElementById('search-panel-count').textContent = 'Suche: ' + query;
+  var hitCount = document.getElementById('search-hit-count');
+  if (hitCount) hitCount.textContent = results.length + ' Dateien gefunden';
+  document.querySelectorAll('.search-filter-btn').forEach(b => b.classList.toggle('active', b.dataset.filter === 'all'));
+  document.getElementById('search-subfilter-bar').classList.remove('show');
+  rerenderSearchResults();
+  overlay.classList.add('show');
+  document.addEventListener('keydown', _searchEscHandler);
+}
+
+function closeSearchDialog(sendAnyway) {
+  document.getElementById('search-overlay').classList.remove('show');
+  document.removeEventListener('keydown', _searchEscHandler);
+  if (sendAnyway && _pendingSearchMsg) {
+    doSendChat(_pendingSearchMsg);
+  }
+  _pendingSearchMsg = null;
+  _searchResults = [];
+}
+
+function _searchEscHandler(e) {
+  if (e.key === 'Escape') { e.preventDefault(); closeSearchDialog(true); }
+}
+
+function toggleAllSearchCheckboxes() {
+  var cbs = document.querySelectorAll('#search-results-list input[type=checkbox]');
+  var nonNotif = Array.from(cbs).filter(function(cb) { return !cb.dataset.notif; });
+  var allChecked = nonNotif.length > 0 && nonNotif.every(function(cb) { return cb.checked; });
+  var count = 0;
+  nonNotif.forEach(function(cb) {
+    if (allChecked) { cb.checked = false; }
+    else if (count < 50) { cb.checked = true; count++; }
+  });
+  updateSelectionCounter();
+}
+
+function updateToggleAllBtn() {
+  var btn = document.getElementById('search-toggle-all-btn');
+  if (!btn) return;
+  var cbs = document.querySelectorAll('#search-results-list input[type=checkbox]');
+  var nonNotif = Array.from(cbs).filter(function(cb) { return !cb.dataset.notif; });
+  var allChecked = nonNotif.length > 0 && nonNotif.every(function(cb) { return cb.checked; });
+  btn.textContent = allChecked ? 'Alle abwaehlen' : 'Alle markieren';
+}
+
+async function loadAllResults() {
+  const paths = _searchResults.filter(r => !r.is_notification).slice(0, 50).map(r => r.path);
+  await doLoadFiles(paths);
+}
+
+async function loadSelectedResults() {
+  const checkboxes = document.querySelectorAll('#search-results-list input[type=checkbox]:checked');
+  const paths = [];
+  checkboxes.forEach(cb => {
+    const idx = parseInt(cb.dataset.idx);
+    if (_searchResults[idx] && paths.length < 50) paths.push(_searchResults[idx].path);
+  });
+  if (paths.length === 0) { closeSearchDialog(true); return; }
+  await doLoadFiles(paths);
+}
+
+async function doLoadFiles(paths) {
+  try {
+    const r = await fetch('/load_selected_files', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({paths, session_id:SESSION_ID})});
+    const data = await r.json();
+    if (data.loaded) {
+      const agent = getAgentName();
+      data.loaded.forEach(n => { addCtxItem(n,'file',true); addFinderLink(agent,n); });
+      addStatusMsg('🔍 ' + data.loaded.length + ' Datei(en) in Kontext geladen');
+      if (data.agents) { data.agents.forEach(a => { if (a !== agent) addStatusMsg('🌐 Dateien aus Agent: ' + a); }); }
+    }
+  } catch(e) { addStatusMsg('Fehler beim Laden: '+e.message); }
+  document.getElementById('search-overlay').classList.remove('show');
+  if (_pendingSearchMsg) {
+    doSendChat(_pendingSearchMsg);
+  }
+  _pendingSearchMsg = null;
+  _searchResults = [];
+}
+
+// ─── SEND MESSAGE ───────────────────────────────────────────────────────────
+async function sendMessage() {
+  const input = document.getElementById('msg-input');
+  const text = input.value.trim();
+  if (!text) return;
+  input.value = ''; input.style.height = 'auto';
+  hideSlashAutocomplete();
+
+  // /find and /find_global commands — intercept, do NOT send to AI
+  hideTypeAutocomplete();
+  hideFindChips();
+  // Match: /find-TYPE query, /find_global-TYPE query, /find query, /find_global query
+  const typedFindMatch = text.match(/^\/find(_global)?(?:-(email|whatsapp|webclip|slack|salesforce|screenshot|contact|document|conversation))?(?:\s+(.*))?$/i);
+  if (typedFindMatch && getAgentName() !== 'Kein Agent') {
+    const isGlobal = !!typedFindMatch[1];
+    let searchType = typedFindMatch[2] ? typedFindMatch[2].toLowerCase() : null;
+    let rawQuery = (typedFindMatch[3] || '').trim();
+    // Also check for old-style /find email query (type as first word)
+    if (!searchType) {
+      const knownTypes = ['email','whatsapp','webclip','slack','salesforce','screenshot','contact','document','conversation'];
+      const firstWord = rawQuery.split(/\s+/)[0].toLowerCase();
+      if (knownTypes.includes(firstWord)) {
+        searchType = firstWord;
+        rawQuery = rawQuery.substring(firstWord.length).trim();
+      }
+    }
+    const query = rawQuery;
+    // Empty query — show recent files instead
+    if (!query) {
+      addMessage('user', text);
+      scrollDown();
+      const typeLabels2 = {email:'E-Mail',whatsapp:'WhatsApp',webclip:'Web Clip',slack:'Slack',salesforce:'Salesforce',screenshot:'Screenshot',document:'Dokument',conversation:'Konversation'};
+      const typeInfo2 = searchType ? ' | Typ: ' + (typeLabels2[searchType]||searchType) : '';
+      startTyping('Lade neueste Dateien' + typeInfo2 + '...');
+      try {
+        const payload2 = {query:'', session_id:SESSION_ID, recent:true};
+        if (searchType) payload2.type = searchType;
+        payload2.agent = getAgentName();
+        const endpoint2 = '/search_preview';
+        const r2 = await fetch(endpoint2, {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify(payload2)});
+        const data2 = await r2.json();
+        stopTyping();
+        if (data2.ok && data2.results && data2.results.length > 0) {
+          _pendingSearchMsg = null;
+          showSearchDialog(data2.results, 'Neueste' + typeInfo2, isGlobal);
+        } else {
+          addStatusMsg('Keine Dateien gefunden' + typeInfo2 + ' (Index leer oder nicht aufgebaut)');
+        }
+      } catch(e2) { stopTyping(); addStatusMsg('Fehler: '+e2.message); }
+      return;
+    }
+    addMessage('user', text);
+    scrollDown();
+    const typeLabels = {email:'E-Mail',webclip:'Web Clip',screenshot:'Screenshot',contact:'Kontakt',document:'Dokument',conversation:'Konversation'};
+    const typeInfo = searchType ? ' | Typ: ' + (typeLabels[searchType]||searchType) : '';
+    startTyping((isGlobal ? 'Globale Suche' : 'Suche') + typeInfo + '...');
+    try {
+      let r;
+      const payload = {query:query, session_id:SESSION_ID};
+      if (searchType) payload.type = searchType;
+      if (isGlobal) {
+        payload.requesting_agent = getAgentName();
+        r = await fetch('/global_search_preview', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify(payload)});
+      } else {
+        payload.agent = getAgentName();
+        r = await fetch('/search_preview', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify(payload)});
+      }
+      const data = await r.json();
+      stopTyping();
+      if (data.ok && data.results && data.results.length > 0) {
+        _pendingSearchMsg = null;  // /find results stay in dialog, no auto-send to AI
+        showSearchDialog(data.results, data.query || query, isGlobal || data.global);
+        return;
+      } else {
+        addStatusMsg('Keine Ergebnisse fuer: ' + query + typeInfo);
+      }
+    } catch(e) { stopTyping(); addStatusMsg('Suchfehler: ' + e.message); }
+    return;
+  }
+
+  // CALENDAR_SLASH_V1: Kalender-Befehle intercepten
+  if (text.startsWith('/calendar-')) {
+    addMessage('user', text);
+    scrollDown();
+    handleCalendarCommand(text);
+    return;
+  }
+
+  // CANVA_SLASH_V1: Canva-Befehle intercepten
+  if (text.startsWith('/canva-')) {
+    addMessage('user', text);
+    scrollDown();
+    handleCanvaCommand(text);
+    return;
+  }
+
+  addMessage('user', text);
+  scrollDown();
+  doSendChat(text);
+}
+
+async function handleCalendarCommand(text) {
+  startTyping('Kalender...');
+  try {
+    const parts = text.split(/\s+/);
+    const cmd = parts[0];
+    const arg = parts.slice(1).join(' ').trim();
+    let daysBack = 0, daysAhead = 1, label = 'Heute';
+
+    if (cmd === '/calendar-today') { daysBack = 0; daysAhead = 1; label = 'Heute'; }
+    else if (cmd === '/calendar-tomorrow') { daysBack = 0; daysAhead = 2; label = 'Morgen'; }
+    else if (cmd === '/calendar-week') { daysBack = 0; daysAhead = 7; label = 'Diese Woche'; }
+    else if (cmd === '/calendar-search') {
+      if (!arg) { stopTyping(); addStatusMsg('Bitte Suchbegriff angeben: /calendar-search Meeting'); return; }
+      daysBack = 30; daysAhead = 30; label = 'Suche: ' + arg;
+    }
+
+    const payload = {days_back: daysBack, days_ahead: daysAhead};
+    if (cmd === '/calendar-search' && arg) payload.search = arg;
+
+    const r = await fetch('/api/calendar', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(payload)});
+    const d = await r.json();
+    stopTyping();
+
+    if (d.error) { addStatusMsg('Kalender-Fehler: ' + d.error); return; }
+
+    let msg = '**\U0001f4c5 Kalender — ' + label + '** (' + d.count + ' Termine)\\n';
+    if (!d.events || !d.events.length) {
+      msg += '\\nKeine Termine gefunden.';
+    } else {
+      let lastDate = '';
+      d.events.forEach(function(e) {
+        const startStr = e.start || '';
+        const dateOnly = startStr.substring(0, 10);
+        if (dateOnly !== lastDate) {
+          msg += '\\n**' + dateOnly + '**';
+          lastDate = dateOnly;
+        }
+        const time = e.all_day ? 'Ganztaegig' : startStr.substring(11, 16);
+        msg += '\\n- ' + time + ' — **' + e.title + '**';
+        if (e.calendar_name) msg += ' _(' + e.calendar_name + ')_';
+        if (e.location) msg += ' \U0001f4cd ' + e.location;
+      });
+    }
+    addMessage('assistant', msg);
+  } catch(e) {
+    stopTyping();
+    addStatusMsg('Kalender-Fehler: ' + e.message);
+  }
+}
+
+async function handleCanvaCommand(text) {
+  startTyping('Canva...');
+  try {
+    const parts = text.split(/\s+/);
+    const cmd = parts[0];
+    const arg = parts.slice(1).join(' ').trim();
+
+    if (cmd === '/canva-search') {
+      const r = await fetch('/api/canva', {method:'POST', headers:{'Content-Type':'application/json'},
+        body: JSON.stringify({action:'search', query: arg || '', count: 10})});
+      const d = await r.json();
+      stopTyping();
+      if (d.ok && d.data && d.data.items) {
+        let msg = '**Canva Designs' + (arg ? ' fuer "'+arg+'"' : '') + ':**\\n';
+        d.data.items.forEach(function(it) {
+          msg += '\\n- **' + (it.title || '(Ohne Titel)') + '** (ID: `' + it.id + '`)';
+          if (it.urls && it.urls.edit_url) msg += ' — [Bearbeiten](' + it.urls.edit_url + ')';
+        });
+        if (!d.data.items.length) msg += '\\nKeine Designs gefunden.';
+        addMessage('assistant', msg);
+      } else { addStatusMsg('Canva-Fehler: ' + (d.error || d.data?.error || 'Unbekannt')); }
+
+    } else if (cmd === '/canva-create') {
+      if (!arg) { stopTyping(); addStatusMsg('Bitte Titel angeben: /canva-create Mein Design'); return; }
+      const r = await fetch('/api/canva', {method:'POST', headers:{'Content-Type':'application/json'},
+        body: JSON.stringify({action:'create', title: arg, design_type: 'doc'})});
+      const d = await r.json();
+      stopTyping();
+      if (d.ok && d.data) {
+        let msg = '**Canva Design erstellt:** ' + arg;
+        if (d.data.design && d.data.design.urls) msg += '\\n[Design oeffnen](' + d.data.design.urls.edit_url + ')';
+        addMessage('assistant', msg);
+      } else { addStatusMsg('Canva-Fehler: ' + (d.error || d.data?.error || 'Unbekannt')); }
+
+    } else if (cmd === '/canva-templates') {
+      const r = await fetch('/api/canva', {method:'POST', headers:{'Content-Type':'application/json'},
+        body: JSON.stringify({action:'brand_templates', query: arg || '', count: 20})});
+      const d = await r.json();
+      stopTyping();
+      if (d.ok && d.data && d.data.items) {
+        let msg = '**Canva Brand Templates:**\\n';
+        d.data.items.forEach(function(it) {
+          msg += '\\n- **' + (it.title || it.id) + '** (ID: `' + it.id + '`)';
+        });
+        if (!d.data.items.length) msg += '\\nKeine Brand Templates gefunden. Erstelle Templates in Canva und markiere sie als Brand Template.';
+        addMessage('assistant', msg);
+      } else { addStatusMsg('Canva-Fehler: ' + (d.error || d.data?.error || 'Unbekannt')); }
+
+    } else if (cmd === '/canva-export') {
+      const exportParts = arg.split(/\s+/);
+      const designId = exportParts[0] || '';
+      const fmt = exportParts[1] || 'pdf';
+      if (!designId) { stopTyping(); addStatusMsg('Bitte Design-ID angeben: /canva-export DAGxxxx pdf'); return; }
+      const r = await fetch('/api/canva', {method:'POST', headers:{'Content-Type':'application/json'},
+        body: JSON.stringify({action:'export', design_id: designId, format: fmt})});
+      const d = await r.json();
+      stopTyping();
+      if (d.ok && d.data) {
+        addMessage('assistant', '**Export gestartet** (Design: `' + designId + '`, Format: ' + fmt + ')\\nStatus: ' + JSON.stringify(d.data).substring(0, 200));
+      } else { addStatusMsg('Export-Fehler: ' + (d.error || d.data?.error || 'Unbekannt')); }
+
+    } else if (cmd === '/canva-campaign') {
+      // Kampagne wird ans LLM delegiert — der Agent erstellt die Varianten
+      stopTyping();
+      doSendChat('Erstelle eine Canva-Kampagne mit mehreren Varianten. ' + (arg || 'Ich moechte verschiedene Ad-Varianten aus einem Brand Template generieren. Zeige mir erst die verfuegbaren Templates.'));
+
+    } else {
+      stopTyping();
+      addStatusMsg('Unbekannter Canva-Befehl: ' + cmd);
+    }
+  } catch(e) {
+    stopTyping();
+    addStatusMsg('Canva-Fehler: ' + e.message);
+  }
+}
+
+async function doSendChat(text) {
+  startTyping(text.substring(0,50));
+  startTaskDiscovery();
+  let data;
+  try {
+    const r = await fetch('/chat', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({message:text, session_id:SESSION_ID})});
+    data = await r.json();
+  } catch(err) { stopTaskDiscovery(); stopTyping(); showStopBtn(false); addStatusMsg('Verbindungsfehler: '+err.message); return; }
+
+  if (data.queued) {
+    const ph = addQueuedMessage(text, data.position, data.queue_id);
+    queuedPlaceholders[data.queue_id] = ph;
+    updateQueueDisplay(data.position);
+    startPolling();
+    startTyping(null);
+    return;
+  }
+
+  // Direct response — hide typing
+  stopTaskDiscovery();
+  stopTyping();
+  handleResponse(data);
+
+  if (data.queue_active) {
+    startPolling();
+    startTyping(null);
+  } else {
+    showStopBtn(false);
+  }
+}
+
+// ── Task Discovery Poller ────────────────────────────────────────────────────
+// Discovers server-side video/image generation tasks via /queue_status and
+// spawns a progress bar for each new task_id. Runs while a /chat request is
+// in flight so the user sees progress during long-running generation.
+var taskDiscoveryInterval = null;
+
+async function discoverTasksOnce() {
+  try {
+    const r = await fetch('/queue_status?session_id=' + SESSION_ID);
+    const st = await r.json();
+    if (st && Array.isArray(st.active_tasks)) {
+      st.active_tasks.forEach(function(t){
+        if (!progressBars[t.task_id]) {
+          createProgressBar(t.task_id, t.kind || 'video');
+        }
+        updateProgressBar(t.task_id, t);
+      });
+    }
+  } catch(e) {}
+}
+
+function startTaskDiscovery() {
+  if (taskDiscoveryInterval) return;
+  discoverTasksOnce();
+  taskDiscoveryInterval = setInterval(discoverTasksOnce, 2000);
+}
+
+function stopTaskDiscovery() {
+  if (taskDiscoveryInterval) { clearInterval(taskDiscoveryInterval); taskDiscoveryInterval = null; }
+}
+
+// ─── URL / FILE / SEARCH ────────────────────────────────────────────────────────
+async function addUrl() {
+  let url = document.getElementById('url-input').value.trim();
+  if (!url) return;
+  if (!url.startsWith('http')) url = 'https://' + url;
+  document.getElementById('url-input').value='';
+  addStatusMsg('Lade: '+url);
+  const r = await fetch('/add_url', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({url, session_id:SESSION_ID})});
+  const data = await r.json();
+  if (data.ok) { addCtxItem(data.title||url,'url'); addStatusMsg('Bereit: '+url); }
+  else addStatusMsg('Fehler: '+data.error);
+}
+
+async function addFileFromInput() {
+  const files = document.getElementById('file-input').files;
+  for (const file of files) {
+    const fd = new FormData(); fd.append('file', file);
+    addStatusMsg('Lade: '+file.name+'...');
+    fd.append('session_id', SESSION_ID);
+    const r = await fetch('/add_file', {method:'POST', body:fd});
+    const data = await r.json();
+    if (data.ok) { addCtxItem(file.name,'file'); addStatusMsg('✓ '+file.name+' — Kontext + Memory gespeichert'); }
+    else addStatusMsg('Fehler: '+data.error);
+  }
+  document.getElementById('file-input').value='';
+}
+
+function toggleSearch() {
+  searchVisible = !searchVisible;
+  document.getElementById('memory-search').style.display = searchVisible?'block':'none';
+  document.getElementById('search-toggle').classList.toggle('active', searchVisible);
+  if (searchVisible) document.getElementById('memory-search').focus();
+}
+
+async function searchMemory() {
+  const q = document.getElementById('memory-search').value.trim();
+  if (!q) return;
+  addStatusMsg('Suche im Memory: '+q+'...');
+  const r = await fetch('/search_memory', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({query:q, session_id:SESSION_ID})});
+  const data = await r.json();
+  if (data.results && data.results.length) {
+    const agent = getAgentName();
+    data.results.forEach(f => { addCtxItem(f.name,'file'); addFinderLink(agent,f.name); });
+    addStatusMsg(data.results.length+' Datei(en) gefunden und geladen.');
+  } else addStatusMsg('Keine Ergebnisse fuer: '+q);
+}
+
+// ─── FILE AUTOCOMPLETE ──────────────────────────────────────────────────────────
+var _fileAcTimer = null;
+var _fileAcIdx = -1;
+var _fileAcResults = [];
+
+async function onFileAcInput(val) {
+  clearTimeout(_fileAcTimer);
+  var dd = document.getElementById('file-ac-dropdown');
+  if (!val || val.length < 2) { dd.style.display = 'none'; _fileAcResults = []; return; }
+  _fileAcTimer = setTimeout(async function() {
+    var agent = getAgentName();
+    if (!agent || agent === 'Kein Agent') return;
+    try {
+      var r = await fetch('/api/memory-files-search?q=' + encodeURIComponent(val) + '&agent=' + encodeURIComponent(agent));
+      var data = await r.json();
+      _fileAcResults = data.results || data || [];
+      _fileAcIdx = -1;
+      if (_fileAcResults.length === 0) { dd.style.display = 'none'; return; }
+      var html = '';
+      for (var i = 0; i < Math.min(_fileAcResults.length, 8); i++) {
+        var item = _fileAcResults[i];
+        html += '<div class="file-ac-item" data-idx="' + i + '" onmousedown="selectFileAc(' + i + ')">';
+        html += '<span class="ac-filename">' + escHtml(item.filename || item.name || '') + '</span>';
+        if (item.snippet) html += '<span class="ac-snippet">' + escHtml(item.snippet) + '</span>';
+        html += '</div>';
+      }
+      dd.innerHTML = html;
+      dd.style.display = 'block';
+    } catch(e) { dd.style.display = 'none'; }
+  }, 250);
+}
+
+function onFileAcKey(e) {
+  var dd = document.getElementById('file-ac-dropdown');
+  if (dd.style.display === 'none') return;
+  var items = dd.querySelectorAll('.file-ac-item');
+  if (e.key === 'ArrowDown') { e.preventDefault(); _fileAcIdx = Math.min(_fileAcIdx + 1, items.length - 1); updateFileAcHighlight(items); }
+  else if (e.key === 'ArrowUp') { e.preventDefault(); _fileAcIdx = Math.max(_fileAcIdx - 1, 0); updateFileAcHighlight(items); }
+  else if (e.key === 'Enter' && _fileAcIdx >= 0) { e.preventDefault(); selectFileAc(_fileAcIdx); }
+  else if (e.key === 'Escape') { dd.style.display = 'none'; }
+}
+
+function updateFileAcHighlight(items) {
+  for (var i = 0; i < items.length; i++) items[i].classList.toggle('selected', i === _fileAcIdx);
+}
+
+async function selectFileAc(idx) {
+  var item = _fileAcResults[idx];
+  if (!item) return;
+  var dd = document.getElementById('file-ac-dropdown');
+  dd.style.display = 'none';
+  document.getElementById('file-ac-input').value = '';
+  var fname = item.filename || item.name;
+  addStatusMsg('Lade: ' + fname + '...');
+  try {
+    var r = await fetch('/load_selected_files', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({files:[fname], session_id:SESSION_ID})});
+    var data = await r.json();
+    if (data.ok) {
+      addCtxItem(fname, 'file');
+      addStatusMsg('Geladen: ' + fname);
+    } else {
+      addStatusMsg('Fehler: ' + (data.error || 'unbekannt'));
+    }
+  } catch(e) { addStatusMsg('Fehler beim Laden: ' + e.message); }
+}
+
+// Close dropdown when clicking elsewhere
+document.addEventListener('click', function(e) {
+  if (!e.target.closest('#file-ac-wrap')) {
+    var dd = document.getElementById('file-ac-dropdown');
+    if (dd) dd.style.display = 'none';
+  }
+});
+
+// ─── DRAG & DROP ────────────────────────────────────────────────────────────────
+let dragCounter = 0;
+document.addEventListener('dragenter', e => { e.preventDefault(); if(++dragCounter===1) document.getElementById('drop-overlay').classList.add('active'); });
+document.addEventListener('dragleave', e => { if(--dragCounter===0) document.getElementById('drop-overlay').classList.remove('active'); });
+document.addEventListener('dragover', e => e.preventDefault());
+document.addEventListener('drop', async e => {
+  e.preventDefault(); dragCounter=0; document.getElementById('drop-overlay').classList.remove('active');
+  const files = Array.from(e.dataTransfer.files);
+  if (!files.length) return;
+  if (document.getElementById('agent-label').textContent==='Kein Agent') { addStatusMsg('Bitte zuerst einen Agenten auswaehlen.'); return; }
+  for (const file of files) {
+    const fd = new FormData(); fd.append('file', file);
+    addStatusMsg('Lade: '+file.name+'...');
+    try {
+      fd.append('session_id', SESSION_ID);
+    const r = await fetch('/add_file', {method:'POST', body:fd});
+      const data = await r.json();
+      if (data.ok) { addCtxItem(file.name,'file'); addStatusMsg('✓ '+file.name+' — Kontext + Memory gespeichert'); }
+      else addStatusMsg('Fehler: '+data.error);
+    } catch(err) { addStatusMsg('Fehler: '+err.message); }
+  }
+});
+
+window.onload = async () => { try { await loadProviders(); } catch(e) {} showAgentModal(); };
+</script>
+</body>
+</html>
+"""
+
+@app.route("/")
+def index():
+    return render_template_string(HTML)
+
+@app.route('/models')
+def get_models():
+    config = load_models()
+    provider_names = {'anthropic': 'Anthropic', 'openai': 'OpenAI', 'mistral': 'Mistral', 'gemini': 'Google Gemini'}
+    result = []
+    for pkey, pdata in config.get('providers', {}).items():
+        result.append({
+            'provider': pkey,
+            'name': provider_names.get(pkey, pkey.title()),
+            'models': [dict(m, capabilities=[CAPABILITY_EMOJI.get(c,'') for c in MODEL_CAPABILITIES.get(m['id'], [])]) for m in pdata.get('models', [])]
+        })
+    if not result:
+        result = [{'provider': 'anthropic', 'name': 'Anthropic', 'models': [
+            {'id': 'claude-sonnet-4-6', 'name': 'Claude Sonnet 4.6'},
+            {'id': 'claude-opus-4-6', 'name': 'Claude Opus 4.6'},
+            {'id': 'claude-haiku-4-5-20251001', 'name': 'Claude Haiku 4.5'}
+        ]}]
+    return jsonify(result)
+
+def get_parent_agent(name):
+    """If name is a sub-agent (contains '_'), return parent name. Otherwise None."""
+    if '_' in name:
+        return name.split('_', 1)[0]
+    return None
+
+def get_agent_speicher(name):
+    """Return the storage directory for an agent. Sub-agents use parent's directory."""
+    parent = get_parent_agent(name)
+    return os.path.join(BASE, parent if parent else name)
+
+def get_agent_display_name(name):
+    """Return display name: 'signicat > outbound' for sub-agents."""
+    parent = get_parent_agent(name)
+    if parent:
+        sub = name.split('_', 1)[1]
+        return parent + ' \u203a ' + sub
+    return name
+
+def _agent_description(name):
+    """TOOLTIPS_V1: Liest die ersten zwei Saetze aus dem Agent-System-Prompt
+    als knappe Beschreibung fuer Frontend-Tooltips. Max 180 Zeichen."""
+    try:
+        fpath = os.path.join(AGENTS_DIR, name + '.txt')
+        if not os.path.exists(fpath):
+            return ''
+        with open(fpath, 'r', encoding='utf-8', errors='ignore') as f:
+            raw = f.read(800)
+        # Memory-/System-Marker entfernen
+        for marker in ['--- GEDAECHTNIS:', '--- DATEI-ERSTELLUNG ---', '--- WEITERE FAEHIGKEITEN ---', 'VERGANGENE KONVERSATIONEN:']:
+            idx = raw.find(marker)
+            if idx != -1:
+                raw = raw[:idx]
+        raw = raw.strip()
+        # Erste ~2 Saetze / 180 Zeichen
+        snippet = raw.split('\n\n')[0] if '\n\n' in raw else raw
+        snippet = ' '.join(snippet.split())
+        if len(snippet) > 180:
+            snippet = snippet[:177].rstrip() + '...'
+        return snippet
+    except Exception:
+        return ''
+
+
+@app.route('/agents')
+def get_agents():
+    files = sorted([f.replace('.txt','') for f in os.listdir(AGENTS_DIR) if f.endswith('.txt')])
+    # Group: parents first, then sub-agents nested
+    parents = []
+    children = {}  # parent_name -> [sub_agent_names]
+    for name in files:
+        parent = get_parent_agent(name)
+        if parent:
+            children.setdefault(parent, []).append(name)
+        else:
+            parents.append(name)
+    # Build hierarchical structure
+    result = []
+    for p in parents:
+        subs = []
+        for c in children.get(p, []):
+            sub_label = c.split('_', 1)[1] if '_' in c else c
+            subs.append({'name': c, 'label': sub_label, 'description': _agent_description(c)})
+        result.append({
+            'name': p,
+            'label': p,
+            'description': _agent_description(p),
+            'has_subagents': len(subs) > 0,
+            'subagents': subs
+        })
+    # Orphan sub-agents (parent has no .txt)
+    orphan_parents = set(children.keys()) - set(parents)
+    for op in sorted(orphan_parents):
+        subs = []
+        for c in children[op]:
+            sub_label = c.split('_', 1)[1] if '_' in c else c
+            subs.append({'name': c, 'label': sub_label, 'description': _agent_description(c)})
+        result.append({
+            'name': op,
+            'label': op,
+            'description': '',
+            'has_subagents': True,
+            'subagents': subs
+        })
+    return jsonify(result)
+
+@app.route('/close_session', methods=['POST'])
+def close_session():
+    session_id = request.json.get('session_id', 'default') if request.is_json else 'default'
+    state = get_session(session_id)
+    close_current_session(state)
+    return jsonify({'ok': True})
+
+@app.route('/select_agent', methods=['POST'])
+def select_agent():
+    session_id = request.json.get('session_id', 'default')
+    state = get_session(session_id)
+    name = request.json['agent']
+    prompt_file = os.path.join(AGENTS_DIR, name + '.txt')
+    if not os.path.exists(prompt_file):
+        return jsonify({'ok': False, 'error': f'Agent "{name}" nicht gefunden (keine .txt Datei)'})
+
+    # Sub-agent: use parent's storage directory for memory sharing
+    speicher = get_agent_speicher(name)
+    os.makedirs(speicher, exist_ok=True)
+
+    with open(prompt_file) as f:
+        raw_prompt = f.read()
+
+    # Strip ANY memory/capability blocks from the file - keep only the user's base prompt
+    for marker in ['\n\n--- GEDAECHTNIS:', '\n--- GEDAECHTNIS:',
+                   '\n\n--- DATEI-ERSTELLUNG ---', '\n--- DATEI-ERSTELLUNG ---',
+                   '\n\n--- WEITERE FAEHIGKEITEN ---']:
+        raw_prompt = raw_prompt.split(marker)[0]
+    base_prompt = raw_prompt.strip()
+
+    # Write clean base prompt back to txt file
+    with open(prompt_file, 'w') as f:
+        f.write(base_prompt)
+
+    # Migrate old conversations not yet indexed
+    migrated = migrate_old_conversations(speicher)
+
+    # Build memory context (always from parent's storage)
+    display_name = get_agent_display_name(name)
+    memory_ctx = build_memory_context(speicher, display_name)
+    system_prompt = base_prompt + memory_ctx
+
+    # Memory info for UI
+    index = load_index(speicher)
+    if index:
+        n = len(index)
+        last = index[-1]['date']
+        migration_note = " (+" + str(migrated) + " importiert)" if migrated > 0 else ""
+        memory_info = str(n) + " vergangene Session(s) geladen. Letzte: " + last + migration_note
+    else:
+        memory_info = None
+
+    # Conversation log: sub-agents add their name as suffix
+    datum = datetime.datetime.now().strftime("%Y-%m-%d_%H-%M")
+    parent = get_parent_agent(name)
+    if parent:
+        sub_label = name.split('_', 1)[1]
+        dateiname = os.path.join(speicher, 'konversation_' + datum + '_' + sub_label + '.txt')
+    else:
+        dateiname = os.path.join(speicher, 'konversation_' + datum + '.txt')
+    tmp_path = dateiname + '.tmp'
+    with open(tmp_path, 'w') as f:
+        f.write('Agent: ' + name + '\nDatum: ' + datum + '\n\n')
+    os.replace(tmp_path, dateiname)
+
+    # Add file creation capability to system prompt
+    file_capability = """
+
+--- DATEI-ERSTELLUNG ---
+Du kannst Word-, Excel- und PDF-Dateien erstellen. Wenn der Nutzer eine Datei moechte, antworte mit einem JSON-Block am Ende deiner Antwort:
+
+Fuer Word (.docx):
+[CREATE_FILE:docx:{"title":"Dateiname","content":[{"type":"heading","level":1,"text":"Titel"},{"type":"paragraph","text":"Text"},{"type":"bullet","text":"Punkt"},{"type":"table","rows":[["Spalte1","Spalte2"],["Wert1","Wert2"]]}]}]
+
+Fuer Excel (.xlsx):
+[CREATE_FILE:xlsx:{"title":"Dateiname","sheets":[{"name":"Tabelle1","rows":[["Kopf1","Kopf2"],["Wert1","Wert2"]]}]}]
+
+Fuer PDF (.pdf):
+[CREATE_FILE:pdf:{"title":"Dateiname","content":[{"type":"heading","level":1,"text":"Titel"},{"type":"paragraph","text":"Text"}]}]
+
+Fuer PowerPoint (.pptx):
+[CREATE_FILE:pptx:{"title":"Praesentation","slides":[{"type":"title","heading":"Untertitel"},{"type":"content","heading":"Folientitel","body":"Einleitungstext","bullets":["Punkt 1","Punkt 2"],"footer":"Fusszeile"}]}]
+
+Fuer E-Mail-Draft (oeffnet Apple Mail):
+[CREATE_EMAIL:{"to":"empfaenger@example.com","cc":"","subject":"Betreff","body":"E-Mail Text hier"}]
+
+WICHTIG: Du schickst NIEMALS eine E-Mail direkt ab. Du erstellst IMMER nur einen Draft der in Apple Mail geoeffnet wird. Das gilt fuer alle Formulierungen: 'schreibe', 'sende', 'schick', 'antworte', 'reply', 'forward' — immer CREATE_EMAIL, niemals direkt senden.
+
+Wenn du auf eine E-Mail antwortest (z.B. "antworte auf diese E-Mail", "reply", "Antwort verfassen", "schreib eine Antwort"):
+- Extrahiere aus der Original-E-Mail im Kontext: Von (Absender), An (Empfaenger), Betreff
+- to: Original-Absender (aus "Von:" Feld)
+- cc: Alle Original-Empfaenger aus "An:" AUSSER moritz.cremer@me.com und londoncityfox@gmail.com
+- subject: "Re: " + Original-Betreff (nur wenn nicht bereits "Re:" vorhanden)
+- body: Dein Antworttext + eine Leerzeile + jede Zeile des Original-Bodys mit "> " davor (klassisches E-Mail-Quoting)
+
+Verwende dies immer wenn der Nutzer ein Dokument, eine Tabelle, PDF, Praesentation oder E-Mail benoetigt.
+
+Fuer WhatsApp-Nachricht (oeffnet WhatsApp mit vorausgefuellter Nachricht):
+[CREATE_WHATSAPP:{"to":"Vorname oder Name","message":"Nachrichtentext hier"}]
+
+WICHTIG: WhatsApp-Nachrichten werden NIEMALS automatisch gesendet. Die App wird nur geoeffnet mit vorausgefuelltem Text. Der Nutzer muss manuell auf Senden klicken. Verwende dies wenn der Nutzer sagt: 'schreib auf WhatsApp', 'WhatsApp an', 'schick per WhatsApp'.
+
+KEINE WIEDERHOLUNG: Wenn im Verlauf bereits eine Aktion ausgefuehrt wurde (erkennbar an '[... — Aktion ausgefuehrt]'), erzeuge diese Aktion NICHT erneut. Jede CREATE_EMAIL, CREATE_WHATSAPP, CREATE_SLACK und CREATE_VIDEO Aktion darf nur EINMAL pro expliziter Nutzer-Anfrage erzeugt werden. Wenn der Nutzer eine NEUE Anfrage stellt (z.B. Video generieren statt WhatsApp), fuehre NUR die neue Aktion aus.
+
+Fuer Slack-Nachricht (oeffnet Slack Desktop mit vorausgefuelltem Text):
+[CREATE_SLACK:{"channel":"#kanalname","message":"Nachrichtentext hier"}]
+
+Fuer Slack-DM:
+[CREATE_SLACK:{"to":"Vorname Nachname","message":"Nachrichtentext hier"}]
+
+WICHTIG: Slack-Nachrichten werden NIEMALS automatisch gesendet. Die App wird geoeffnet, Text wird eingefuegt. Der Nutzer muss manuell auf Senden klicken. Verwende dies wenn der Nutzer sagt: 'schreib auf Slack', 'Slack an', 'schick per Slack', 'poste in #channel'.
+--- WEITERE FAEHIGKEITEN ---
+- Web-Suche: Du kannst aktuelle Informationen aus dem Internet abrufen. Nutze dies automatisch wenn der Nutzer nach aktuellen Infos, Preisen, Nachrichten oder Website-Inhalten fragt.
+- Bilder lesen: Hochgeladene Screenshots und Fotos kannst du analysieren und beschreiben.
+- Dateien lesen: PDF, Word, Excel werden automatisch extrahiert und stehen als Kontext zur Verfuegung.
+- Bilder erstellen: Wenn der Nutzer ein Bild moechte, verwende CREATE_IMAGE. Das System wechselt automatisch auf das passende Bildmodell des aktiven Anbieters (Imagen 4 bei Google Gemini, gpt-image-1 bei OpenAI). Sage NIEMALS dass du keine Bilder erstellen kannst.
+- Videos erstellen: Wenn der Nutzer ein Video moechte, verwende CREATE_VIDEO. Das System nutzt automatisch Google Veo. Sage NIEMALS dass du keine Videos erstellen kannst.
+- Kalender: Du hast Zugriff auf den Kalender (Fantastical/Apple Calendar). Befehle: /calendar-today, /calendar-tomorrow, /calendar-week, /calendar-search [query]. Termine werden auch automatisch eingeblendet wenn der Nutzer danach fragt.
+- Canva Designs: Du kannst Canva-Designs suchen, erstellen und exportieren. Verwende die /canva-Befehle oder sage einfach "erstelle ein Canva Design", "suche in Canva", "exportiere als PDF". Fuer Kampagnen mit Brand Templates: /canva-campaign.
+--- ENDE DATEI-ERSTELLUNG ---"""
+
+    system_prompt = system_prompt + file_capability
+
+    # Load saved provider/model preference for this agent
+    agent_prefs = _load_agent_prefs()
+    agent_pref = agent_prefs.get(name, {})
+    pref_provider = agent_pref.get('provider', '')
+    pref_model = agent_pref.get('model', '')
+
+    update_dict = {
+        'agent': name, 'system_prompt': system_prompt, 'speicher': speicher,
+        'verlauf': [], 'dateiname': dateiname, 'kontext_items': [], 'session_files': []
+    }
+    # Set provider/model from saved preference (if available)
+    if pref_provider:
+        update_dict['provider'] = pref_provider
+    if pref_model:
+        update_dict['model_id'] = pref_model
+    state.update(update_dict)
+
+    # txt file stays clean (base prompt only) - sidebar shows full prompt with memory
+    # Build/update search index in background
+    if build_index_async and state.get('speicher'):
+        build_index_async(state['speicher'])
+    return jsonify({'ok': True, 'memory_info': memory_info, 'base_prompt': system_prompt,
+                    'pref_provider': pref_provider, 'pref_model': pref_model})
+
+
+@app.route('/new_conversation', methods=['POST'])
+def new_conversation():
+    session_id = request.json.get('session_id', 'default')
+    state = get_session(session_id)
+    name = request.json['agent']
+    if not state['agent']:
+        return jsonify({'ok': False})
+    datum = datetime.datetime.now().strftime("%Y-%m-%d_%H-%M")
+    dateiname = os.path.join(state['speicher'], 'konversation_' + datum + '.txt')
+    tmp_path = dateiname + '.tmp'
+    with open(tmp_path, 'w') as f:
+        f.write('Agent: ' + name + '\nDatum: ' + datum + '\n\n')
+    os.replace(tmp_path, dateiname)
+    state['verlauf'] = []
+    state['dateiname'] = dateiname
+    state['kontext_items'] = []
+    state['session_files'] = []
+    return jsonify({'ok': True})
+
+@app.route('/get_prompt', methods=['GET'])
+def get_prompt():
+    session_id = request.args.get('session_id', 'default')
+    state = get_session(session_id)
+    agent = request.args.get('agent', '')
+    prompt_file = os.path.join(AGENTS_DIR, agent + '.txt')
+    if not agent or not os.path.exists(prompt_file):
+        return jsonify({'ok': False, 'prompt': ''})
+    # If this is the active agent, return the full in-memory system prompt
+    if state['agent'] == agent and state.get('system_prompt'):
+        return jsonify({'ok': True, 'prompt': state['system_prompt'], 'has_memory': True})
+    # For inactive agents, return only the base prompt from .txt file
+    with open(prompt_file) as f:
+        raw = f.read()
+    for marker in ['\n\n--- GEDAECHTNIS:', '\n--- GEDAECHTNIS:',
+                   '\n\n--- DATEI-ERSTELLUNG ---', '\n--- DATEI-ERSTELLUNG ---',
+                   '\n\n--- WEITERE FAEHIGKEITEN ---']:
+        raw = raw.split(marker)[0]
+    return jsonify({'ok': True, 'prompt': raw.strip(), 'has_memory': False})
+
+@app.route('/save_prompt', methods=['POST'])
+def save_prompt():
+    session_id = request.json.get('session_id', 'default')
+    state = get_session(session_id)
+    agent = request.json['agent']
+    new_prompt = request.json['prompt']
+    prompt_file = os.path.join(AGENTS_DIR, agent + '.txt')
+    try:
+        # Strip all auto-generated blocks, keep only user's base text
+        base_part = new_prompt
+        for marker in ['\n\n--- GEDAECHTNIS:', '\n--- GEDAECHTNIS:',
+                       '\n\n--- DATEI-ERSTELLUNG ---', '\n--- DATEI-ERSTELLUNG ---',
+                       '\n\n--- WEITERE FAEHIGKEITEN ---']:
+            base_part = base_part.split(marker)[0]
+        base_part = base_part.strip()
+        # Always write ONLY the base prompt to the .txt file
+        with open(prompt_file, 'w') as f:
+            f.write(base_part)
+        # If this agent is active, rebuild the in-memory system prompt
+        if state['agent'] == agent:
+            memory_ctx = build_memory_context(state['speicher'], agent)
+            state['system_prompt'] = base_part + memory_ctx
+        return jsonify({'ok': True, 'prompt': base_part})
+    except Exception as e:
+        return jsonify({'ok': False, 'error': str(e)})
+
+@app.route('/create_agent', methods=['POST'])
+def create_agent():
+    session_id = request.json.get('session_id', 'default')
+    state = get_session(session_id)
+    name = request.json.get('name', '').strip()
+    prompt = request.json.get('prompt', 'Du bist ein hilfreicher Assistent.')
+    if not name:
+        return jsonify({'ok': False, 'error': 'Name erforderlich'})
+    prompt_file = os.path.join(AGENTS_DIR, name + '.txt')
+    if os.path.exists(prompt_file):
+        return jsonify({'ok': False, 'error': 'Agent "' + name + '" existiert bereits'})
+    try:
+        with open(prompt_file, 'w') as f:
+            f.write(prompt)
+        # Sub-agents use parent's directory, no new folder needed
+        speicher = get_agent_speicher(name)
+        os.makedirs(speicher, exist_ok=True)
+        return jsonify({'ok': True})
+    except Exception as e:
+        return jsonify({'ok': False, 'error': str(e)})
+
+@app.route('/open_in_finder', methods=['POST'])
+def open_in_finder():
+    import subprocess
+    agent = request.json.get('agent', '')
+    filename = request.json.get('filename', '')
+    memory_dir = os.path.join(BASE, agent, 'memory')
+    try:
+        if filename:
+            fpath = os.path.join(memory_dir, filename)
+            if os.path.exists(fpath):
+                # -R reveals file in Finder (select it)
+                subprocess.run(['open', '-R', fpath], check=True)
+                return jsonify({'ok': True})
+            else:
+                # File not found - open folder instead
+                subprocess.run(['open', memory_dir], check=True)
+                return jsonify({'ok': True, 'note': 'Datei nicht gefunden, Ordner geoeffnet'})
+        elif os.path.exists(memory_dir):
+            subprocess.run(['open', memory_dir], check=True)
+            return jsonify({'ok': True})
+        return jsonify({'ok': False, 'error': 'Ordner nicht gefunden: ' + memory_dir})
+    except Exception as e:
+        return jsonify({'ok': False, 'error': str(e)})
+
+@app.route('/get_history', methods=['GET'])
+def get_history():
+    session_id = request.args.get('session_id', 'default')
+    state = get_session(session_id)
+    agent = request.args.get('agent', '')
+    if not agent:
+        return jsonify({'sessions': []})
+    # SUBAGENT_HISTORY_V1: Sub-Agents nutzen Parent-Ordner
+    speicher = get_agent_speicher(agent)
+    if not os.path.exists(speicher):
+        return jsonify({'sessions': []})
+    
+    # Scan conversation files directly from disk (ignore _index.json for listing)
+    # Sub-Agent-Suffix (z.B. '_outbound' fuer 'signicat_outbound')
+    parent = get_parent_agent(agent)
+    sub_suffix = '_' + agent.split('_', 1)[1] if parent else None
+    all_conv = [f for f in os.listdir(speicher)
+                if f.startswith('konversation_') and f.endswith('.txt')]
+    if sub_suffix:
+        # Sub-Agent: nur eigene Konversationen (mit Suffix im Dateinamen)
+        conv_files = [f for f in all_conv if f.endswith(sub_suffix + '.txt')]
+    else:
+        # Parent: Konversationen ohne bekannte Sub-Agent-Suffixe
+        known_subs = set()
+        for afile in os.listdir(AGENTS_DIR):
+            if afile.endswith('.txt') and '_' in afile:
+                aname = afile.replace('.txt', '')
+                if get_parent_agent(aname) == agent:
+                    known_subs.add('_' + aname.split('_', 1)[1] + '.txt')
+        conv_files = [f for f in all_conv
+                      if not any(f.endswith(s) for s in known_subs)] if known_subs else all_conv
+    # Build result with file metadata
+    result = []
+    for fname in conv_files:
+        fpath = os.path.join(speicher, fname)
+        # Skip tiny files (empty sessions with only header, <=50 bytes)
+        try:
+            fsize = os.path.getsize(fpath)
+        except Exception:
+            continue
+        if fsize <= 50:
+            continue
+        # Auto-title: extract first user message
+        title = ''
+        try:
+            with open(fpath, encoding='utf-8') as f:
+                for line in f:
+                    if line.startswith('Du: '):
+                        title = line[4:].strip()[:60]
+                        break
+        except Exception:
+            pass
+        # Skip if no user message (test artifacts)
+        if not title:
+            continue
+        # Sort key: file modification time (last save = most recent activity)
+        try:
+            mtime = os.path.getmtime(fpath)
+        except Exception:
+            mtime = 0
+        # Readable date from modification time
+        import datetime as _dt
+        date_display = _dt.datetime.fromtimestamp(mtime).strftime('%d.%m.%Y %H:%M')
+        result.append({
+            'date': date_display,
+            'file': fname,
+            'title': title,
+            'mtime': mtime,
+        })
+    # Sort by modification time, newest first
+    result.sort(key=lambda x: x['mtime'], reverse=True)
+    # Remove mtime from response
+    for r in result:
+        del r['mtime']
+    return jsonify({'sessions': result})
+
+@app.route('/load_conversation', methods=['POST'])
+def load_conversation():
+    session_id = request.json.get('session_id', 'default')
+    state = get_session(session_id)
+    agent = request.json.get('agent', '')
+    filename = request.json.get('file', '')
+    resume = request.json.get('resume', False)
+    speicher = get_agent_speicher(agent)  # SUBAGENT_HISTORY_V1
+    fpath = os.path.join(speicher, filename)
+
+    if not filename or not os.path.exists(fpath):
+        return jsonify({'ok': False, 'error': 'Datei nicht gefunden: ' + filename})
+
+    try:
+        with open(fpath) as f:
+            raw = f.read()
+
+        # Parse conversation file into messages
+        messages = []
+        lines = raw.split('\n')
+        i = 0
+        # Skip header lines (Agent:, Datum:)
+        while i < len(lines) and not lines[i].startswith('['):
+            i += 1
+
+        current_role = None
+        current_content = []
+
+        for line in lines[i:]:
+            if line.startswith('Du: '):
+                if current_role and current_content:
+                    messages.append({'role': current_role, 'content': '\n'.join(current_content).strip()})
+                current_role = 'user'
+                current_content = [line[4:]]
+            elif line.startswith('Assistant: '):
+                if current_role and current_content:
+                    messages.append({'role': current_role, 'content': '\n'.join(current_content).strip()})
+                current_role = 'assistant'
+                current_content = [line[11:]]
+            elif current_role:
+                current_content.append(line)
+
+        if current_role and current_content:
+            messages.append({'role': current_role, 'content': '\n'.join(current_content).strip()})
+
+        # Filter empty
+        messages = [m for m in messages if m['content'].strip()]
+
+        # Parse KONTEXT_DATEIEN block if present
+        restored_ctx = []
+        missing_ctx = []
+        import re as _ctx_re
+        ctx_match = _ctx_re.search(r'\[KONTEXT_DATEIEN:(\[.*?\])\]', raw)
+        if ctx_match:
+            try:
+                ctx_entries = json.loads(ctx_match.group(1))
+                for entry in ctx_entries:
+                    fname = entry.get('name', '')
+                    if not fname:
+                        continue
+                    # Try to find the file in agent memory
+                    ctx_fpath = os.path.join(speicher, 'memory', fname)
+                    if os.path.exists(ctx_fpath):
+                        try:
+                            with open(ctx_fpath, 'r', encoding='utf-8', errors='replace') as cf:
+                                ctx_content = cf.read(50000)
+                            restored_ctx.append({'name': fname, 'content': ctx_content})
+                        except Exception:
+                            missing_ctx.append(fname)
+                    else:
+                        missing_ctx.append(fname)
+            except Exception as ctx_err:
+                print(f'[LOAD] KONTEXT_DATEIEN parse error: {ctx_err}')
+
+        # Resume mode: set session state so new messages continue in this file
+        if resume and state.get('agent'):
+            state['dateiname'] = fpath
+            state['verlauf'] = messages[:]
+            state['kontext_items'] = restored_ctx[:]
+            state['session_files'] = [c['name'] for c in restored_ctx]
+
+        # Extract provider/model from conversation (format: [provider/model_id])
+        conv_provider = None
+        conv_model_id = None
+        import re as _re
+        for line in raw.split('\n'):
+            pm = _re.match(r'\[([^/]+)/([^\]]+)\]', line.strip())
+            if pm:
+                conv_provider = pm.group(1)
+                conv_model_id = pm.group(2)
+        # Set on session state if resuming
+        if resume and conv_provider and conv_model_id:
+            state['provider'] = conv_provider
+            state['model_id'] = conv_model_id
+
+        return jsonify({'ok': True, 'messages': messages, 'resumed': bool(resume),
+                        'provider': conv_provider, 'model_id': conv_model_id,
+                        'restored_ctx': [c['name'] for c in restored_ctx],
+                        'missing_ctx': missing_ctx})
+    except Exception as e:
+        return jsonify({'ok': False, 'error': str(e)})
+
+@app.route('/create_file', methods=['POST'])
+def create_file():
+    session_id = request.json.get('session_id', 'default') if request.is_json else 'default'
+    state = get_session(session_id)
+    try:
+        filetype = request.json.get('type', 'docx')
+        spec = request.json.get('spec', {})
+        if filetype == 'docx':
+            fname, fpath = create_docx_from_spec(spec)
+        elif filetype == 'xlsx':
+            fname, fpath = create_xlsx_from_spec(spec)
+        elif filetype == 'pdf':
+            fname, fpath = create_pdf_from_spec(spec)
+        elif filetype == 'pptx':
+            fname, fpath = create_pptx_from_spec(spec)
+        else:
+            return jsonify({'ok': False, 'error': 'Unbekannter Dateityp: ' + filetype})
+        # Also save to agent memory
+        if state.get('speicher'):
+            memory_dir = os.path.join(state['speicher'], 'memory')
+            os.makedirs(memory_dir, exist_ok=True)
+            import shutil
+            shutil.copy2(fpath, os.path.join(memory_dir, fname))
+        return jsonify({'ok': True, 'filename': fname, 'path': fpath})
+    except Exception as e:
+        import traceback
+        return jsonify({'ok': False, 'error': str(e), 'trace': traceback.format_exc()})
+
+@app.route('/send_email_draft', methods=['POST'])
+def send_email_draft_route():
+    session_id = request.json.get('session_id', 'default') if request.is_json else 'default'
+    state = get_session(session_id)
+    try:
+        spec = request.json
+        send_email_draft(spec)
+        return jsonify({'ok': True, 'subject': spec.get('subject',''), 'to': spec.get('to','')})
+    except Exception as e:
+        return jsonify({'ok': False, 'error': str(e)})
+
+
+@app.route('/send_whatsapp_draft', methods=['POST'])
+def send_whatsapp_draft_route():
+    session_id = request.json.get('session_id', 'default') if request.is_json else 'default'
+    state = get_session(session_id)
+    try:
+        spec = request.json
+        agent_name = state.get('agent', 'standard')
+        to_name, phone = send_whatsapp_draft(spec, agent_name)
+        return jsonify({'ok': True, 'to': to_name, 'phone': phone, 'clipboard_fallback': phone is None})
+    except Exception as e:
+        return jsonify({'ok': False, 'error': str(e)})
+
+
+@app.route('/open_slack_draft', methods=['POST'])
+def open_slack_draft_route():
+    try:
+        spec = request.json
+        target, clipboard_only = send_slack_draft(spec)
+        return jsonify({'ok': True, 'target': target, 'clipboard_only': clipboard_only})
+    except Exception as e:
+        return jsonify({'ok': False, 'error': str(e)})
+
+
+@app.route('/download_file', methods=['GET'])
+def download_file():
+    session_id = request.args.get('session_id', 'default')
+    state = get_session(session_id)
+    from flask import send_file
+    fpath = request.args.get('path', '')
+    if not fpath or not os.path.exists(fpath):
+        return "Datei nicht gefunden", 404
+    return send_file(fpath, as_attachment=True)
+
+@app.route('/select_model', methods=['POST'])
+def select_model():
+    session_id = request.json.get('session_id', 'default')
+    state = get_session(session_id)
+    state['provider'] = request.json['provider']
+    state['model_id'] = request.json['model_id']
+    return jsonify({'ok': True})
+
+
+AGENT_PREFS_FILE = os.path.join(BASE, "config", "agent_model_preferences.json")
+
+def _load_agent_prefs():
+    if os.path.exists(AGENT_PREFS_FILE):
+        try:
+            with open(AGENT_PREFS_FILE) as f:
+                return json.load(f)
+        except Exception:
+            pass
+    return {}
+
+def _save_agent_prefs(prefs):
+    os.makedirs(os.path.dirname(AGENT_PREFS_FILE), exist_ok=True)
+    with open(AGENT_PREFS_FILE, 'w') as f:
+        json.dump(prefs, f, indent=2)
+
+@app.route('/api/agent-model-preference', methods=['GET', 'POST'])
+def agent_model_preference():
+    if request.method == 'POST':
+        data = request.json
+        agent = data.get('agent', '')
+        if not agent:
+            return jsonify({'ok': False, 'error': 'No agent specified'})
+        prefs = _load_agent_prefs()
+        prefs[agent] = {'provider': data.get('provider', ''), 'model': data.get('model', '')}
+        _save_agent_prefs(prefs)
+        return jsonify({'ok': True})
+    else:
+        agent = request.args.get('agent', '')
+        prefs = _load_agent_prefs()
+        pref = prefs.get(agent, {})
+        return jsonify({'ok': True, 'provider': pref.get('provider', ''), 'model': pref.get('model', '')})
+
+
+SEARCH_STOPWORDS = {
+    # Deutsch — Artikel, Präpositionen, Pronomen
+    'die', 'der', 'das', 'ein', 'eine', 'und', 'oder', 'von', 'für', 'fuer',
+    'mit', 'den', 'dem', 'des', 'auf', 'aus', 'bei', 'bis',
+    'ist', 'mir', 'ich', 'er', 'sie', 'wir', 'ihr',
+    'über', 'ueber', 'wie', 'was', 'wer', 'zum', 'zur',
+    'meine', 'meinen', 'meinem', 'dein', 'sein', 'ihre',
+    'bitte', 'nochmal', 'noch', 'mal', 'auch', 'nur', 'sehr',
+    'dann', 'jetzt', 'hier', 'dort', 'aber', 'wenn', 'weil',
+    'kann', 'dass', 'nach', 'suche', 'suchen',
+    # Englisch
+    'the', 'and', 'from', 'for',
+    'that', 'this', 'also', 'please', 'just', 'load',
+    # Portugiesisch
+    'uma', 'uns', 'umas', 'para', 'com', 'por', 'que',
+    'mas', 'não', 'nao', 'ao', 'na', 'no', 'nas', 'nos',
+    'pelo', 'pela', 'este', 'essa', 'esse', 'isso',
+    'algum', 'alguma', 'alguns', 'algumas',
+    'dos', 'tem',
+    # Kontext-spezifisch (Memory-Suche Trigger)
+    'memory', 'folder', 'ordner', 'prompt', 'kontext',
+    'schau', 'guck', 'lies', 'read', 'find', 'such', 'hol', 'lad',
+    'e-mail', 'email', 'mail',
+}
+
+# Note: _SEARCH_ACTIONS, _SEARCH_PHRASES, _SEARCH_OBJECTS removed.
+# Search is now triggered only by explicit /find and /find_global commands.
+BINARY_EXTS = {'.png', '.jpg', '.jpeg', '.gif', '.webp', '.mp4', '.mov', '.mp3', '.wav'}
+
+
+def parse_search_keywords(query):
+    """Split query into normalized keywords, removing stopwords and short tokens."""
+    import re
+    query_lower = query.lower().strip()
+    raw_tokens = query_lower.split()
+    keywords = []
+    for token in raw_tokens:
+        token = token.strip('.,;:!?()[]{}\"\'/') 
+        if len(token) < 3:
+            continue
+        if token in SEARCH_STOPWORDS:
+            continue
+        keywords.append(token)
+        # Also add version without hyphens for fuzzy matching (wave-x -> wavex)
+        no_hyphen = token.replace('-', '')
+        if no_hyphen != token and len(no_hyphen) >= 3:
+            keywords.append(no_hyphen)
+    return list(dict.fromkeys(keywords))  # dedupe, preserve order
+
+
+def _is_binary(fname):
+    return any(fname.lower().endswith(ext) for ext in BINARY_EXTS)
+
+
+def _read_file_text(fpath, fname, max_chars=20000):
+    """Read file content as text, skipping binaries. Returns empty string on failure."""
+    if _is_binary(fname):
+        return ''
+    try:
+        with open(fpath, 'rb') as f:
+            raw = f.read()
+        return extract_file_content(raw, fname)[:max_chars]
+    except Exception:
+        return ''
+
+
+def scored_memory_search(memory_dir, keywords, max_results=3):
+    """Search memory files by keyword scoring. Returns list of {name, content, score}."""
+    if not keywords or not os.path.exists(memory_dir):
+        return []
+
+    all_files = os.listdir(memory_dir)
+    scored = []
+
+    # --- Pass 1: score by filename ---
+    for fname in all_files:
+        if _is_binary(fname):
+            continue
+        fname_lower = fname.lower()
+        fname_no_hyphen = fname_lower.replace('-', '')
+        score = 0
+        matched_kws = 0
+        for kw in keywords:
+            if kw in fname_lower or kw in fname_no_hyphen:
+                score += 3
+                matched_kws += 1
+        if matched_kws == len(keywords) and len(keywords) > 1:
+            score += 5
+        if score > 0:
+            scored.append((fname, score))
+
+    # --- Pass 2: if fewer than 3 filename hits, search file contents ---
+    if len([s for s in scored if s[1] > 0]) < max_results:
+        files_by_mtime = sorted(
+            [f for f in all_files if not _is_binary(f)],
+            key=lambda f: os.path.getmtime(os.path.join(memory_dir, f)),
+            reverse=True,
+        )[:1000]
+
+        already_scored = {s[0] for s in scored}
+        for fname in files_by_mtime:
+            fpath = os.path.join(memory_dir, fname)
+            text = _read_file_text(fpath, fname)
+            if not text:
+                continue
+            text_lower = text.lower()
+
+            content_score = 0
+            matched_content_kws = 0
+            for kw in keywords:
+                count = text_lower.count(kw)
+                # Also count without hyphens
+                kw_no_h = kw.replace('-', '')
+                if kw_no_h != kw:
+                    count += text_lower.replace('-', '').count(kw_no_h)
+                if count >= 3:
+                    content_score += 2
+                    matched_content_kws += 1
+                elif count >= 1:
+                    content_score += 1
+                    matched_content_kws += 1
+            if matched_content_kws == len(keywords) and len(keywords) > 1:
+                content_score += 3
+
+            if fname in already_scored:
+                scored = [(f, s + content_score) if f == fname else (f, s) for f, s in scored]
+            elif content_score > 0:
+                scored.append((fname, content_score))
+
+            if len([s for s in scored if s[1] > 0]) >= max_results:
+                break
+
+    # Sort by score descending, take top results
+    scored.sort(key=lambda x: x[1], reverse=True)
+    results = []
+    for fname, score in scored[:max_results]:
+        if score <= 0:
+            break
+        fpath = os.path.join(memory_dir, fname)
+        content = _read_file_text(fpath, fname)
+        if content:
+            results.append({'name': fname, 'content': content, 'score': score})
+    return results
+
+
+def auto_search_memory(msg, speicher):
+    """Auto-search memory. Only triggers on legacy 'memory folder/ordner' keyword.
+    All other searches now use explicit /find and /find_global commands."""
+    try:
+        import re
+        msg_lower = msg.lower()
+
+        # --- Legacy trigger: "memory folder" / "memory ordner" ---
+        if 'memory folder' in msg_lower or 'memory ordner' in msg_lower:
+            memory_dir = os.path.join(speicher, 'memory')
+            if not os.path.exists(memory_dir):
+                return []
+            after = re.split(r'memory folder|memory ordner', msg_lower, maxsplit=1)[-1]
+            after = re.split(r'\bnach\b|\bfor\b|\bafter\b', after)[-1]
+            keywords = parse_search_keywords(after)
+            if not keywords:
+                return []
+            return scored_memory_search(memory_dir, keywords, max_results=3)
+
+        return []
+
+    except Exception as e:
+        print("auto_search_memory error: " + str(e))
+        return []
+
+def process_single_message(msg, kontext_override=None, state=None, **kwargs):
+    """Process a single chat message through the LLM. Returns result dict.
+    Does not use Flask request/jsonify — can be called from queue worker thread."""
+    if state is None:
+        state = get_session()
+    kontext_items = kontext_override if kontext_override is not None else state['kontext_items']
+
+    # Auto-search memory (via search_engine.py)
+    auto_loaded_names = kwargs.get('auto_loaded_override', [])
+    auto_search_info = kwargs.get('auto_search_info_override', '')
+    if auto_loaded_names or auto_search_info:
+        pass  # Overrides provided — skip auto-search
+    elif auto_search and state.get('speicher'):
+        try:
+            search_results, search_feedback = auto_search(msg, state['speicher'])
+            for item in search_results:
+                if not any(k['name'] == item['name'] for k in kontext_items):
+                    kontext_items.append(item)
+                    if item['name'] not in state['session_files']:
+                        state['session_files'].append(item['name'])
+                    auto_loaded_names.append(item['name'])
+            if search_feedback:
+                auto_search_info = format_search_feedback(search_feedback, len(auto_loaded_names))
+        except Exception as e:
+            print(f"auto_search error: {e}")
+
+    # Fallback: deep_memory_search only for explicit /find command (passed through from frontend)
+    if not auto_loaded_names and state.get('speicher') and not kontext_override:
+        msg_lower = msg.lower()
+        if msg_lower.startswith('/find '):
+            try:
+                memory_dir = os.path.join(state['speicher'], 'memory')
+                ds_results = deep_memory_search(memory_dir, msg, max_results=15)
+                hits = ds_results.get('results', [])
+                if hits:
+                    if len(hits) <= 5:
+                        # Auto-load up to 5
+                        for r in hits:
+                            fname = r['filename']
+                            if not any(k['name'] == fname for k in kontext_items):
+                                fpath = os.path.join(memory_dir, fname)
+                                try:
+                                    with open(fpath, 'r', encoding='utf-8', errors='replace') as f:
+                                        content = f.read(50000)
+                                    kontext_items.append({'name': fname, 'content': content})
+                                    if fname not in state['session_files']:
+                                        state['session_files'].append(fname)
+                                    auto_loaded_names.append(fname)
+                                except Exception:
+                                    pass
+                        auto_search_info = f'{len(auto_loaded_names)} Datei(en) aus Deep-Search geladen'
+                    elif len(hits) <= 15:
+                        # Inject hint into message for the AI
+                        filelist = ', '.join(r['filename'][:40] for r in hits[:10])
+                        auto_search_info = f'{len(hits)} relevante Dateien gefunden. Dateien: {filelist}'
+                    else:
+                        auto_search_info = f'Zu viele Treffer ({ds_results["candidates_after_filter"]}). Bitte praezisiere deinen Suchbegriff.'
+            except Exception as e:
+                print(f"deep_search fallback error: {e}")
+
+    # Check for sub-agent delegation (requires user confirmation)
+    if state['agent'] and not kwargs.get('skip_delegation'):
+        deleg_info = detect_delegation(msg, state['agent'])
+        if deleg_info:
+            import uuid as _deleg_uuid
+            import time as _deleg_time
+            # Clean expired pending delegations (>5 min)
+            expired = [k for k, v in _pending_delegations.items()
+                       if _deleg_time.time() - v.get('timestamp', 0) > 300]
+            for k in expired:
+                _pending_delegations.pop(k, None)
+            # Also expire any previous pending for this session
+            old_pending = [k for k, v in _pending_delegations.items()
+                          if v.get('session_id') == kwargs.get('_session_id', '')]
+            for k in old_pending:
+                _pending_delegations.pop(k, None)
+            conf_id = str(_deleg_uuid.uuid4())[:12]
+            _pending_delegations[conf_id] = {
+                'session_id': kwargs.get('_session_id', ''),
+                'sub_agent': deleg_info['full_name'],
+                'msg': msg,
+                'kontext': kontext_items[:],
+                'auto_loaded': auto_loaded_names,
+                'auto_search_info': auto_search_info,
+                'timestamp': _deleg_time.time(),
+            }
+            return {
+                'type': 'subagent_confirmation_required',
+                'suggested_subagent': deleg_info['full_name'],
+                'subagent_display': deleg_info['display_name'],
+                'matched_keywords': deleg_info['matched_keywords'],
+                'score': deleg_info['score'],
+                'confirmation_id': conf_id,
+                'original_message': msg[:100],
+            }
+
+    # Build context string
+    text_ctx = ''
+    image_items = []
+    if kontext_items:
+        text_ctx = '\n\n--- KONTEXT ---\n'
+        for item in kontext_items:
+            if item.get('image_b64'):
+                image_items.append(item)
+                text_ctx += '\n[Bild: ' + item['name'] + ']\n'
+            else:
+                text_ctx += '\n[' + item['name'] + ']:\n' + item['content'][:10000] + '\n'
+        text_ctx += '\n--- ENDE KONTEXT ---\n'
+
+    full_text = msg + text_ctx if text_ctx else msg
+
+    # CALENDAR_INTEGRATION_V1: Automatisch Kalender-Daten injizieren wenn Intent erkannt
+    if _has_calendar_intent(msg):
+        try:
+            _cal_events, _cal_cals, _cal_err = get_calendar_events(days_back=1, days_ahead=7)
+            if _cal_events:
+                _cal_ctx = format_calendar_context(_cal_events)
+                full_text = full_text + '\n\n' + _cal_ctx
+                print(f"[CALENDAR] {len(_cal_events)} Events injiziert fuer Intent in: {msg[:50]}", flush=True)
+            elif _cal_err:
+                print(f"[CALENDAR] Fehler: {_cal_err}", flush=True)
+        except Exception as _cal_ex:
+            print(f"[CALENDAR] Exception: {_cal_ex}", flush=True)
+
+    provider_key = state.get('provider', 'anthropic')
+    if image_items and provider_key == 'anthropic':
+        user_content = []
+        for img in image_items:
+            user_content.append({
+                'type': 'image',
+                'source': {'type': 'base64', 'media_type': img['image_type'], 'data': img['image_b64']}
+            })
+        user_content.append({'type': 'text', 'text': full_text})
+    else:
+        user_content = full_text
+
+    state['verlauf'].append({'role': 'user', 'content': user_content})
+    # Sofort-Save: User-Nachricht sofort sichern (auch wenn Antwort noch aussteht)
+    for _sid_imm, _st_imm in sessions.items():
+        if _st_imm is state:
+            auto_save_session(_sid_imm)
+            break
+    try:
+        config = load_models()
+        provider_key = state.get('provider', 'anthropic')
+        model_id = state.get('model_id', 'claude-sonnet-4-6')
+        provider_cfg = config['providers'].get(provider_key, {})
+        api_key = provider_cfg.get('api_key', '')
+        model_name = next((m['name'] for m in provider_cfg.get('models', []) if m['id'] == model_id), model_id)
+        adapter = ADAPTERS.get(provider_key)
+        if not adapter:
+            raise ValueError('Unbekannter Anbieter: ' + provider_key)
+        text = adapter(api_key, model_id, state['system_prompt'], state['verlauf'])
+
+        # Parse MEMORY_SEARCH in agent response and re-query if found
+        ms_match = re.search(r'MEMORY_SEARCH:\s*(\{[^}]+\})', text)
+        if ms_match and state.get('speicher'):
+            try:
+                ms_params = json.loads(ms_match.group(1))
+                ms_results = deep_memory_search(
+                    os.path.join(state['speicher'], 'memory'),
+                    ms_params.get('query', ''),
+                    date_from=ms_params.get('date_from'),
+                    date_to=ms_params.get('date_to'),
+                    direction=ms_params.get('direction'),
+                    contact=ms_params.get('contact'),
+                )
+                if ms_results.get('results'):
+                    # Inject results and re-query
+                    search_ctx = '\n\n--- MEMORY_SEARCH ERGEBNIS ---\n'
+                    for r in ms_results['results'][:5]:
+                        search_ctx += f"\n[{r['filename']}]\nVon: {r.get('von','')}\nAn: {r.get('an','')}\nBetreff: {r.get('betreff','')}\nDatum: {r.get('datum','')}\n{r.get('preview','')[:500]}\n"
+                    search_ctx += '\n--- ENDE MEMORY_SEARCH ---\n'
+                    # Replace MEMORY_SEARCH block with results and re-send
+                    state['verlauf'].append({'role': 'assistant', 'content': text})
+                    state['verlauf'].append({'role': 'user', 'content': search_ctx + '\nBitte beantworte die urspruengliche Frage mit diesen Suchergebnissen.'})
+                    text = adapter(api_key, model_id, state['system_prompt'], state['verlauf'])
+                    # Remove the injected messages from verlauf (we'll add the final response below)
+                    state['verlauf'].pop()  # remove injected user msg
+                    state['verlauf'].pop()  # remove MEMORY_SEARCH response
+            except Exception as mse:
+                print(f"MEMORY_SEARCH error: {mse}")
+
+        created_files = []
+        created_emails = []
+
+        def extract_blocks(src, tag):
+            results = []
+            prefix = '[' + tag + ':'
+            i = 0
+            while i < len(src):
+                idx = src.find(prefix, i)
+                if idx == -1:
+                    break
+                after_tag = src[idx + len(prefix):]
+                colon = after_tag.find(':')
+                if colon == -1:
+                    i = idx + 1
+                    continue
+                btype = after_tag[:colon]
+                jstart = idx + len(prefix) + colon + 1
+                depth = 0
+                j = jstart
+                jend = -1
+                in_string = False
+                escape_next = False
+                while j < len(src):
+                    c = src[j]
+                    if escape_next:
+                        escape_next = False
+                    elif c == '\\':
+                        escape_next = True
+                    elif c == '"' and not escape_next:
+                        in_string = not in_string
+                    elif not in_string:
+                        if c == '{':
+                            depth += 1
+                        elif c == '}':
+                            depth -= 1
+                            if depth == 0:
+                                jend = j + 1
+                                break
+                    j += 1
+                if jend != -1 and jend < len(src) and src[jend] == ']':
+                    json_str = src[jstart:jend]
+                    results.append((src[idx:jend+1], btype, json_str))
+                    i = jend + 1
+                else:
+                    i = idx + 1
+            return results
+
+        # Parse CREATE_EMAIL
+        email_prefix = '[CREATE_EMAIL:'
+        ei = 0
+        while ei < len(text):
+            eidx = text.find(email_prefix, ei)
+            if eidx == -1:
+                break
+            jstart = eidx + len(email_prefix)
+            depth = 0
+            j = jstart
+            jend = -1
+            in_str = False
+            esc = False
+            while j < len(text):
+                c = text[j]
+                if esc:
+                    esc = False
+                elif c == '\\':
+                    esc = True
+                elif c == '"' and not esc:
+                    in_str = not in_str
+                elif not in_str:
+                    if c == '{':
+                        depth += 1
+                    elif c == '}':
+                        depth -= 1
+                        if depth == 0:
+                            jend = j + 1
+                            break
+                j += 1
+            if jend != -1 and jend < len(text) and text[jend] == ']':
+                full_block = text[eidx:jend+1]
+                json_str = text[jstart:jend]
+                spec = {}
+                try:
+                    spec = json.loads(json_str)
+                    send_email_draft(spec)
+                    created_emails.append({'ok': True, 'subject': spec.get('subject',''), 'to': spec.get('to',''), 'body': spec.get('body','')})
+                    marker = f'\n[E-Mail-Draft an {spec.get("to","")} erstellt — Aktion ausgefuehrt]\n'
+                    text = text[:eidx] + marker + text[jend+1:]
+                    ei = eidx + len(marker)
+                except Exception as ee:
+                    created_emails.append({'ok': False, 'subject': spec.get('subject',''), 'to': '', 'error': str(ee), 'body': spec.get('body','')})
+                    marker = '\n[E-Mail-Erstellung fehlgeschlagen]\n'
+                    text = text[:eidx] + marker + text[jend+1:]
+                    ei = eidx + len(marker)
+            else:
+                ei = eidx + 1
+
+
+        # Parse CREATE_WHATSAPP
+        created_whatsapps = []
+        wa_prefix = '[CREATE_WHATSAPP:'
+        wi = 0
+        while wi < len(text):
+            widx = text.find(wa_prefix, wi)
+            if widx == -1:
+                break
+            wjstart = widx + len(wa_prefix)
+            depth = 0
+            wj = wjstart
+            wjend = -1
+            win_str = False
+            wesc = False
+            while wj < len(text):
+                wc = text[wj]
+                if wesc:
+                    wesc = False
+                elif wc == '\\':
+                    wesc = True
+                elif wc == '"' and not wesc:
+                    win_str = not win_str
+                elif not win_str:
+                    if wc == '{':
+                        depth += 1
+                    elif wc == '}':
+                        depth -= 1
+                        if depth == 0:
+                            wjend = wj + 1
+                            break
+                wj += 1
+            if wjend != -1 and wjend < len(text) and text[wjend] == ']':
+                full_block = text[widx:wjend+1]
+                json_str = text[wjstart:wjend]
+                wspec = {}
+                try:
+                    wspec = json.loads(json_str)
+                    agent_name = state.get('agent', 'standard')
+                    wa_to, wa_phone = send_whatsapp_draft(wspec, agent_name)
+                    created_whatsapps.append({'ok': True, 'to': wa_to, 'phone': wa_phone, 'clipboard_fallback': wa_phone is None})
+                    marker = f'\n[WhatsApp an {wa_to} vorbereitet — Aktion ausgefuehrt]\n'
+                    text = text[:widx] + marker + text[wjend+1:]
+                    wi = widx + len(marker)
+                except Exception as we:
+                    created_whatsapps.append({'ok': False, 'to': wspec.get('to',''), 'error': str(we)})
+                    marker = '\n[WhatsApp-Erstellung fehlgeschlagen]\n'
+                    text = text[:widx] + marker + text[wjend+1:]
+                    wi = widx + len(marker)
+            else:
+                wi = widx + 1
+
+
+        # Parse CREATE_SLACK
+        created_slacks = []
+        sl_prefix = '[CREATE_SLACK:'
+        si = 0
+        while si < len(text):
+            sidx = text.find(sl_prefix, si)
+            if sidx == -1:
+                break
+            sjstart = sidx + len(sl_prefix)
+            depth = 0
+            sj = sjstart
+            sjend = -1
+            sin_str = False
+            sesc = False
+            while sj < len(text):
+                sc = text[sj]
+                if sesc:
+                    sesc = False
+                elif sc == '\\':
+                    sesc = True
+                elif sc == '"' and not sesc:
+                    sin_str = not sin_str
+                elif not sin_str:
+                    if sc == '{':
+                        depth += 1
+                    elif sc == '}':
+                        depth -= 1
+                        if depth == 0:
+                            sjend = sj + 1
+                            break
+                sj += 1
+            if sjend != -1 and sjend < len(text) and text[sjend] == ']':
+                json_str = text[sjstart:sjend]
+                sspec = {}
+                try:
+                    sspec = json.loads(json_str)
+                    sl_target, sl_clipboard = send_slack_draft(sspec)
+                    created_slacks.append({'ok': True, 'target': sl_target, 'clipboard_only': sl_clipboard})
+                    marker = f'\n[Slack-Nachricht an {sl_target} vorbereitet — Aktion ausgefuehrt]\n'
+                    text = text[:sidx] + marker + text[sjend+1:]
+                    si = sidx + len(marker)
+                except Exception as se:
+                    created_slacks.append({'ok': False, 'target': sspec.get('channel', sspec.get('to', '')), 'error': str(se)})
+                    marker = '\n[Slack-Erstellung fehlgeschlagen]\n'
+                    text = text[:sidx] + marker + text[sjend+1:]
+                    si = sidx + len(marker)
+            else:
+                si = sidx + 1
+
+
+        # Parse CREATE_FILE
+        for full_block, ftype, json_str in extract_blocks(text, 'CREATE_FILE'):
+            try:
+                spec = sanitize_llm_json(json_str)
+                if ftype == 'docx':
+                    fname, fpath = create_docx_from_spec(spec)
+                elif ftype == 'xlsx':
+                    fname, fpath = create_xlsx_from_spec(spec)
+                elif ftype == 'pdf':
+                    fname, fpath = create_pdf_from_spec(spec)
+                elif ftype == 'pptx':
+                    fname, fpath = create_pptx_from_spec(spec)
+                else:
+                    raise ValueError('Unbekannter Typ: ' + ftype)
+                created_files.append({'filename': fname, 'path': fpath, 'type': ftype})
+                text = text.replace(full_block, '')
+            except Exception as fe:
+                err_msg = str(fe)
+                if 'double quotes' in err_msg or 'Expecting' in err_msg:
+                    err_msg = 'JSON-Format ungueltig. Bitte versuche es erneut.'
+                text = text.replace(full_block, f'\n*Datei-Erstellung fehlgeschlagen: {err_msg}*\n')
+
+        # Resolve session_id for task-status attribution
+        _task_session_id = kwargs.get('_session_id')
+        if not _task_session_id:
+            for _sid, _st in sessions.items():
+                if _st is state:
+                    _task_session_id = _sid
+                    break
+        _task_session_id = _task_session_id or 'default'
+
+        # Parse CREATE_IMAGE
+        created_images = []
+        img_pattern = re.compile(r'\[?CREATE_IMAGE:\s*(.+?)\]?(?:\n|$)')
+        img_matches = list(img_pattern.finditer(text))
+        for m in reversed(img_matches):
+            img_prompt = m.group(1).strip().rstrip(']')
+            _img_task_id = task_create('image', _task_session_id, estimated_total=30)
+            try:
+                current_provider = state.get('provider', 'anthropic')
+                fname, fpath, fallback_info = generate_image(
+                    img_prompt, state['agent'] or 'standard', current_provider,
+                    task_id=_img_task_id,
+                )
+                created_images.append({
+                    'filename': fname, 'path': fpath,
+                    'prompt': img_prompt[:100], 'task_id': _img_task_id,
+                })
+                replacement = f'\n\n*Bild erfolgreich generiert: {fname}{fallback_info}. Das Bild wird unten angezeigt.*'
+                text = text[:m.start()] + replacement + text[m.end():]
+            except Exception as ie:
+                task_error(_img_task_id, str(ie))
+                text = text[:m.start()] + f'\n\n*Bild-Generierung fehlgeschlagen: {str(ie)}. Du kannst es erneut versuchen.*' + text[m.end():]
+
+        # Parse CREATE_VIDEO
+        created_videos = []
+        vid_pattern = re.compile(r'\[?CREATE_VIDEO:\s*(.+?)\]?(?:\n|$)')
+        vid_matches = list(vid_pattern.finditer(text))
+        for m in reversed(vid_matches):
+            vid_prompt = m.group(1).strip().rstrip(']')
+            _vid_task_id = task_create('video', _task_session_id, estimated_total=180)
+            try:
+                fname, fpath = generate_video(
+                    vid_prompt, state['agent'] or 'standard',
+                    state.get('provider', 'anthropic'),
+                    task_id=_vid_task_id,
+                )
+                created_videos.append({
+                    'filename': fname, 'path': fpath,
+                    'prompt': vid_prompt[:100], 'task_id': _vid_task_id,
+                })
+                text = text[:m.start()] + f'\n\n*Video erfolgreich generiert: {fname}. Das Video wird unten angezeigt.*' + text[m.end():]
+            except Exception as ve:
+                task_error(_vid_task_id, str(ve))
+                text = text[:m.start()] + f'\n\n*Video-Generierung fehlgeschlagen: {str(ve)}. Du kannst es erneut versuchen.*' + text[m.end():]
+
+        text = text.strip()
+        state['verlauf'].append({'role': 'assistant', 'content': text})
+        # Auto-save full session after each message (overwrites entire file)
+        for _sid, _st in sessions.items():
+            if _st is state:
+                auto_save_session(_sid)
+                break
+        return {
+            'response': text,
+            'model_name': model_name,
+            'provider_display': PROVIDER_DISPLAY.get(provider_key, provider_key),
+            'model_display': MODEL_DISPLAY.get(model_id, model_name),
+            'auto_loaded': auto_loaded_names,
+            'auto_search_info': auto_search_info,
+            'agent': state['agent'],
+            'created_files': created_files,
+            'created_emails': created_emails,
+            'created_whatsapps': created_whatsapps,
+            'created_images': created_images,
+            'created_videos': created_videos,
+            'created_slacks': created_slacks,
+        }
+    except Exception as e:
+        state['verlauf'].pop()
+        raise
+
+
+def process_queue_worker(state):
+    """Background thread: processes queued messages one by one."""
+    while True:
+        with queue_lock:
+            if state['stop_requested']:
+                state['stop_requested'] = False
+                state['queue'] = []
+                state['processing'] = False
+                state['current_prompt'] = ''
+                return
+            if not state['queue']:
+                state['processing'] = False
+                state['current_prompt'] = ''
+                return
+            item = state['queue'].pop(0)
+            state['current_prompt'] = item['message'][:50]
+
+        try:
+            result = process_single_message(item['message'], kontext_override=item.get('kontext_snapshot'), state=state)
+            result['queue_id'] = item['id']
+            result['original_message'] = item['message'][:50]
+            with queue_lock:
+                state['completed_responses'].append(result)
+            # Auto-save after queue item processed
+            for _sid, _st in sessions.items():
+                if _st is state:
+                    auto_save_session(_sid)
+                    break
+        except Exception as e:
+            with queue_lock:
+                state['completed_responses'].append({
+                    'queue_id': item['id'],
+                    'original_message': item['message'][:50],
+                    'error': str(e),
+                })
+
+
+# Pending sub-agent delegations awaiting user confirmation
+_pending_delegations = {}  # confirmation_id -> {session_id, sub_agent, msg, kontext, timestamp, auto_loaded, auto_search_info}
+
+@app.route('/api/subagent_confirm', methods=['POST'])
+def subagent_confirm():
+    session_id = request.json.get('session_id', 'default')
+    state = get_session(session_id)
+    confirmation_id = request.json.get('confirmation_id', '')
+    confirmed = request.json.get('confirmed', False)
+
+    pending = _pending_delegations.pop(confirmation_id, None)
+    if not pending:
+        return jsonify({'error': 'Confirmation abgelaufen oder nicht gefunden'})
+
+    if not confirmed:
+        # User declined — process with current agent (no delegation)
+        try:
+            # Re-process the original message without delegation
+            result = process_single_message(
+                pending['msg'], state=state, skip_delegation=True,
+                kontext_override=pending.get('kontext'),
+                auto_loaded_override=pending.get('auto_loaded', []),
+                auto_search_info_override=pending.get('auto_search_info', ''),
+            )
+            return jsonify(result)
+        except Exception as e:
+            return jsonify({'error': str(e)})
+
+    # User confirmed — execute delegation
+    try:
+        deleg_result = execute_delegation(
+            pending['sub_agent'], pending['msg'],
+            pending.get('kontext', []), state=state
+        )
+        if 'error' in deleg_result:
+            return jsonify({'error': deleg_result['error']})
+        state['verlauf'].append({'role': 'user', 'content': pending['msg']})
+        state['verlauf'].append({'role': 'assistant', 'content': deleg_result['response']})
+        for _sid, _st in sessions.items():
+            if _st is state:
+                auto_save_session(_sid)
+                break
+        model_name = deleg_result.get('model_name', '')
+        return jsonify({
+            'response': deleg_result['response'],
+            'model_name': model_name,
+            'provider_display': deleg_result.get('provider_display', ''),
+            'model_display': deleg_result.get('model_display', ''),
+            'auto_loaded': pending.get('auto_loaded', []),
+            'auto_search_info': pending.get('auto_search_info', ''),
+            'agent': state['agent'],
+            'created_files': [], 'created_emails': [], 'created_whatsapps': [],
+            'created_images': [], 'created_videos': [], 'created_slacks': [],
+            'delegated_to': deleg_result.get('delegated_to', ''),
+            'delegated_display': deleg_result.get('delegated_display', ''),
+        })
+    except Exception as e:
+        return jsonify({'error': str(e)})
+
+
+@app.route('/chat', methods=['POST'])
+def chat():
+    session_id = request.json.get('session_id', 'default')
+    state = get_session(session_id)
+    if not state['agent']:
+        return jsonify({'error': 'Kein Agent aktiv'})
+    msg = request.json['message']
+
+    with queue_lock:
+        if state['processing']:
+            # System busy — queue the message
+            item = {
+                'id': str(uuid.uuid4()),
+                'message': msg,
+                'kontext_snapshot': copy.deepcopy(state['kontext_items']),
+                'timestamp': datetime.datetime.now().isoformat(),
+            }
+            state['queue'].append(item)
+            return jsonify({
+                'queued': True,
+                'position': len(state['queue']),
+                'message': msg[:50],
+                'queue_id': item['id'],
+            })
+        state['processing'] = True
+        state['current_prompt'] = msg[:50]
+
+    # System idle — process synchronously
+    try:
+        result = process_single_message(msg, state=state, _session_id=session_id)
+    except Exception as e:
+        with queue_lock:
+            state['processing'] = False
+            state['current_prompt'] = ''
+        return jsonify({'error': str(e)})
+
+    # Check if queue has items (added while we were processing)
+    with queue_lock:
+        has_queue = len(state['queue']) > 0
+    if has_queue:
+        threading.Thread(target=process_queue_worker, args=(state,), daemon=True).start()
+    else:
+        with queue_lock:
+            state['processing'] = False
+            state['current_prompt'] = ''
+
+    result['queue_active'] = has_queue
+    return jsonify(result)
+
+
+@app.route('/stop_queue', methods=['POST'])
+def stop_queue():
+    session_id = request.json.get('session_id', 'default') if request.is_json else 'default'
+    state = get_session(session_id)
+    with queue_lock:
+        cancelled = len(state['queue'])
+        state['stop_requested'] = True
+        state['queue'] = []
+    return jsonify({'ok': True, 'cancelled': cancelled})
+
+
+@app.route('/queue_status', methods=['GET'])
+def queue_status():
+    session_id = request.args.get('session_id', 'default')
+    state = get_session(session_id)
+    with queue_lock:
+        payload = {
+            'processing': state['processing'],
+            'queue_length': len(state['queue']),
+            'queue_preview': [{'id': q['id'], 'message': q['message'][:50]} for q in state['queue'][:3]],
+            'current_prompt': state['current_prompt'],
+        }
+    # Piggyback active long-running tasks (video/image) so the frontend
+    # can discover them without a separate endpoint.
+    payload['active_tasks'] = tasks_for_session(session_id)
+    return jsonify(payload)
+
+
+@app.route('/task_status/<task_id>', methods=['GET'])
+def task_status(task_id):
+    """Return the current status of a long-running task (video/image generation)."""
+    t = task_get(task_id)
+    if not t:
+        return jsonify({'error': 'Task nicht gefunden', 'task_id': task_id}), 404
+    # Opportunistic cleanup of very old finished tasks
+    try:
+        tasks_cleanup()
+    except Exception:
+        pass
+    return jsonify(t)
+
+
+@app.route('/poll_responses', methods=['GET'])
+def poll_responses():
+    session_id = request.args.get('session_id', 'default')
+    state = get_session(session_id)
+    with queue_lock:
+        responses = list(state['completed_responses'])
+        state['completed_responses'] = []
+    return jsonify({'responses': responses})
+
+
+@app.route('/available_subagents', methods=['GET'])
+def available_subagents():
+    session_id = request.args.get('session_id', 'default')
+    state = get_session(session_id)
+    agent = request.args.get('agent', state.get('agent', ''))
+    parent = get_parent_agent(agent) or agent
+    if not parent:
+        return jsonify({'ok': False, 'subagents': []})
+    subs = _get_available_subagents(parent)
+    kw_map = _load_subagent_keywords()
+    result = []
+    for s in subs:
+        result.append({
+            'name': s['full_name'],
+            'label': s['sub_label'],
+            'display': get_agent_display_name(s['full_name']),
+            'keywords': kw_map.get(s['sub_label'], []),
+        })
+    return jsonify({'ok': True, 'parent': parent, 'subagents': result})
+
+
+@app.route('/add_url', methods=['POST'])
+def add_url():
+    session_id = request.json.get('session_id', 'default')
+    state = get_session(session_id)
+    url = request.json['url'].strip()
+    if url and not url.startswith('http://') and not url.startswith('https://'):
+        url = 'https://' + url
+    try:
+        r = requests.get(url, timeout=15, headers={
+            'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 Chrome/120.0 Safari/537.36',
+            'Accept': 'text/html,application/xhtml+xml,*/*',
+            'Accept-Language': 'de-DE,de;q=0.9,en;q=0.8'
+        })
+        soup = BeautifulSoup(r.text, 'html.parser')
+        for tag in soup(['script','style','nav','footer','header']): tag.decompose()
+        text = soup.get_text(separator='\n', strip=True)
+        text = '\n'.join(l for l in text.splitlines() if l.strip())[:20000]
+        title = (soup.title.string if soup.title else url).strip()[:60]
+        memory_dir = os.path.join(state['speicher'], 'memory')
+        os.makedirs(memory_dir, exist_ok=True)
+        safe = ''.join(c if c.isalnum() or c in '-_' else '_' for c in title)
+        fname = safe + '.txt'
+        with open(os.path.join(memory_dir, fname), 'w') as f:
+            f.write('Quelle: ' + url + '\n\n' + text)
+        state['kontext_items'].append({'name':title, 'content':text})
+        if fname not in state['session_files']:
+            state['session_files'].append(fname)
+        return jsonify({'ok':True, 'title':title})
+    except Exception as e:
+        return jsonify({'ok':False, 'error':str(e)})
+
+
+# ── Deep Memory Search ────────────────────────────────────────────────────────
+
+def deep_memory_search(memory_dir, query, date_from=None, date_to=None, direction=None, contact=None, max_results=10):
+    """3-stage deep search: filename filter -> content scan -> scored results."""
+    if not os.path.isdir(memory_dir) or not query:
+        return {'total_files_scanned': 0, 'candidates_after_filter': 0, 'results': []}
+
+    all_files = os.listdir(memory_dir)
+    total = len(all_files)
+
+    # Stage 1: Filename filter (no file opening)
+    candidates = []
+    for fname in all_files:
+        if not fname.endswith(('.txt', '.eml', '.json')):
+            continue
+        fname_lower = fname.lower()
+
+        # Date filter (prefix YYYY-MM-DD)
+        if date_from:
+            file_date = fname[:10]
+            if file_date < date_from:
+                continue
+        if date_to:
+            file_date = fname[:10]
+            if file_date > date_to:
+                continue
+
+        # Direction filter
+        if direction:
+            d = direction.upper()
+            if d == 'IN' and '_IN_' not in fname:
+                continue
+            if d == 'OUT' and '_OUT_' not in fname:
+                continue
+
+        # Contact filter (substring in filename)
+        if contact:
+            if contact.lower().replace('@', '_at_').replace('.', '_') not in fname_lower and contact.lower() not in fname_lower:
+                continue
+
+        candidates.append(fname)
+
+    # Stage 2: Content scan (only candidates)
+    keywords = [kw.lower() for kw in query.split() if len(kw) >= 2]
+    scored = []
+    for fname in candidates:
+        fpath = os.path.join(memory_dir, fname)
+        try:
+            with open(fpath, 'r', encoding='utf-8', errors='replace') as f:
+                raw = f.read(30000)
+            # For JSON webclips: extract searchable text fields
+            if fname.endswith('.json'):
+                try:
+                    parsed = json.loads(raw)
+                    content = (parsed.get('title', '') + '\n' +
+                              parsed.get('url', '') + '\n' +
+                              parsed.get('full_text', ''))[:5000]
+                except (json.JSONDecodeError, TypeError):
+                    content = raw[:5000]
+            else:
+                content = raw[:5000]
+        except Exception:
+            continue
+
+        content_lower = content.lower()
+        score = sum(content_lower.count(kw) for kw in keywords)
+        # Bonus for filename match
+        fname_lower = fname.lower()
+        score += sum(2 for kw in keywords if kw in fname_lower)
+
+        if score > 0:
+            # Parse headers
+            headers = {}
+            for line in content.split('\n')[:10]:
+                for key in ['Von', 'An', 'Betreff', 'Datum', 'Richtung', 'Kontakt']:
+                    if line.startswith(key + ': '):
+                        headers[key] = line[len(key) + 2:]
+
+            # Preview: skip headers, get body start
+            body_start = content.find('\u2500' * 10)
+            if body_start > 0:
+                preview = content[body_start:body_start + 300].strip().lstrip('\u2500').strip()
+            else:
+                preview = content[:300]
+
+            scored.append({
+                'filename': fname,
+                'score': score,
+                'preview': preview,
+                'von': headers.get('Von', ''),
+                'an': headers.get('An', ''),
+                'betreff': headers.get('Betreff', ''),
+                'datum': headers.get('Datum', ''),
+                'richtung': headers.get('Richtung', ''),
+                'kontakt': headers.get('Kontakt', ''),
+            })
+
+    scored.sort(key=lambda x: x['score'], reverse=True)
+
+    return {
+        'total_files_scanned': total,
+        'candidates_after_filter': len(candidates),
+        'results': scored[:max_results],
+    }
+
+
+@app.route('/api/memory-files-search', methods=['GET'])
+def api_memory_files_search():
+    """Autocomplete search for files in agent memory."""
+    q = request.args.get('q', '').strip().lower()
+    agent = request.args.get('agent', '').strip()
+    if not q or len(q) < 2 or not agent:
+        return jsonify([])
+
+    speicher = get_agent_speicher(agent)
+    if not speicher:
+        return jsonify([])
+
+    results = []
+    # Search in search index first (fast)
+    index_path = os.path.join(speicher, '.search_index.json')
+    if os.path.exists(index_path):
+        try:
+            with open(index_path) as f:
+                idx = json.load(f)
+            entries = idx if isinstance(idx, dict) else {}
+            for fname, entry in entries.items():
+                fname_lower = fname.lower()
+                subject = (entry.get('subject') or '').lower()
+                preview = (entry.get('preview') or '').lower()
+                keywords_str = ' '.join(entry.get('keywords', [])).lower()
+                if q in fname_lower or q in subject or q in preview or q in keywords_str:
+                    results.append({
+                        'filename': fname,
+                        'snippet': entry.get('subject') or entry.get('preview', '')[:80] or fname,
+                    })
+                    if len(results) >= 8:
+                        break
+        except Exception:
+            pass
+
+    # Fallback: scan filenames directly if no index results
+    if not results:
+        memory_dir = os.path.join(speicher, 'memory')
+        if os.path.isdir(memory_dir):
+            for fname in os.listdir(memory_dir):
+                if q in fname.lower():
+                    results.append({'filename': fname, 'snippet': fname})
+                    if len(results) >= 8:
+                        break
+
+    return jsonify(results)
+
+
+@app.route('/api/memory/search', methods=['POST'])
+def api_memory_search():
+    """Deep memory search with filename + content filters."""
+    data = request.json or {}
+    agent = data.get('agent', '')
+    query = data.get('query', '')
+
+    if not agent or not query:
+        return jsonify({'error': 'agent and query required', 'results': []})
+
+    speicher = get_agent_speicher(agent)
+    if not speicher:
+        return jsonify({'error': f'Agent "{agent}" not found', 'results': []})
+
+    memory_dir = os.path.join(speicher, 'memory')
+    result = deep_memory_search(
+        memory_dir,
+        query,
+        date_from=data.get('date_from'),
+        date_to=data.get('date_to'),
+        direction=data.get('direction'),
+        contact=data.get('contact'),
+        max_results=int(data.get('max_results', 10)),
+    )
+    return jsonify(result)
+
+
+@app.route('/api/context-info', methods=['GET'])
+def api_context_info():
+    """Returns token estimates for system prompt, conversation, and loaded memory files."""
+    try:
+        session_id = request.args.get('session_id', 'default')
+        state = get_session(session_id)
+
+        sp = state.get('system_prompt') or ''
+        sp_tokens = len(sp) // 4
+
+        conv_text = json.dumps(state.get('verlauf', []))
+        conv_tokens = len(conv_text) // 4
+
+        memory_files = []
+        for item in state.get('kontext_items', []):
+            content = item.get('content', '')
+            tokens = len(content) // 4
+            memory_files.append({
+                'name': item.get('name', ''),
+                'tokens': tokens,
+                'removable': True,
+            })
+
+        total = sp_tokens + conv_tokens + sum(m['tokens'] for m in memory_files)
+
+        return jsonify({
+            'system_prompt_tokens': sp_tokens,
+            'conversation_tokens': conv_tokens,
+            'memory_files_loaded': memory_files,
+            'total_tokens': total,
+            'limit_warning': total > 25000,
+        })
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        return jsonify({'error': str(e), 'total_tokens': 0, 'limit_warning': False,
+                        'system_prompt_tokens': 0, 'conversation_tokens': 0, 'memory_files_loaded': []})
+
+
+# CALENDAR_INTEGRATION_V1: Kalender-API Route
+@app.route('/api/calendar', methods=['GET', 'POST'])
+def api_calendar():
+    """Gibt Kalender-Events im angegebenen Zeitraum zurueck."""
+    if request.method == 'POST' and request.is_json:
+        data = request.json or {}
+    else:
+        data = dict(request.args)
+    days_back = int(data.get('days_back', 0))
+    days_ahead = int(data.get('days_ahead', 7))
+    cal_filter = data.get('calendar_filter', None)
+    search = data.get('search', None)
+    calendars = [cal_filter] if cal_filter else None
+
+    events, cals_found, error = get_calendar_events(
+        days_back=days_back, days_ahead=days_ahead,
+        calendars=calendars, search=search,
+    )
+    if error:
+        return jsonify({'error': error, 'events': [], 'count': 0})
+
+    now = datetime.datetime.now()
+    return jsonify({
+        'events': events,
+        'count': len(events),
+        'range': {
+            'from': (now - datetime.timedelta(days=days_back)).strftime('%Y-%m-%d'),
+            'to': (now + datetime.timedelta(days=days_ahead)).strftime('%Y-%m-%d'),
+        },
+        'calendars_found': sorted(cals_found),
+    })
+
+
+# SLACK_API_V1: Slack-API Route
+@app.route('/api/slack', methods=['POST'])
+def api_slack():
+    """Slack-API Proxy: send, channels, history, users."""
+    data = request.json or {}
+    action = data.get('action', 'send')
+
+    if action == 'send':
+        channel = data.get('channel', '')
+        text = data.get('text', data.get('message', ''))
+        if not channel or not text:
+            return jsonify({'error': 'channel und text/message erforderlich'})
+        # Channel-Name → ID aufloesen wenn noetig
+        if channel.startswith('#'):
+            ch_id = slack_find_channel_id(channel)
+            if ch_id:
+                channel = ch_id
+        ok, resp = slack_send_message(channel, text, thread_ts=data.get('thread_ts'))
+        return jsonify({'ok': ok, 'data': resp})
+
+    elif action == 'channels':
+        ok, resp = slack_list_channels(limit=data.get('limit', 100))
+        channels = [{'id': c['id'], 'name': c['name'], 'topic': c.get('topic', {}).get('value', '')}
+                    for c in resp.get('channels', [])] if ok else []
+        return jsonify({'ok': ok, 'channels': channels})
+
+    elif action == 'history':
+        ch = data.get('channel_id', data.get('channel', ''))
+        if not ch:
+            return jsonify({'error': 'channel_id erforderlich'})
+        ok, resp = slack_channel_history(ch, limit=data.get('limit', 20))
+        return jsonify({'ok': ok, 'messages': resp.get('messages', []) if ok else [], 'error': resp.get('error')})
+
+    elif action == 'users':
+        ok, resp = slack_list_users(limit=data.get('limit', 200))
+        users = [{'id': u['id'], 'name': u.get('real_name', u.get('name', '')),
+                  'display': u.get('profile', {}).get('display_name', '')}
+                 for u in resp.get('members', []) if not u.get('is_bot') and not u.get('deleted')] if ok else []
+        return jsonify({'ok': ok, 'users': users})
+
+    return jsonify({'error': f'Unbekannte action: {action}'})
+
+
+# CANVA_API_V1: Canva-API Route
+@app.route('/api/canva', methods=['POST'])
+def api_canva():
+    """Canva Connect API Proxy: designs, create, export, folders."""
+    data = request.json or {}
+    action = data.get('action', 'list')
+
+    if action == 'list' or action == 'search':
+        ok, resp = canva_list_designs(query=data.get('query'), count=data.get('count', 20))
+        return jsonify({'ok': ok, 'data': resp})
+
+    elif action == 'get':
+        did = data.get('design_id', '')
+        if not did:
+            return jsonify({'error': 'design_id erforderlich'})
+        ok, resp = canva_get_design(did)
+        return jsonify({'ok': ok, 'data': resp})
+
+    elif action == 'create':
+        title = data.get('title', 'Neues Design')
+        ok, resp = canva_create_design(
+            title, design_type=data.get('design_type', 'doc'),
+            width=data.get('width'), height=data.get('height'),
+        )
+        return jsonify({'ok': ok, 'data': resp})
+
+    elif action == 'export':
+        did = data.get('design_id', '')
+        fmt = data.get('format', 'pdf')
+        if not did:
+            return jsonify({'error': 'design_id erforderlich'})
+        ok, resp = canva_export_design(did, format_type=fmt)
+        return jsonify({'ok': ok, 'data': resp})
+
+    elif action == 'folders':
+        ok, resp = canva_list_folders(count=data.get('count', 50))
+        return jsonify({'ok': ok, 'data': resp})
+
+    # CANVA_CAMPAIGNS_V1: Brand Templates + Autofill Actions
+    elif action == 'brand_templates' or action == 'templates':
+        ok, resp = canva_list_brand_templates(query=data.get('query'), count=data.get('count', 50))
+        return jsonify({'ok': ok, 'data': resp})
+
+    elif action == 'template_dataset':
+        tid = data.get('template_id', '')
+        if not tid:
+            return jsonify({'error': 'template_id erforderlich'})
+        ok, resp = canva_get_template_dataset(tid)
+        return jsonify({'ok': ok, 'data': resp})
+
+    elif action == 'autofill':
+        tid = data.get('template_id', '')
+        field_data = data.get('data', {})
+        if not tid:
+            return jsonify({'error': 'template_id erforderlich'})
+        if not field_data:
+            return jsonify({'error': 'data (Feld-Mappings) erforderlich'})
+        ok, resp = canva_autofill(tid, field_data, title=data.get('title'))
+        return jsonify({'ok': ok, 'data': resp})
+
+    elif action == 'autofill_status':
+        jid = data.get('job_id', '')
+        if not jid:
+            return jsonify({'error': 'job_id erforderlich'})
+        ok, resp = canva_get_autofill_job(jid)
+        return jsonify({'ok': ok, 'data': resp})
+
+    elif action == 'batch_campaign':
+        tid = data.get('template_id', '')
+        rows = data.get('rows', [])
+        if not tid or not rows:
+            return jsonify({'error': 'template_id und rows erforderlich'})
+        jobs = canva_batch_campaign(tid, rows, title_prefix=data.get('title_prefix', 'Campaign'))
+        return jsonify({'ok': True, 'jobs': jobs, 'count': len(jobs)})
+
+    elif action == 'upload_asset':
+        url = data.get('url', '')
+        name = data.get('name', 'uploaded_image')
+        if not url:
+            return jsonify({'error': 'url erforderlich'})
+        ok, resp = canva_upload_asset(url, name=name)
+        return jsonify({'ok': ok, 'data': resp})
+
+    return jsonify({'error': f'Unbekannte action: {action}'})
+
+
+@app.route('/search_memory', methods=['POST'])
+def search_memory():
+    session_id = request.json.get('session_id', 'default')
+    state = get_session(session_id)
+    query = request.json.get('query', '')
+    if not state.get('speicher') or not query:
+        return jsonify({'ok': False, 'results': []})
+    if auto_search:
+        results, feedback = auto_search(query, state['speicher'])
+        return jsonify({'ok': True, 'results': [{'name': r['name'], 'preview': r['content'][:500]} for r in results], 'feedback': feedback})
+    # Fallback to old search
+    memory_dir = os.path.join(state['speicher'], 'memory')
+    keywords = parse_search_keywords(query)
+    results = scored_memory_search(memory_dir, keywords, max_results=5)
+    return jsonify({'ok': True, 'results': [{'name': r['name'], 'preview': r['content'][:500]} for r in results]})
+
+
+NOTIFICATION_PATTERNS = [
+    'noreply', 'no-reply', 'no_reply', 'donotreply', 'do-not-reply',
+    'mailer-daemon', 'postmaster', 'notifications@', 'notification@',
+    'newsletter', 'digest', 'automated', 'auto-reply', 'autoreply',
+    'bounce', 'info@', 'support@', 'service@', 'team@', 'hello@',
+    'mailchimp', 'sendgrid', 'hubspot', 'salesforce', 'marketo',
+    'intercom', 'zendesk', 'jira', 'confluence', 'atlassian',
+    'github', 'gitlab', 'bitbucket', 'circleci', 'travis',
+    'slack', 'notion', 'asana', 'trello', 'monday.com',
+    'google-workspace', 'calendar-notification', 'accepted this invitation',
+    'automatic reply', 'automatische antwort', 'abwesenheit',
+    'out of office', 'ooo', 'delivery status', 'undeliverable',
+    'unsubscribe', 'abmelden', 'cancelar inscricao',
+]
+
+def is_notification(from_field, subject):
+    check = (from_field + ' ' + subject).lower()
+    return any(p in check for p in NOTIFICATION_PATTERNS)
+
+
+@app.route('/search_preview', methods=['POST'])
+def search_preview():
+    """Search memory and return rich preview results for interactive selection."""
+    session_id = request.json.get('session_id', 'default')
+    state = get_session(session_id)
+    query = request.json.get('query', '')
+    search_type = request.json.get('type', None)
+    # Map shorthand type names to SOURCE_TAXONOMY keys
+    _type_aliases = {'slack': 'webclip_slack', 'salesforce': 'webclip_salesforce'}
+    if search_type in _type_aliases:
+        search_type = _type_aliases[search_type]
+    is_recent = request.json.get('recent', False)
+    if not state.get('speicher'):
+        return jsonify({'ok': False, 'results': []})
+    if not query and not is_recent:
+        return jsonify({'ok': False, 'results': []})
+    try:
+        from search_engine import QueryParser, HybridSearch, SearchIndex, normalize_unicode, get_or_build_index, extract_search_keywords, search_contacts, get_recent_files
+
+        # Empty query with recent flag — return latest files
+        if is_recent and not query:
+            if search_type:
+                recent = get_recent_files(state['speicher'], category=search_type, limit=10)
+            else:
+                recent = get_recent_files(state['speicher'], per_category=True, limit=3)
+            items = []
+            for r in recent:
+                items.append({
+                    'name': r['name'], 'path': r['path'], 'type': r.get('source_type','file'),
+                    'source_type': r.get('source_type','file'), 'date': r.get('date',''),
+                    'from': r.get('from',''), 'subject': r.get('subject',''),
+                    'preview': r.get('preview',''), 'score': 0,
+                    'from_person': False, 'is_notification': False,
+                })
+            return jsonify({'ok': True, 'results': items, 'query': 'Neueste Dateien', 'feedback': None})
+
+        # Contact search — special case
+        if search_type == 'contact':
+            contact_results = search_contacts(query, state['speicher'])
+            items = []
+            for c in contact_results:
+                items.append({
+                    'name': c['name'], 'path': '', 'type': 'contact', 'source_type': 'contact',
+                    'date': '', 'from': '', 'subject': c['name'].replace('contact_','').replace('_',' '),
+                    'preview': c['content'][:150], 'score': c['score'],
+                    'from_person': False, 'is_notification': False,
+                })
+            return jsonify({'ok': True, 'results': items, 'query': query, 'feedback': {'query': query}})
+
+        # NLP keyword extraction for long queries
+        extracted_keywords = None
+        effective_query = query
+        words = query.split()
+        if len(words) > 5:
+            extracted_keywords = extract_search_keywords(query, search_type)
+            if extracted_keywords:
+                effective_query = ' '.join(extracted_keywords)
+
+        intent = QueryParser.parse(effective_query, force_search=True)
+        # Ensure index
+        idx = get_or_build_index(state['speicher'])
+        idx.update_index()
+        results, feedback = HybridSearch.search(intent, state['speicher'], max_results=500, forced_type=search_type)
+        if extracted_keywords and feedback:
+            feedback['extracted_keywords'] = extracted_keywords
+        # Build rich preview items
+        items = []
+        names_norm = [normalize_unicode(pn) for pn in intent.person_names]
+        for r in results:
+            fname = r['name']
+            entry = idx.entries.get(fname, {})
+            from_field = entry.get('from', '')
+            from_norm = normalize_unicode(from_field) if from_field else ''
+            from_person = any(pn in from_norm for pn in names_norm) if names_norm else False
+            stype = entry.get('source_type') or entry.get('type', 'file')
+            is_notif = is_notification(from_field, entry.get('subject', '')) or stype == 'notification'
+            score = r.get('score', 0)
+            if is_notif:
+                score *= 0.1
+            items.append({
+                'name': fname,
+                'path': entry.get('path', os.path.join(state['speicher'], 'memory', fname)),
+                'type': entry.get('type', 'file'),
+                'source_type': stype,
+                'date': entry.get('date', ''),
+                'from': from_field,
+                'subject': entry.get('subject', ''),
+                'preview': r['content'][:150].replace('\n', ' ').strip(),
+                'score': score,
+                'from_person': from_person,
+                'is_notification': is_notif,
+            })
+        # Sort: from_person first, then highest score, then newest date
+        items.sort(key=lambda x: (not x.get('from_person'), -x['score'], x.get('date','') or '0'), reverse=False)
+        return jsonify({
+            'ok': True,
+            'results': items,
+            'query': feedback.get('query', query) if feedback else query,
+            'feedback': feedback,
+        })
+    except Exception as e:
+        print(f"search_preview error: {e}")
+        import traceback; traceback.print_exc()
+        return jsonify({'ok': False, 'results': [], 'error': str(e)})
+
+
+@app.route('/global_search_preview', methods=['POST'])
+def global_search_preview():
+    """Global search across all agents and Downloads shared."""
+    query = request.json.get('query', '')
+    search_type = request.json.get('type', None)
+    _type_aliases2 = {'slack': 'webclip_slack', 'salesforce': 'webclip_salesforce'}
+    if search_type in _type_aliases2:
+        search_type = _type_aliases2[search_type]
+    if not query:
+        return jsonify({'ok': False, 'results': []})
+    try:
+        from search_engine import global_search, normalize_unicode, QueryParser, extract_search_keywords
+        # NLP keyword extraction for long queries
+        effective_query = query
+        extracted_keywords = None
+        if len(query.split()) > 5:
+            extracted_keywords = extract_search_keywords(query, search_type)
+            if extracted_keywords:
+                effective_query = ' '.join(extracted_keywords)
+        results, feedback = global_search(effective_query, max_results=500)
+        if extracted_keywords and feedback:
+            feedback['extracted_keywords'] = extracted_keywords
+        return jsonify({
+            'ok': True,
+            'results': results,
+            'query': feedback.get('query', query),
+            'feedback': feedback,
+            'global': True,
+        })
+    except Exception as e:
+        print(f"global_search_preview error: {e}")
+        import traceback; traceback.print_exc()
+        return jsonify({'ok': False, 'results': [], 'error': str(e)})
+
+
+@app.route('/load_selected_files', methods=['POST'])
+def load_selected_files():
+    """Load selected files into kontext_items."""
+    session_id = request.json.get('session_id', 'default')
+    state = get_session(session_id)
+    paths = request.json.get('paths', [])[:50]  # Max 50 files
+    loaded = []
+    agents_seen = set()
+    for fpath in paths:
+        fname = os.path.basename(fpath)
+        if any(k['name'] == fname for k in state['kontext_items']):
+            loaded.append(fname)
+            continue
+        try:
+            ext = os.path.splitext(fname.lower())[1]
+            # Screenshots: load as base64 image for vision
+            if ext in ('.png', '.jpg', '.jpeg', '.gif', '.webp'):
+                import base64
+                with open(fpath, 'rb') as f:
+                    img_data = base64.b64encode(f.read()).decode('utf-8')
+                mime = {'png': 'image/png', 'jpg': 'image/jpeg', 'jpeg': 'image/jpeg',
+                        'gif': 'image/gif', 'webp': 'image/webp'}.get(ext.lstrip('.'), 'image/png')
+                state['kontext_items'].append({
+                    'name': fname,
+                    'content': '[Screenshot]',
+                    'image_b64': img_data,
+                    'image_type': mime,
+                    'path': fpath,
+                    'auto_loaded': True,
+                })
+            else:
+                with open(fpath, 'r', encoding='utf-8', errors='replace') as f:
+                    text = f.read(20000)
+                state['kontext_items'].append({
+                    'name': fname,
+                    'content': text,
+                    'path': fpath,
+                    'auto_loaded': True,
+                })
+            if fname not in state.get('session_files', []):
+                state.setdefault('session_files', []).append(fname)
+            loaded.append(fname)
+            # Track agent from path
+            fpath_lower = fpath.lower()
+            for agent_name in ['signicat', 'privat', 'trustedcarrier']:
+                if f'/{agent_name}/' in fpath_lower:
+                    agents_seen.add(agent_name)
+        except Exception as e:
+            print(f"load_selected_files error for {fname}: {e}")
+    return jsonify({'ok': True, 'loaded': loaded, 'agents': list(agents_seen)})
+
+
+@app.route('/add_file', methods=['POST'])
+def add_file():
+    session_id = request.form.get('session_id', 'default')
+    state = get_session(session_id)
+    file = request.files.get('file')
+    if not file:
+        return jsonify({'ok': False, 'error': 'Keine Datei erhalten'})
+    if not state['agent'] or not state['speicher']:
+        return jsonify({'ok': False, 'error': 'Kein Agent aktiv - bitte zuerst Agenten auswaehlen'})
+    try:
+        raw = file.read()
+        filename = file.filename
+        fname_lower = filename.lower()
+
+        # Detect image files
+        image_exts = {'.png': 'image/png', '.jpg': 'image/jpeg', '.jpeg': 'image/jpeg',
+                      '.gif': 'image/gif', '.webp': 'image/webp'}
+        is_image = any(fname_lower.endswith(ext) for ext in image_exts)
+        image_type = next((v for k,v in image_exts.items() if fname_lower.endswith(k)), None)
+
+        # Save to memory folder
+        memory_dir = os.path.join(state['speicher'], 'memory')
+        os.makedirs(memory_dir, exist_ok=True)
+        memory_path = os.path.join(memory_dir, filename)
+        with open(memory_path, 'wb') as f:
+            f.write(raw)
+
+        if is_image:
+            import base64
+            b64 = base64.b64encode(raw).decode('utf-8')
+            # Store as image item - will be sent as vision content
+            state['kontext_items'].append({
+                'name': filename,
+                'content': f'[Bild: {filename}]',
+                'image_b64': b64,
+                'image_type': image_type
+            })
+        else:
+            file_content = extract_file_content(raw, filename)
+            state['kontext_items'].append({'name': filename, 'content': file_content})
+
+        if filename not in state['session_files']:
+            state['session_files'].append(filename)
+        return jsonify({'ok': True, 'filename': filename, 'memory_path': memory_path})
+    except Exception as e:
+        return jsonify({'ok': False, 'error': str(e)})
+
+@app.route('/remove_ctx', methods=['POST'])
+def remove_ctx():
+    session_id = request.json.get('session_id', 'default')
+    state = get_session(session_id)
+    name = request.json['name']
+    state['kontext_items'] = [i for i in state['kontext_items'] if i['name'] != name]
+    return jsonify({'ok':True})
+
+
+@app.route('/remove_all_ctx', methods=['POST'])
+def remove_all_ctx():
+    session_id = request.json.get('session_id', 'default')
+    state = get_session(session_id)
+    state['kontext_items'] = []
+    return jsonify({'ok':True})
+
+if __name__ == '__main__':
+    def open_browser():
+        import time; time.sleep(1)
+        webbrowser.open('http://localhost:8080')
+    threading.Thread(target=open_browser, daemon=True).start()
+    # Cleanup old sessions every hour
+    def session_cleanup_loop():
+        import time
+        while True:
+            time.sleep(3600)
+            cleanup_old_sessions()
+    threading.Thread(target=session_cleanup_loop, daemon=True).start()
+
+    # Save all sessions on shutdown (pkill, Ctrl+C, restart)
+    import atexit, signal
+    def _save_all_sessions_on_exit():
+        print('[AUTO-SAVE] Shutdown erkannt — sichere alle Sessions...')
+        for sid in list(sessions.keys()):
+            try:
+                auto_save_session(sid)
+                print(f'[AUTO-SAVE] Session {sid[:12]} gesichert')
+            except Exception as e:
+                print(f'[AUTO-SAVE] Fehler bei {sid[:12]}: {e}')
+    atexit.register(_save_all_sessions_on_exit)
+    signal.signal(signal.SIGTERM, lambda sig, frame: (_save_all_sessions_on_exit(), exit(0)))
+    # Build global search index in background at startup
+    if build_global_index_async:
+        build_global_index_async()
+    # Periodic incremental index update (every 5 minutes)
+    def index_update_loop():
+        import time
+        time.sleep(60)  # Wait 1 min after startup before first run
+        while True:
+            try:
+                if update_all_indexes:
+                    update_all_indexes()
+            except Exception as e:
+                print(f'[INDEX] Periodischer Update Fehler: {e}')
+            time.sleep(300)  # Every 5 minutes
+    threading.Thread(target=index_update_loop, daemon=True).start()
+    print('\nAssistant Web Interface laeuft auf http://localhost:8080')
+    print('Zum Beenden: Control+C\n')
+    app.run(host='127.0.0.1', port=8080, debug=False)
