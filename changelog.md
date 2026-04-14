@@ -4,6 +4,235 @@ Format: [Datum] Änderung | Datei | Grund
 
 ---
 
+## 2026-04-14
+
+### Architektur-Audit Phase 2 — Access Control UI, Watcher-Konsolidierung, setup.sh, Recovery-Test
+- **Aufgabe 1: Access Control Web UI**
+  - `BASE/config/access_control.json` angelegt mit 9 Agenten (privat, signicat, signicat_lamp, signicat_meddpicc, signicat_outbound, signicat_powerpoint, system ward, trustedcarrier, trustedcarrier_instagramm)
+  - 3 neue Routes in `web_server.py`: `GET /admin/access-control` (HTML), `GET /api/access-control` (JSON), `POST /api/access-control` (Speichern + Validierung)
+  - Admin-Button (Zahnrad) im Header neben Agent-Button — oeffnet Admin-UI in neuem Tab
+  - Dunkles Theme (#1a1a2e) passend zum Haupt-UI, Checkboxen fuer own_memory/shared_memory, Text-Input fuer cross_agent_read
+- **Aufgabe 2: email_watcher Konsolidierung**
+  - Diagnose: 3 parallele Prozesse (PIDs 5905, 86235 aus /Applications/, PID 57665 aus src/ aber alte Version)
+  - Zombies 5905 und 86235 gekillt
+  - LaunchAgent neu geladen → neuer Prozess nutzt aktuelle Dual-Write-Version
+  - LaunchAgent plist korrekt: zeigt auf `~/AssistantDev/src/email_watcher.py` (kein Fix noetig)
+  - Finaler Zustand: **3 Prozesse → 1 Prozess** (nur LaunchAgent)
+- **Aufgabe 3: setup.sh Disaster Recovery Skript**
+  - Neues `~/AssistantDev/setup.sh` (ausfuehrbar)
+  - 5 Stufen: Systemvoraussetzungen → Verzeichnisstruktur → LaunchAgents → App-Deployment → models.json Template
+  - Python-Paket-Check mit automatischer Nachinstallation (12 Packages)
+  - Legt `BASE/config/models.json.template` an als Referenz fuer API-Keys
+- **Aufgabe 4: Dual-Write Recovery-Test**
+  - Mirror `BASE/config/email_processed_log.json` angelegt (21.117 Eintraege)
+  - Test-Szenario: lokale Datei geloescht → watcher recovered aus iCloud → 21.117 Eintraege wieder da
+  - Log-Output: `[WATCHER] Recovered processed log from iCloud mirror (21117 entries)`
+  - **Recovery: BESTANDEN**
+- Dateien: `src/web_server.py`, `setup.sh`, `scripts/add_access_control_ui.py`, `BASE/config/access_control.json`, `BASE/config/email_processed_log.json`, `BASE/config/models.json.template`
+
+### Architektur-Audit Phase 1 — Abschluss (Git + Docs)
+- **git commit + push:** `src/email_watcher.py` Dual-Write Aenderung auf `develop` gepusht
+  - Commit `b65bdaa`: "fix: email_watcher dual-write iCloud mirror fuer disaster recovery"
+  - Kein Deployment nach /Applications/ noetig — LaunchAgent zeigt auf `~/AssistantDev/src/`
+  - ACHTUNG: Laufende email_watcher-Prozesse nutzen noch alte Version; manuelle Neustarts ausstehend
+- **TECHNICAL_DOCUMENTATION.md aktualisiert:** 4 neue Abschnitte
+  - §13 Services: vollstaendige Tabelle mit Ports, LaunchAgents, Status
+  - §14 Bekannte Probleme: email_watcher Mehrfach-Instanz, Global Index fehlt, Access Control fehlt
+  - §15 Datalake Struktur: aktuelle Zahlen pro Agent nach Cleanup
+  - §16 Disaster Recovery: Dual-Write-Mechanismus dokumentiert
+- Dateien: `docs/TECHNICAL_DOCUMENTATION.md`
+
+### Architektur-Audit Phase 1 + Datalake Cleanup
+- **Ist-Analyse:** 9 Python-Services in src/, 3 LaunchAgents aktiv (emailwatcher, kchat_watcher, calendar-export)
+  - WARNUNG: 3 parallel laufende email_watcher.py Prozesse (PIDs 5905, 86235, 57665) — mischen aus App-Bundle + Dev-Pfad
+  - `.global_search_index.json` existiert NICHT (nur pro-Agent Indizes)
+  - `config/access_control.json` existiert NICHT — muss fuer Phase 2 angelegt werden
+- **contacts.json Deduplizierung:** Alle 4 Agenten gecheckt, 0 Duplikate nach E-Mail gefunden (waren bereits sauber)
+  - Backups: `contacts.json.backup_20260414_115713`
+- **Attachments-Unterordner angelegt:** `memory/attachments/` in allen 4 Agenten
+  - privat: 287 Dateien verschoben (PDFs, CSVs, Bilder)
+  - signicat: 1367 Dateien verschoben (UUIDs, RTFs, PPTX, Bilder)
+  - standard: 54 Dateien verschoben
+  - trustedcarrier: 73 Dateien verschoben
+  - Regel: `.eml`/`.txt`/`.json` bleiben, alles andere → attachments/
+  - Gesamt: 1781 Dateien verschoben, 0 Fehler
+- **email_watcher.py Dual-Write:** Processed-Log wird jetzt zusaetzlich nach `BASE/config/email_processed_log.json` gespiegelt
+  - `load_processed()` faellt auf iCloud-Mirror zurueck wenn lokal leer/nicht vorhanden
+  - `save_processed()` schreibt nach lokalem Pfad UND iCloud-Mirror (best-effort)
+  - Backup: `src/email_watcher.py` in `backups/2026-04-14_11-58-08/`
+- Dateien: `src/email_watcher.py`, `scripts/dedupe_contacts.py`, `scripts/create_attachments_folder.py`, `scripts/patch_email_watcher_dualwrite.py`
+
+### Feature: Kalender-Integration — Data Lake Export + Memory fuer alle Agenten
+- Neues Skript `scripts/export_calendar.py`: Exportiert alle macOS Kalender (Apple Calendar + Fantastical-Accounts) in den AssistantDev Data Lake
+- **Erfolgreiche Methode:** EventKit via PyObjC (icalBuddy nicht installiert — Fallback AppleScript vorhanden)
+- **Exportiert:** 1338 Events aus 11 Kalendern (Privat, Calendar, Moritz Cremer, londoncityfox@gmail.com, moritz@demoscapital.co, Übertragen von moritz@cassiopeia-consulting.io, Birthdays, Feiertage in Deutschland, Feiertage in Großbritannien, Feriados, United Kingdom holidays)
+- **Zeitraum:** 30 Tage rueckwaerts bis 180 Tage voraus (parametrisierbar via `--days-back`, `--days-forward`, `--calendars`, `--output-dir`)
+- **Output (Data Lake):** `claude_datalake/calendar/calendar_events.json` (maschinenlesbar) + `calendar_summary.txt` (human-readable, gruppiert nach Monat + KW)
+- **Memory-Integration:** Symlinks fuer alle 5 Agenten (`signicat`, `privat`, `trustedcarrier`, `standard`, `system ward`) — `memory/calendar_events.txt` zeigt auf die zentrale summary-Datei, so dass alle Agenten immer die aktuelle Version sehen
+- **Automatisches Update:** launchd Job `com.assistantdev.calendar-export` unter `~/Library/LaunchAgents/` — laeuft taeglich um 06:00 Uhr, Log nach `logs/calendar_export.log`, aktiv geladen
+- Search-Index: kein separates Rebuild-Skript vorhanden, Index wird in-process (`src/search_engine.py`) aufgebaut und findet die neuen Symlinks automatisch beim naechsten Build
+
+### Fix: E-Mail Suche — Modal-Diskrepanz, Datumssortierung, Reply-Modal Content
+- **Problem 1 (Modal fand nichts):** Root Cause: Modal-Suche filterte nur `.eml` Dateien.
+  Signicat hat aber 3178 `.txt` Emails (deutsches Format: Von/An/Betreff/Datum).
+  Deshalb fand das Modal "sebastian" nicht, obwohl /find-email 8 Treffer lieferte.
+- **Fix:** `_build_email_cache` unterstuetzt jetzt `.eml` UND `.txt`
+  - Neuer `_parse_txt_email()` Helper fuer deutsches Header-Format
+  - Neuer `_parse_filename_timestamp()` Fallback: extrahiert Datum aus Dateiname (`YYYY-MM-DD_HH-MM-SS_...`)
+  - Sortierung: Datum absteigend (neueste zuerst) — `Datum:` Header, dann Dateiname, dann mtime
+  - Deduplikation: nicht nur ueber Message-ID, auch ueber (from_email, subject, date_ts) — entfernt iCloud-Duplikate (`_2`, `_2 2`, etc.)
+  - From-Email Cleaning: entfernt `<mailto:...>` Wrapper aus .txt Emails
+- **Problem 2 (keine Datumssortierung):** `/search_preview` sortierte Emails nach from_person/score
+  - **Fix:** Fuer `search_type == 'email'` explizit nach `date` DESC sortieren
+- **Problem 3 (Reply-Modal laedt Inhalt nicht):** `/api/email-content` parste nur `.eml`
+  - **Fix:** Auch `.txt` Dateien lesen, deutsches Format parsen, Message-ID aus Header extrahieren
+- **Performance:** Erster Cache-Aufbau fuer signicat (4788 Dateien): ~80s einmalig, danach jede Suche <20ms
+- Alle 453 Tests bestanden
+- Dateien: `src/web_server.py`, `scripts/patch_email_search_unify.py`, `scripts/patch_email_search_refine.py`
+
+## 2026-04-13
+
+### Performance Fix: E-Mail Suche + Apple Mail Draft-Erstellung
+- **Fix 1: E-Mail Suche** — In-Memory Header Cache statt Filesystem-Scan
+  - Root Cause: Bei jeder Suchanfrage wurden 21.000+ .eml Dateien vom Disk gelesen und komplett MIME-geparst (~11s pro Suche)
+  - Fix: In-Memory Cache (`_email_header_cache`): liest nur die ersten 40 Zeilen (Header) jeder .eml via `os.scandir()`, cached fuer 5 Minuten
+  - Ergebnis: **11.465ms → 17ms** (677x schneller). Erster Aufruf 4.4s (einmaliger Cache-Aufbau), danach <25ms
+  - Namens-Normalisierung: Kommas im Von-Feld werden fuer die Suche zu Leerzeichen normalisiert ("Nachname, Vorname" → Token-Match)
+  - Frontend-Debounce von 300ms auf 250ms reduziert
+- **Fix 2: Apple Mail Draft** — Asynchrone AppleScript-Ausfuehrung
+  - Root Cause: `subprocess.run()` blockierte synchron (timeout=10s/30s), besonders langsam bei `send_email_reply` (iteriert alle Mailboxen)
+  - Fix: `subprocess.Popen()` (fire-and-forget) — HTTP-Response wird sofort zurueckgegeben
+  - Betrifft: `send_email_draft()` (2 Bloecke) + `send_email_reply()` — alle 3 auf async umgestellt
+- Alle 453 Tests bestanden
+- Dateien: `src/web_server.py`, `scripts/patch_email_perf_v2.py`
+
+### Fix: Portrait-Video (9:16) korrekt im Chat anzeigen
+- `generate_video()` gibt jetzt den tatsaechlich verwendeten `aspect` Wert als dritten Return-Wert zurueck
+- Portrait-Erkennung: API aspect == "9:16" ODER Prompt-Keywords (portrait, hochformat, vertical, tiktok, reels, shorts, 9:16)
+- `addVideoPreview()` im Frontend: Portrait-Videos bekommen max-width 280px, aspect-ratio 9/16, zentriert
+- Landscape-Videos bleiben unveraendert (max-width 600px)
+- `created_videos` Dict bekommt `is_portrait` Flag das an Frontend durchgereicht wird
+- Alle 453 Tests bestanden
+- Dateien: `src/web_server.py`, `scripts/patch_portrait_video.py`
+
+### Fix: E-Mail Reply Feature — Such-Modal mit Filtern + Routing-Fix
+- **Bug 1 Fix:** E-Mail-Such-Modal mit kategorierten Filtern (Von, Betreff, An/CC, Freitext)
+  - Neues Modal (`#email-search-modal`) mit 4 Filterfeldern und Debounce-Suche (300ms)
+  - `/create-email-reply` und `/reply` oeffnen jetzt das Such-Modal statt Inline-Chat-Suche
+  - Backend `/api/email-search` erweitert: unterstuetzt jetzt `from`, `subject`, `to`, `body` Parameter einzeln
+  - Klick auf Suchergebnis laedt E-Mail als Card direkt in den Chat (mit Antworten-Button)
+- **Bug 2 Fix:** Sub-Agent-Routing wird bei E-Mail-Reply-Kontext uebersprungen
+  - Nachrichten mit `[E-MAIL KONTEXT:...]` Prefix umgehen `detect_delegation()` komplett
+  - Verhindert falsches Routing (z.B. signicat_meddpicc statt signicat_outbound) waehrend Reply
+- Alle 453 Tests bestanden
+- Dateien: `src/web_server.py`, `scripts/patch_email_reply_fixes.py`, `scripts/patch_email_search_filter_fix.py`
+
+### UX-Ueberarbeitung: Chat-nativer E-Mail Reply Flow
+- **ERSETZT:** Altes E-Mail Reply Modal komplett entfernt (Formular-Popup mit Von/Betreff/CC/Body Feldern)
+- **NEU:** Chat-nativer Flow:
+  1. `/reply [suchbegriff]` zeigt E-Mail-Suchergebnisse als klickbare Cards im Chat
+  2. Klick auf Card laedt vollstaendige E-Mail als formatierte Email-Card (Von, An, CC, Betreff, Datum, Body mit max-height 400px scrollbar)
+  3. "Antworten"-Button setzt E-Mail-Kontext (Message-ID, From, Subject, CC)
+  4. Naechste User-Nachricht wird automatisch mit E-Mail-Kontext an den Agent gesendet (einmalig)
+- **NEU:** Backend-Route `GET /api/email-content` — laedt vollstaendigen E-Mail-Body aus .eml Dateien (text/plain mit HTML-Fallback, max 5000 Zeichen)
+- **NEU:** `/reply` Slash-Command als Kurzbefehl fuer E-Mail-Suche im Chat
+- `/create-email-reply` leitet jetzt auf `/reply` weiter statt Modal zu oeffnen
+- Alle 453 Tests bestanden
+- Dateien: `src/web_server.py`, `scripts/patch_email_chat_flow_v3.py`
+
+### Live-Suche im Email Reply Modal (ersetzt durch Chat-Flow oben)
+- **NEU:** Email Reply Modal mit Live-Suche statt einfachem Template-Text
+  - `/create-email-reply` oeffnet jetzt ein Modal mit Suchfeld, To, Subject, CC, Body
+  - Live-Suche ab 2 Zeichen (300ms Debounce) durchsucht .eml Dateien in Agent-Memory und email_inbox
+  - Max. 8 Treffer, neueste zuerst, mit Absender, Betreff, Datum
+  - Klick auf Treffer befuellt alle Felder automatisch (To, Subject, CC, Message-ID)
+  - CC filtert automatisch eigene Adressen heraus (moritz.cremer@me.com, londoncityfox@gmail.com, moritz.cremer@signicat.com)
+  - Pfeiltasten-Navigation und Escape im Dropdown
+  - Submit baut Prompt und sendet an Agent
+- **NEU:** Backend-Route `GET /api/email-search?agent=X&q=Y` — parst .eml Header (From, Subject, Date, Message-ID, To, Cc)
+- Alle 453 Tests bestanden
+- Dateien: `src/web_server.py`, `scripts/patch_email_reply_search.py`
+
+### LLM-Modell Audit, API-Tests & models.json Update
+- Alle 5 Provider getestet (Anthropic, OpenAI, Mistral, Perplexity, Gemini)
+- **Anthropic**: claude-sonnet-4-6, claude-opus-4-6, claude-haiku-4-5 — alle OK (HTTP 200)
+- **OpenAI**: gpt-4o, gpt-4o-mini, o1 — alle HTTP 429 (Quota exceeded, Billing pruefen!). o3 und o4-mini als neue Modelle hinzugefuegt
+- **Mistral**: mistral-large ✅, mistral-small ✅, mistral-nemo ❌ (invalid model ID entfernt). Neu hinzugefuegt: mistral-medium, magistral-medium (Reasoning), magistral-small (Reasoning), codestral (Code), open-mistral-nemo
+- **Perplexity**: sonar ✅, sonar-pro ✅, sonar-reasoning ❌ (deprecated Dez 2025, entfernt), sonar-reasoning-pro ✅, sonar-deep-research ✅
+- **Gemini**: gemini-2.5-flash ✅, gemini-2.5-pro ⚠️ (503 high demand), gemini-3-flash-preview ✅, gemini-3-pro-preview ✅, gemini-3.1-pro-preview ✅, gemini-2.0-flash ❌ (deprecated, entfernt)
+- Dropdown wird dynamisch aus models.json populiert — alle Aenderungen sofort sichtbar
+- Kein Provider-Fallback-Mechanismus vorhanden (nur innerhalb Video/Bild-Generierung)
+- Dateien: `config/models.json`
+
+### /create-email-reply Slash-Command im Frontend
+- `/create-email-reply` Shortcut im Slash-Command-Menü ergänzt (Gruppe: Kommunikation, direkt nach /create-email)
+- Template: "Antworte auf die E-Mail von [Absender] zum Thema [Betreff]: "
+- Dateien: `src/web_server.py`
+- Alle 453 Tests bestanden
+
+### Copy-Button fuer Code-Bloecke im Chat-Frontend
+- `addCodeCopyButtons()` erweitert: behandelt jetzt auch marked.js `<pre><code>` Bloecke (vorher nur custom `code-block-wrapper`)
+- Marked.js-Bloecke werden automatisch in `.code-block-wrapper` gewrappt mit Sprach-Label und Copy-Button
+- Copy-Buttons erscheinen jetzt auch in User-Nachrichten (nicht nur Assistant)
+- Duplikat-Schutz: Buttons werden nicht doppelt eingefuegt
+- Bestehende CSS-Klassen (`code-copy-btn`, hover-Effekte, `copied`-Zustand) werden wiederverwendet
+- Alle 453 Tests bestanden
+- Dateien: `src/web_server.py`, `scripts/patch_code_copy_buttons.py`
+
+### Auto-Deploy bei develop-Merge + Deployment-Audit
+- Git Post-Merge Hook erstellt (`.git/hooks/post-merge`): deployed automatisch wenn auf develop gemerged wird
+- `finish_feature.sh` deployed jetzt automatisch nach Feature-Merge (mit Fehlertoleranz)
+- `deploy.sh` robuster gemacht: logs-Verzeichnis wird angelegt, Timestamps in `logs/deploy.log`, sleep auf 4s erhoeht
+- Sofort-Deploy aller ausstehenden Features inkl. CREATE_EMAIL_REPLY verifiziert (Diff war 0 Zeilen — Quellcode und deployed waren bereits identisch)
+- Dateien: `scripts/deploy.sh`, `scripts/finish_feature.sh`, `.git/hooks/post-merge`
+
+### CREATE_EMAIL from-Feld Support
+- **NEU:** Optionales "from"-Feld in CREATE_EMAIL und CREATE_EMAIL_REPLY implementiert
+  - `send_email_draft()`: setzt `sender` im AppleScript wenn "from" angegeben
+  - `send_email_reply()`: setzt `sender` im Reply-AppleScript und beiden Fallback-Pfaden
+  - System-Prompt: Beispiel-JSON um "from" erweitert, Dokumentation ergaenzt
+  - Beide duplizierten Bloecke (Zeile ~278 und ~994) konsistent gepatcht
+- **signicat.txt:** Absenderadresse-Block eingefuegt (from: moritz.cremer@signicat.com fuer alle Drafts)
+- Dateien: `src/web_server.py`, `config/agents/signicat.txt`
+- Alle 453 Tests bestanden
+
+### CREATE_EMAIL_REPLY Feature
+- Neuer Trigger `[CREATE_EMAIL_REPLY:json]` fuer E-Mail-Antworten mit korrektem Threading
+- JSON-Felder: message_id, to, cc, subject, body, quote_original
+- `send_email_reply()` Funktion: AppleScript sucht E-Mail per Message-ID in Apple Mail, oeffnet Reply; Fallback auf neue E-Mail wenn nicht gefunden
+- CREATE_EMAIL Parser erkennt und ueberspringt CREATE_EMAIL_REPLY (kein Doppel-Match)
+- `/send_email_reply` API-Route fuer direkten Aufruf
+- System-Prompt (DATEI-ERSTELLUNG Block) um CREATE_EMAIL_REPLY Anweisung ergaenzt
+- Agent-Prompts (privat, signicat, signicat_outbound, trustedcarrier) um CREATE_EMAIL_REPLY Anweisung ergaenzt
+- JS-Frontend zeigt "Reply" statt "Draft" bei Reply-E-Mails
+- KEINE WIEDERHOLUNG Block um CREATE_EMAIL_REPLY erweitert
+- 10 neue Tests in run_tests.py (Stand: 453 Tests)
+- Dateien: src/web_server.py, tests/run_tests.py, config/agents/*.txt
+
+### GitHub Integration + Terminal-Workflow eingerichtet
+- Git Repository initialisiert in ~/AssistantDev/
+- GitHub Repo erstellt: github.com/moritzdagee/AssistantDev (private)
+- Branching-Strategie: main (stable/deployed) / develop (integration) / feature/xxx
+- Initial Commit + develop Branch gepusht
+- 4 Workflow-Skripte erstellt in ~/AssistantDev/scripts/:
+  - new_feature.sh [name]: Branch von develop erstellen
+  - finish_feature.sh [name]: Feature in develop mergen, Branch loeschen
+  - deploy.sh: Deploy + automatischer Git-Commit bei Erfolg
+  - claude_task.sh [task] [branch]: Branch + Claude Code in einem Befehl
+- .gitignore schuetzt: models.json (API-Keys), config/agents/, memory/*.json, *.backup_*, claude_outputs/
+- CLAUDE.md um Abschnitt Git Workflow erweitert
+- Claude CLI eingerichtet: ~/.local/bin/claude (v2.1.90), eingeloggt als moritz.cremer@me.com
+- Terminal-Workflow: Alle Claude Code Prompts ab sofort als direkt ausfuehrbare Terminal-Commands
+- Homebrew installiert, gh CLI installiert und eingeloggt als moritzdagee
+
+---
+
+## 2026-04-13 — GitHub Repository Setup
+
+2026-04-13 | GitHub Repository moritzdagee/AssistantDev private eingerichtet. Branching-Strategie main/develop/feature. Workflow-Skripte new_feature.sh finish_feature.sh deploy.sh claude_task.sh erstellt. | .gitignore, scripts/, CLAUDE.md | Versionskontrolle und strukturierter Workflow
+
+---
+
 ## SERVICE-VERZEICHNIS — Alle verwalteten Dienste
 
 > **WICHTIG:** Wenn ein neuer Service/Daemon erstellt wird, MUSS er hier eingetragen UND in `src/app.py` (Menu Bar App) als `Service(...)` Eintrag hinzugefuegt werden, damit er im macOS Menu Bar sichtbar, startbar und stoppbar ist. Ebenso muss das Script ins App Bundle kopiert werden: `cp src/[script].py /Applications/Assistant.app/Contents/Resources/`

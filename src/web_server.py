@@ -281,6 +281,7 @@ def send_email_draft(spec):
     subject = spec.get('subject', '')
     body    = spec.get('body', '')
     cc      = spec.get('cc', '')
+    sender  = spec.get('from', '')
 
     # Escape for AppleScript - handle all special chars
     def esc(s):
@@ -291,19 +292,18 @@ def send_email_draft(spec):
         return s
 
     cc_line = f'\n        make new cc recipient at end of cc recipients with properties {{address:\"{esc(cc)}\"}}' if cc else ''
+    sender_line = f'\n    set sender of newMessage to "{esc(sender)}"' if sender else ''
 
     script = f'''tell application "Mail"
     set newMessage to make new outgoing message with properties {{subject:"{esc(subject)}", content:"{esc(body)}", visible:true}}
     tell newMessage
         make new to recipient at end of to recipients with properties {{address:"{esc(to)}"}}{cc_line}
-    end tell
+    end tell{sender_line}
     activate
 end tell'''
 
-    result = subprocess.run(['osascript', '-e', script], 
-                          capture_output=True, text=True, timeout=10)
-    if result.returncode != 0:
-        raise Exception(f"AppleScript Fehler: {result.stderr.strip()}")
+    subprocess.Popen(['osascript', '-e', script],
+                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     return True
 
 BASE = os.path.expanduser("~/Library/Mobile Documents/com~apple~CloudDocs/Downloads shared/claude_datalake")
@@ -997,6 +997,7 @@ def send_email_draft(spec):
     subject = spec.get('subject', '')
     body    = spec.get('body', '')
     cc      = spec.get('cc', '')
+    sender  = spec.get('from', '')
 
     # Escape for AppleScript - handle all special chars
     def esc(s):
@@ -1007,19 +1008,91 @@ def send_email_draft(spec):
         return s
 
     cc_line = f'\n        make new cc recipient at end of cc recipients with properties {{address:\"{esc(cc)}\"}}' if cc else ''
+    sender_line = f'\n    set sender of newMessage to "{esc(sender)}"' if sender else ''
 
     script = f'''tell application "Mail"
     set newMessage to make new outgoing message with properties {{subject:"{esc(subject)}", content:"{esc(body)}", visible:true}}
     tell newMessage
         make new to recipient at end of to recipients with properties {{address:"{esc(to)}"}}{cc_line}
-    end tell
+    end tell{sender_line}
     activate
 end tell'''
 
-    result = subprocess.run(['osascript', '-e', script],
-                          capture_output=True, text=True, timeout=10)
-    if result.returncode != 0:
-        raise Exception(f"AppleScript Fehler: {result.stderr.strip()}")
+    subprocess.Popen(['osascript', '-e', script],
+                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    return True
+
+def send_email_reply(spec):
+    """Opens Apple Mail reply to an existing email identified by message_id."""
+    import subprocess
+    to      = spec.get('to', '')
+    subject = spec.get('subject', '')
+    body    = spec.get('body', '')
+    cc      = spec.get('cc', '')
+    sender  = spec.get('from', '')
+    message_id = spec.get('message_id', '')
+    quote_original = spec.get('quote_original', True)
+
+    def esc(s):
+        s = s.replace('\\', '\\\\')
+        s = s.replace('"', '\\"')
+        s = s.replace('\n', '\\n')
+        s = s.replace('\r', '')
+        return s
+
+    # Build CC recipients AppleScript lines
+    cc_lines = ''
+    if cc:
+        for addr in [a.strip() for a in cc.split(',') if a.strip()]:
+            cc_lines += f'\n            make new cc recipient at end of cc recipients with properties {{address:"{esc(addr)}"}}'
+
+    # AppleScript: try to find message by message-id and reply, fallback to new email
+    if message_id:
+        script = f'''tell application "Mail"
+    set foundMsg to missing value
+    set msgId to "{esc(message_id)}"
+    repeat with acct in accounts
+        repeat with mbox in mailboxes of acct
+            try
+                set msgs to (messages of mbox whose message id is msgId)
+                if (count of msgs) > 0 then
+                    set foundMsg to item 1 of msgs
+                    exit repeat
+                end if
+            end try
+        end repeat
+        if foundMsg is not missing value then exit repeat
+    end repeat
+    if foundMsg is not missing value then
+        set replyMsg to reply foundMsg with opening window
+        delay 0.5
+        tell replyMsg
+            set subject to "{esc(subject)}"
+            set content to "{esc(body)}"{cc_lines}
+        end tell
+        {f'set sender of replyMsg to "{esc(sender)}"' if sender else ''}
+    else
+        set newMessage to make new outgoing message with properties {{subject:"{esc(subject)}", content:"{esc(body)}", visible:true}}
+        tell newMessage
+            make new to recipient at end of to recipients with properties {{address:"{esc(to)}"}}{cc_lines}
+        end tell
+        {f'set sender of newMessage to "{esc(sender)}"' if sender else ''}
+    end if
+    activate
+end tell'''
+    else:
+        # No message_id: fallback to regular new email
+        sender_line = f'\n    set sender of newMessage to "{esc(sender)}"' if sender else ''
+        script = f'''tell application "Mail"
+    set newMessage to make new outgoing message with properties {{subject:"{esc(subject)}", content:"{esc(body)}", visible:true}}
+    tell newMessage
+        make new to recipient at end of to recipients with properties {{address:"{esc(to)}"}}{cc_lines}
+    end tell{sender_line}
+    activate
+end tell'''
+
+    subprocess.Popen(['osascript', '-e', script],
+                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     return True
 
 def send_whatsapp_draft(spec, agent_name=None):
@@ -1920,7 +1993,7 @@ def generate_video(prompt, agent_name, provider_key=None, task_id=None):
                 f.write(vr.content)
             print(f"[VEO] Video gespeichert: {fpath} ({len(vr.content)} bytes)", flush=True)
             task_done(task_id, message='Video fertig')
-            return fname, fpath
+            return fname, fpath, aspect
 
         # Fallback: base64 encoded video
         vid_b64 = samples[0].get('bytesBase64Encoded', samples[0].get('video', {}).get('bytesBase64Encoded', ''))
@@ -1930,7 +2003,7 @@ def generate_video(prompt, agent_name, provider_key=None, task_id=None):
             with open(fpath, 'wb') as f:
                 f.write(base64.b64decode(vid_b64))
             task_done(task_id, message='Video fertig')
-            return fname, fpath
+            return fname, fpath, aspect
 
         # Bekanntes Format nicht erkannt → volle Debug-Ausgabe
         sample_preview = _vjson.dumps(samples[0])[:500]
@@ -3030,7 +3103,56 @@ HTML = """<!DOCTYPE html>
   .code-block-wrapper { position:relative; background:#0d0d0d; border:1px solid #333; border-radius:6px; margin:8px 0; padding:0; }
   .code-block-wrapper pre { margin:0; padding:10px 12px; white-space:pre-wrap; word-wrap:break-word; font-size:12px; }
   .code-block-lang { position:absolute; top:4px; left:10px; font-size:9px; color:#555; text-transform:uppercase; font-family:Inter,sans-serif; }
-  .code-copy-btn { position:absolute; top:4px; right:6px; background:rgba(255,255,255,0.06); border:1px solid rgba(255,255,255,0.12); border-radius:5px; color:#888; font-size:11px; padding:2px 8px; cursor:pointer; transition:background 0.15s, color 0.15s; z-index:10; font-family:Inter,sans-serif; }
+  /* Email Search Modal */
+  #email-search-modal { display:none; position:fixed; inset:0; background:rgba(0,0,0,0.85); z-index:200; align-items:center; justify-content:center; }
+  #email-search-modal.show { display:flex; }
+  #email-search-box { background:#1a1a1a; border:1px solid #333; border-radius:12px; padding:20px; width:600px; max-width:92vw; max-height:85vh; display:flex; flex-direction:column; }
+  #email-search-box h2 { margin:0 0 12px; font-size:16px; color:#e0e0e0; }
+  .esm-filters { display:flex; gap:8px; margin-bottom:10px; flex-wrap:wrap; }
+  .esm-filter { flex:1; min-width:120px; }
+  .esm-filter label { display:block; font-size:10px; color:#666; margin-bottom:3px; text-transform:uppercase; letter-spacing:0.5px; }
+  .esm-filter input { width:100%; background:#111; border:1px solid #333; border-radius:5px; color:#e0e0e0; padding:6px 8px; font-size:13px; font-family:Inter,sans-serif; box-sizing:border-box; }
+  .esm-filter input:focus { border-color:#4a8aca; outline:none; }
+  .esm-filter input::placeholder { color:#555; }
+  #esm-results { flex:1; overflow-y:auto; max-height:50vh; margin-top:8px; }
+  .esm-result { padding:10px 12px; border:1px solid #2a2a3e; border-radius:8px; margin:5px 0; cursor:pointer; transition:background 0.15s, border-color 0.15s; background:#111; }
+  .esm-result:hover { background:#1a1a3a; border-color:#4a8aca; }
+  .esm-result-from { font-size:13px; color:#e0e0e0; }
+  .esm-result-email { font-size:11px; color:#777; margin-left:4px; }
+  .esm-result-subject { font-size:12px; color:#aaa; margin-top:3px; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+  .esm-result-date { font-size:10px; color:#555; float:right; }
+  .esm-result-meta { font-size:10px; color:#555; margin-top:2px; }
+  .esm-hint { text-align:center; color:#555; font-size:12px; padding:20px 0; }
+  .esm-loading { text-align:center; color:#888; font-size:12px; padding:15px 0; }
+  .esm-footer { display:flex; justify-content:flex-end; margin-top:10px; gap:8px; }
+  .esm-btn { padding:6px 16px; border-radius:6px; border:none; cursor:pointer; font-size:13px; font-family:Inter,sans-serif; }
+  .esm-btn-close { background:#333; color:#aaa; }
+  .esm-btn-close:hover { background:#444; color:#fff; }
+  /* Email Card in Chat */
+  .email-card { background:#1a1a2e; border:1px solid #334; border-radius:10px; margin:8px 0; overflow:hidden; font-family:Inter,sans-serif; }
+  .email-card-header { padding:12px 16px 8px; border-bottom:1px solid #2a2a3e; }
+  .email-card-label { font-size:10px; color:#6a8aca; text-transform:uppercase; letter-spacing:1px; font-weight:600; margin-bottom:8px; }
+  .email-card-row { font-size:12px; color:#bbb; margin:3px 0; line-height:1.5; }
+  .email-card-row strong { color:#e0e0e0; font-weight:500; min-width:60px; display:inline-block; }
+  .email-card-subject { font-size:14px; color:#e8e8e8; font-weight:600; margin:6px 0 2px; }
+  .email-card-date { font-size:11px; color:#666; }
+  .email-card-body { padding:12px 16px; max-height:400px; overflow-y:auto; font-size:13px; color:#ccc; line-height:1.6; white-space:pre-wrap; word-wrap:break-word; border-top:1px solid #2a2a3e; }
+  .email-card-body::-webkit-scrollbar { width:6px; }
+  .email-card-body::-webkit-scrollbar-thumb { background:#444; border-radius:3px; }
+  .email-card-msgid { padding:4px 16px 8px; font-size:10px; color:#444; word-break:break-all; }
+  .email-card-actions { padding:8px 16px 12px; display:flex; gap:8px; border-top:1px solid #2a2a3e; }
+  .email-card-btn { padding:6px 16px; border-radius:6px; border:none; cursor:pointer; font-size:12px; font-family:Inter,sans-serif; transition:background 0.15s; }
+  .email-card-btn-reply { background:#4a8aca; color:#fff; }
+  .email-card-btn-reply:hover { background:#5a9ada; }
+  .email-card-btn-close { background:#333; color:#aaa; }
+  .email-card-btn-close:hover { background:#444; color:#fff; }
+  .email-search-card { background:#1a1a2e; border:1px solid #334; border-radius:8px; padding:10px 14px; margin:6px 0; cursor:pointer; transition:background 0.15s, border-color 0.15s; }
+  .email-search-card:hover { background:#22224a; border-color:#4a8aca; }
+  .email-search-card-from { font-size:13px; color:#e0e0e0; }
+  .email-search-card-email { font-size:11px; color:#888; margin-left:4px; }
+  .email-search-card-subject { font-size:12px; color:#aaa; margin-top:3px; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+  .email-search-card-date { font-size:10px; color:#555; float:right; }
+    .code-copy-btn { position:absolute; top:4px; right:6px; background:rgba(255,255,255,0.06); border:1px solid rgba(255,255,255,0.12); border-radius:5px; color:#888; font-size:11px; padding:2px 8px; cursor:pointer; transition:background 0.15s, color 0.15s; z-index:10; font-family:Inter,sans-serif; }
   .code-copy-btn:hover { background:rgba(255,255,255,0.14); color:#fff; }
   .code-copy-btn.copied { color:#4caf50; border-color:#4caf50; }
   .output-block { position:relative; background:#0f1a0f; border-left:3px solid #4a8a4a; border-radius:4px; padding:12px 16px; margin:8px 0; }
@@ -3078,6 +3200,7 @@ HTML = """<!DOCTYPE html>
   <div id="header-spacer" style="flex:1;"></div><!-- AGENT_BTN_V1 -->
   <button class="hdr-btn" onclick="newSession()" style="background:#2a3a2a;border-color:#4a6a4a;color:#a0d090;">+ Neu <span class="shortcut-label">[N]</span></button>
   <button id="agent-btn" class="hdr-btn" data-tooltip-kind="agent" onclick="showAgentModal()"><span id="agent-label">Kein Agent</span> <span class="shortcut-label">[A]</span></button>
+  <button id="admin-btn" class="hdr-btn" onclick="window.open('/admin/access-control', '_blank')" title="Access Control">\u2699 Admin</button>
   <select id="provider-select" class="hdr-select" onchange="onProviderChange()">
     <option>Anthropic</option>
   </select>
@@ -3163,6 +3286,24 @@ HTML = """<!DOCTYPE html>
     <div class="new-agent-row">
       <input type="text" class="new-agent-input" id="new-agent-name" placeholder="Neuer Agent..." />
       <button class="new-agent-btn" onclick="createAgent()">+ Neu</button>
+    </div>
+  </div>
+</div>
+
+<div id="email-search-modal">
+  <div id="email-search-box">
+    <h2>\u2709 E-Mail suchen</h2>
+    <div class="esm-filters">
+      <div class="esm-filter"><label>Von</label><input type="text" id="esm-from" placeholder="Absender..." /></div>
+      <div class="esm-filter"><label>Betreff</label><input type="text" id="esm-subject" placeholder="Betreff..." /></div>
+    </div>
+    <div class="esm-filters">
+      <div class="esm-filter"><label>An / CC</label><input type="text" id="esm-to" placeholder="Empfaenger..." /></div>
+      <div class="esm-filter"><label>Freitext</label><input type="text" id="esm-body" placeholder="Inhalt..." /></div>
+    </div>
+    <div id="esm-results"><div class="esm-hint">Mindestens 2 Zeichen in ein Feld eingeben...</div></div>
+    <div class="esm-footer">
+      <button class="esm-btn esm-btn-close" onclick="closeEmailSearchModal()">Schliessen</button>
     </div>
   </div>
 </div>
@@ -3782,6 +3923,7 @@ function addMessage(role, text, modelName, providerDisplay, modelDisplay) {
     addSectionCopyButtons(div, text);
   } else {
     div.innerHTML = '<div class="bubble"><pre>' + escHtml(text) + '</pre></div><div class="meta">' + meta + '</div>';
+    addCodeCopyButtons(div);
   }
   msgs.appendChild(div);
   scrollDown();
@@ -3801,14 +3943,46 @@ function copyToClipboard(text, btn, label) {
 }
 
 function addCodeCopyButtons(msgEl) {
+  // Handle custom code-block-wrapper (renderCodeBlocks fallback)
   var blocks = msgEl.querySelectorAll('.code-block-wrapper');
   blocks.forEach(function(wrapper) {
+    if (wrapper.querySelector('.code-copy-btn')) return;
     var code = wrapper.getAttribute('data-code');
     if (!code) return;
     var btn = document.createElement('button');
     btn.className = 'code-copy-btn';
     btn.textContent = 'Kopieren';
     btn.onclick = function() { copyToClipboard(code, btn, 'Kopieren'); };
+    wrapper.appendChild(btn);
+  });
+  // Handle marked.js rendered <pre><code> blocks
+  var pres = msgEl.querySelectorAll('pre');
+  pres.forEach(function(pre) {
+    if (pre.closest('.code-block-wrapper') || pre.closest('.output-block')) return;
+    if (pre.parentNode.classList && pre.parentNode.classList.contains('code-block-wrapper')) return;
+    if (pre.querySelector('.code-copy-btn')) return;
+    var codeEl = pre.querySelector('code');
+    var codeText = codeEl ? codeEl.textContent : pre.textContent;
+    if (!codeText || codeText.trim().length < 2) return;
+    // Wrap in code-block-wrapper for consistent styling
+    var wrapper = document.createElement('div');
+    wrapper.className = 'code-block-wrapper';
+    pre.parentNode.insertBefore(wrapper, pre);
+    wrapper.appendChild(pre);
+    // Detect language from class (marked adds language-xxx)
+    if (codeEl) {
+      var langClass = (codeEl.className || '').match(/language-(\w+)/);
+      if (langClass) {
+        var langLabel = document.createElement('span');
+        langLabel.className = 'code-block-lang';
+        langLabel.textContent = langClass[1];
+        wrapper.insertBefore(langLabel, pre);
+      }
+    }
+    var btn = document.createElement('button');
+    btn.className = 'code-copy-btn';
+    btn.textContent = 'Kopieren';
+    btn.onclick = function() { copyToClipboard(codeText, btn, 'Kopieren'); };
     wrapper.appendChild(btn);
   });
 }
@@ -4035,8 +4209,11 @@ function addVideoPreview(vid) {
   const msgs = document.getElementById('messages');
   const div = document.createElement('div');
   div.style.cssText = 'text-align:center;padding:12px 0;';
-  div.innerHTML = '<video controls style="max-width:600px;border-radius:8px;border:1px solid #333;"><source src="/download_file?path=' + encodeURIComponent(vid.path) + '" type="video/mp4"></video><br>' +
-    '<span style="font-size:11px;color:#888;font-family:Inter,sans-serif;">' + vid.filename + '</span><br>' +
+  var videoStyle = vid.is_portrait
+    ? 'max-width:280px;max-height:500px;aspect-ratio:9/16;border-radius:8px;border:1px solid #333;display:block;margin:0 auto;'
+    : 'max-width:600px;border-radius:8px;border:1px solid #333;';
+  div.innerHTML = '<video controls style="' + videoStyle + '"><source src="/download_file?path=' + encodeURIComponent(vid.path) + '" type="video/mp4"></video><br>' +
+    '<span style="font-size:11px;color:#888;font-family:Inter,sans-serif;">' + vid.filename + (vid.is_portrait ? ' (Portrait 9:16)' : '') + '</span><br>' +
     '<a href="/download_file?path=' + encodeURIComponent(vid.path) + '" download="' + vid.filename + '" ' +
     'style="display:inline-block;margin-top:6px;background:#f0c060;color:#111;padding:6px 20px;border-radius:6px;font-size:12px;font-weight:700;text-decoration:none;font-family:Inter,sans-serif;">\u2b07 Video herunterladen</a>';
   msgs.appendChild(div);
@@ -4095,7 +4272,7 @@ function handleChatResponse(data) {
   if (data.created_videos && data.created_videos.length) data.created_videos.forEach(vid => addVideoPreview(vid));
   if (data.created_emails && data.created_emails.length) {
     data.created_emails.forEach(e => {
-      if (e && e.ok) addStatusMsg('\u2709 Apple Mail geoeffnet: '+e.subject);
+      if (e && e.ok) addStatusMsg('\u2709 Apple Mail ' + (e.reply ? 'Reply' : 'Draft') + ' geoeffnet: '+e.subject);
       else addMailtoFallback(e||{});
     });
   }
@@ -4389,7 +4566,7 @@ function handleResponse(data) {
   if (data.created_videos && data.created_videos.length) data.created_videos.forEach(vid => addVideoPreview(vid));
   if (data.created_emails && data.created_emails.length) {
     data.created_emails.forEach(e => {
-      if (e && e.ok) addStatusMsg('\u2709 Apple Mail geoeffnet: '+e.subject);
+      if (e && e.ok) addStatusMsg('\u2709 Apple Mail ' + (e.reply ? 'Reply' : 'Draft') + ' geoeffnet: '+e.subject);
       else addMailtoFallback(e||{});
     });
   }
@@ -4519,6 +4696,8 @@ const _SLASH_COMMANDS = [
   // SLASH_CLUSTER_V1: Gruppierte Slash Commands
   // ─── Kommunikation ───
   {cmd: '/create-email', label: '/create-email', desc: 'E-Mail Draft erstellen', template: 'Erstelle eine E-Mail an [Empfaenger] zum Thema: ', group: 'Kommunikation'},
+  {cmd: '/create-email-reply', label: '/create-email-reply', desc: 'E-Mail Antwort erstellen', template: 'Antworte auf die E-Mail von [Absender] zum Thema [Betreff]: ', group: 'Kommunikation'},
+  {cmd: '/reply', label: '/reply [suche]', desc: 'E-Mail suchen und im Chat oeffnen', template: '/reply ', group: 'Kommunikation'},
   {cmd: '/create-whatsapp', label: '/create-whatsapp', desc: 'WhatsApp-Nachricht', template: 'Schreibe eine WhatsApp-Nachricht an [Name]: ', group: 'Kommunikation'},
   {cmd: '/create-slack', label: '/create-slack', desc: 'Slack-Nachricht', template: 'Schreibe eine Slack-Nachricht an [#channel oder Name]: ', group: 'Kommunikation'},
   // ─── Kalender ───
@@ -4628,8 +4807,174 @@ function hideSlashAutocomplete() {
   _slashAcIdx = -1;
 }
 
+// ─── EMAIL SEARCH MODAL + CHAT FLOW ───────────────────────────────────
+let _emailContext = null;
+let _esmDebounce = null;
+
+function showEmailSearchModal() {
+  document.getElementById('esm-from').value = '';
+  document.getElementById('esm-subject').value = '';
+  document.getElementById('esm-to').value = '';
+  document.getElementById('esm-body').value = '';
+  document.getElementById('esm-results').innerHTML = '<div class="esm-hint">Mindestens 2 Zeichen in ein Feld eingeben...</div>';
+  var m = document.getElementById('email-search-modal');
+  m.classList.add('show'); m.style.display = 'flex';
+  setTimeout(function() { document.getElementById('esm-from').focus(); }, 100);
+}
+
+function closeEmailSearchModal() {
+  var m = document.getElementById('email-search-modal');
+  m.classList.remove('show'); m.style.display = 'none';
+}
+
+function _esmDoSearch() {
+  var from = document.getElementById('esm-from').value.trim();
+  var subj = document.getElementById('esm-subject').value.trim();
+  var to = document.getElementById('esm-to').value.trim();
+  var body = document.getElementById('esm-body').value.trim();
+  // Need at least 2 chars in any field
+  var q = from || subj || to || body;
+  if (!q || q.length < 2) { document.getElementById('esm-results').innerHTML = '<div class="esm-hint">Mindestens 2 Zeichen in ein Feld eingeben...</div>'; return; }
+  document.getElementById('esm-results').innerHTML = '<div class="esm-loading">Suche...</div>';
+  var agent = getAgentName();
+  var params = 'agent=' + encodeURIComponent(agent);
+  if (from) params += '&from=' + encodeURIComponent(from);
+  if (subj) params += '&subject=' + encodeURIComponent(subj);
+  if (to) params += '&to=' + encodeURIComponent(to);
+  if (body) params += '&body=' + encodeURIComponent(body);
+  // Also send combined q for backwards compat
+  params += '&q=' + encodeURIComponent([from, subj, to, body].filter(Boolean).join(' '));
+  fetch('/api/email-search?' + params)
+    .then(function(r) { return r.json(); })
+    .then(function(results) {
+      var container = document.getElementById('esm-results');
+      if (!results || results.length === 0) {
+        container.innerHTML = '<div class="esm-hint">Keine E-Mails gefunden</div>';
+        return;
+      }
+      container.innerHTML = '';
+      results.forEach(function(item, idx) {
+        var div = document.createElement('div');
+        div.className = 'esm-result';
+        div.innerHTML = '<div><span class="esm-result-from">' + escHtml(item.from_name || item.from_email) + '</span>'
+          + (item.from_name ? '<span class="esm-result-email">&lt;' + escHtml(item.from_email) + '&gt;</span>' : '')
+          + '<span class="esm-result-date">' + escHtml(item.date) + '</span></div>'
+          + '<div class="esm-result-subject">' + escHtml(item.subject || '(kein Betreff)') + '</div>'
+          + (item.to ? '<div class="esm-result-meta">An: ' + escHtml(item.to).substring(0,60) + '</div>' : '');
+        div.onclick = function() { _esmSelectEmail(item); };
+        container.appendChild(div);
+      });
+    })
+    .catch(function(e) { document.getElementById('esm-results').innerHTML = '<div class="esm-hint">Fehler: ' + escHtml(e.message) + '</div>'; });
+}
+
+function _esmSelectEmail(item) {
+  closeEmailSearchModal();
+  _openEmailInChat(item);
+}
+
+// Attach search listeners on DOMContentLoaded
+document.addEventListener('DOMContentLoaded', function() {
+  ['esm-from','esm-subject','esm-to','esm-body'].forEach(function(id) {
+    var el = document.getElementById(id);
+    if (el) {
+      el.addEventListener('input', function() {
+        clearTimeout(_esmDebounce);
+        _esmDebounce = setTimeout(_esmDoSearch, 250);
+      });
+      el.addEventListener('keydown', function(e) {
+        if (e.key === 'Escape') closeEmailSearchModal();
+      });
+    }
+  });
+  var modal = document.getElementById('email-search-modal');
+  if (modal) modal.addEventListener('click', function(e) { if (e.target === modal) closeEmailSearchModal(); });
+});
+
+function _openEmailInChat(emailMeta) {
+  addStatusMsg('Lade E-Mail...');
+  var agent = getAgentName();
+  fetch('/api/email-content?agent=' + encodeURIComponent(agent) + '&message_id=' + encodeURIComponent(emailMeta.message_id || '') + '&from_email=' + encodeURIComponent(emailMeta.from_email || '') + '&subject=' + encodeURIComponent(emailMeta.subject || ''))
+    .then(function(r) { return r.json(); })
+    .then(function(data) {
+      if (!data.ok) { addStatusMsg('E-Mail konnte nicht geladen werden: ' + (data.error || 'unbekannt')); return; }
+      _showEmailCard(data);
+    })
+    .catch(function(e) { addStatusMsg('Fehler: ' + e.message); });
+}
+
+function _showEmailCard(email) {
+  var msgs = document.getElementById('messages');
+  var div = document.createElement('div');
+  div.className = 'msg assistant';
+  var time = new Date().toLocaleTimeString('de-DE', {hour:'2-digit', minute:'2-digit'});
+  var fromDisplay = email.from_name ? escHtml(email.from_name) + ' &lt;' + escHtml(email.from_email) + '&gt;' : escHtml(email.from_email);
+  var bodyText = email.body || '(kein Inhalt)';
+  var ccDisplay = email.cc ? escHtml(email.cc) : '';
+  var cardId = 'ec-' + Date.now();
+  var html = '<div class="bubble"><div class="email-card">'
+    + '<div class="email-card-header">'
+    + '<div class="email-card-label">\\u2709 E-Mail</div>'
+    + '<div class="email-card-subject">' + escHtml(email.subject || '(kein Betreff)') + '</div>'
+    + '<div class="email-card-row"><strong>Von:</strong> ' + fromDisplay + '</div>'
+    + '<div class="email-card-row"><strong>An:</strong> ' + escHtml(email.to || '') + '</div>'
+    + (ccDisplay ? '<div class="email-card-row"><strong>CC:</strong> ' + ccDisplay + '</div>' : '')
+    + '<div class="email-card-date">' + escHtml(email.date || '') + '</div>'
+    + '</div>'
+    + '<div class="email-card-body">' + escHtml(bodyText) + '</div>'
+    + (email.message_id ? '<div class="email-card-msgid">Message-ID: ' + escHtml(email.message_id) + '</div>' : '')
+    + '<div class="email-card-actions">'
+    + '<button class="email-card-btn email-card-btn-reply" data-card="' + cardId + '">Antworten</button>'
+    + '<button class="email-card-btn email-card-btn-close" data-card="' + cardId + '">Schliessen</button>'
+    + '</div>'
+    + '</div></div><div class="meta">' + time + '</div>';
+  div.innerHTML = html;
+  div.id = cardId;
+  msgs.appendChild(div);
+  scrollDown();
+
+  div.querySelector('.email-card-btn-reply').onclick = function() {
+    var ownAddrs = ['moritz.cremer@me.com', 'londoncityfox@gmail.com', 'moritz.cremer@signicat.com'];
+    var ccParts = [];
+    [email.to || '', email.cc || ''].forEach(function(field) {
+      if (!field) return;
+      field.split(',').forEach(function(addr) {
+        addr = addr.trim();
+        var em = addr.includes('<') ? addr.substring(addr.indexOf('<')+1, addr.indexOf('>')) : addr;
+        if (em && !ownAddrs.includes(em.toLowerCase().trim())) ccParts.push(addr);
+      });
+    });
+    _emailContext = {
+      from_email: email.from_email || '',
+      from_name: email.from_name || '',
+      subject: email.subject || '',
+      message_id: email.message_id || '',
+      cc: ccParts.join(', ')
+    };
+    addStatusMsg('E-Mail-Kontext gesetzt. Schreibe jetzt deine Antwort-Anweisung.');
+    document.getElementById('msg-input').focus();
+    this.textContent = '\\u2713 Kontext gesetzt';
+    this.style.background = '#2a5a2a';
+    this.onclick = null;
+  };
+  div.querySelector('.email-card-btn-close').onclick = function() { div.remove(); };
+}
+
+function _getAndClearEmailContext() {
+  if (!_emailContext) return null;
+  var ctx = _emailContext;
+  _emailContext = null;
+  return ctx;
+}
+
 function selectSlashCmd(inputEl, cmd) {
   var entry = _SLASH_COMMANDS.find(c => c.cmd === cmd);
+  if (cmd === '/create-email-reply' || cmd === '/reply') {
+    inputEl.value = '';
+    hideSlashAutocomplete();
+    showEmailSearchModal();
+    return;
+  }
   if (entry && entry.template) {
     inputEl.value = entry.template;
     hideSlashAutocomplete();
@@ -5232,6 +5577,12 @@ async function handleCanvaCommand(text) {
 }
 
 async function doSendChat(text) {
+  // Inject email context if set (one-time use)
+  var ectx = _getAndClearEmailContext();
+  if (ectx) {
+    var ctxBlock = '[E-MAIL KONTEXT: Von: ' + ectx.from_email + (ectx.from_name ? ' (' + ectx.from_name + ')' : '') + ', Betreff: ' + ectx.subject + ', Message-ID: ' + ectx.message_id + (ectx.cc ? ', CC: ' + ectx.cc : '') + ']\\n\\nUser-Anweisung: ';
+    text = ctxBlock + text;
+  }
   startTyping(text.substring(0,50));
   startTaskDiscovery();
   let data;
@@ -5636,16 +5987,23 @@ Fuer PowerPoint (.pptx):
 [CREATE_FILE:pptx:{"title":"Praesentation","slides":[{"type":"title","heading":"Untertitel"},{"type":"content","heading":"Folientitel","body":"Einleitungstext","bullets":["Punkt 1","Punkt 2"],"footer":"Fusszeile"}]}]
 
 Fuer E-Mail-Draft (oeffnet Apple Mail):
-[CREATE_EMAIL:{"to":"empfaenger@example.com","cc":"","subject":"Betreff","body":"E-Mail Text hier"}]
+[CREATE_EMAIL:{"to":"empfaenger@example.com","cc":"","subject":"Betreff","body":"E-Mail Text hier","from":"optionale-absender@example.com"}]
 
-WICHTIG: Du schickst NIEMALS eine E-Mail direkt ab. Du erstellst IMMER nur einen Draft der in Apple Mail geoeffnet wird. Das gilt fuer alle Formulierungen: 'schreibe', 'sende', 'schick', 'antworte', 'reply', 'forward' — immer CREATE_EMAIL, niemals direkt senden.
+Fuer E-Mail-Antwort (oeffnet Apple Mail Reply mit korrektem Threading):
+[CREATE_EMAIL_REPLY:{"message_id":"<original-message-id@domain.com>","to":"absender@example.com","cc":"andere@example.com","subject":"Re: Betreff","body":"Antworttext hier","quote_original":true,"from":"optionale-absender@example.com"}]
+
+WICHTIG: Du schickst NIEMALS eine E-Mail direkt ab. Du erstellst IMMER nur einen Draft der in Apple Mail geoeffnet wird. Das gilt fuer alle Formulierungen: 'schreibe', 'sende', 'schick', 'antworte', 'reply', 'forward' — immer CREATE_EMAIL oder CREATE_EMAIL_REPLY, niemals direkt senden.
 
 Wenn du auf eine E-Mail antwortest (z.B. "antworte auf diese E-Mail", "reply", "Antwort verfassen", "schreib eine Antwort"):
-- Extrahiere aus der Original-E-Mail im Kontext: Von (Absender), An (Empfaenger), Betreff
+- Verwende CREATE_EMAIL_REPLY statt CREATE_EMAIL fuer korrekte Threading
+- message_id: Lies den Message-ID Header aus der Original-E-Mail (z.B. aus der .eml Datei im Kontext)
 - to: Original-Absender (aus "Von:" Feld)
 - cc: Alle Original-Empfaenger aus "An:" AUSSER moritz.cremer@me.com und londoncityfox@gmail.com
 - subject: "Re: " + Original-Betreff (nur wenn nicht bereits "Re:" vorhanden)
-- body: Dein Antworttext + eine Leerzeile + jede Zeile des Original-Bodys mit "> " davor (klassisches E-Mail-Quoting)
+- body: Dein Antworttext
+- quote_original: true wenn das Original zitiert werden soll (Standard), false wenn nicht
+- Falls keine message_id verfuegbar: verwende CREATE_EMAIL als Fallback
+- from: (Optional) Absender-E-Mail-Adresse. Wenn angegeben, wird dieser Account in Apple Mail als Sender verwendet. Nur setzen wenn ein bestimmter Absender-Account gewuenscht ist.
 
 Verwende dies immer wenn der Nutzer ein Dokument, eine Tabelle, PDF, Praesentation oder E-Mail benoetigt.
 
@@ -5654,7 +6012,7 @@ Fuer WhatsApp-Nachricht (oeffnet WhatsApp mit vorausgefuellter Nachricht):
 
 WICHTIG: WhatsApp-Nachrichten werden NIEMALS automatisch gesendet. Die App wird nur geoeffnet mit vorausgefuelltem Text. Der Nutzer muss manuell auf Senden klicken. Verwende dies wenn der Nutzer sagt: 'schreib auf WhatsApp', 'WhatsApp an', 'schick per WhatsApp'.
 
-KEINE WIEDERHOLUNG: Wenn im Verlauf bereits eine Aktion ausgefuehrt wurde (erkennbar an '[... — Aktion ausgefuehrt]'), erzeuge diese Aktion NICHT erneut. Jede CREATE_EMAIL, CREATE_WHATSAPP, CREATE_SLACK und CREATE_VIDEO Aktion darf nur EINMAL pro expliziter Nutzer-Anfrage erzeugt werden. Wenn der Nutzer eine NEUE Anfrage stellt (z.B. Video generieren statt WhatsApp), fuehre NUR die neue Aktion aus.
+KEINE WIEDERHOLUNG: Wenn im Verlauf bereits eine Aktion ausgefuehrt wurde (erkennbar an '[... — Aktion ausgefuehrt]'), erzeuge diese Aktion NICHT erneut. Jede CREATE_EMAIL, CREATE_EMAIL_REPLY, CREATE_WHATSAPP, CREATE_SLACK und CREATE_VIDEO Aktion darf nur EINMAL pro expliziter Nutzer-Anfrage erzeugt werden. Wenn der Nutzer eine NEUE Anfrage stellt (z.B. Video generieren statt WhatsApp), fuehre NUR die neue Aktion aus.
 
 Fuer Slack-Nachricht (oeffnet Slack Desktop mit vorausgefuelltem Text):
 [CREATE_SLACK:{"channel":"#kanalname","message":"Nachrichtentext hier"}]
@@ -5718,6 +6076,184 @@ def new_conversation():
     state['kontext_items'] = []
     state['session_files'] = []
     return jsonify({'ok': True})
+
+# ─── ACCESS CONTROL ───────────────────────────────────────────────────────
+ACCESS_CONTROL_FILE = os.path.join(BASE, "config", "access_control.json")
+
+def _load_access_control():
+    try:
+        with open(ACCESS_CONTROL_FILE, 'r') as f:
+            return json.load(f)
+    except Exception:
+        return {"agents": {}, "last_modified": "", "version": "1.0"}
+
+
+@app.route('/api/access-control', methods=['GET'])
+def api_access_control_get():
+    return jsonify(_load_access_control())
+
+
+@app.route('/api/access-control', methods=['POST'])
+def api_access_control_post():
+    import datetime as _dt
+    data = request.get_json(silent=True)
+    if not data or 'agents' not in data:
+        return jsonify({'success': False, 'error': 'Ungueltige Eingabe: agents fehlt'}), 400
+    # Validate: each agent must exist as .txt in AGENTS_DIR
+    valid_agents = set()
+    if os.path.exists(AGENTS_DIR):
+        for fname in os.listdir(AGENTS_DIR):
+            if fname.endswith('.txt') and '.backup_' not in fname:
+                valid_agents.add(fname[:-4])
+    for agent in data['agents'].keys():
+        if agent not in valid_agents:
+            return jsonify({'success': False, 'error': f'Unbekannter Agent: {agent}'}), 400
+    # Write
+    data['last_modified'] = _dt.datetime.now().isoformat()
+    data.setdefault('version', '1.0')
+    try:
+        os.makedirs(os.path.dirname(ACCESS_CONTROL_FILE), exist_ok=True)
+        with open(ACCESS_CONTROL_FILE, 'w') as f:
+            json.dump(data, f, indent=2, ensure_ascii=False)
+        return jsonify({'success': True, 'saved_at': data['last_modified']})
+    except Exception as e:
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+
+@app.route('/admin/access-control', methods=['GET'])
+def admin_access_control_page():
+    html = """<!DOCTYPE html>
+<html><head><meta charset="UTF-8"><title>Access Control — AssistantDev</title>
+<style>
+* { box-sizing:border-box; }
+body { background:#1a1a2e; color:#e0e0e0; font-family:-apple-system,Inter,sans-serif; margin:0; padding:30px; }
+h1 { color:#f0c060; font-size:24px; margin:0 0 8px; }
+.subtitle { color:#888; font-size:13px; margin-bottom:24px; }
+.container { max-width:900px; margin:0 auto; }
+.agent-card { background:#22224a; border:1px solid #334; border-radius:10px; padding:18px; margin:12px 0; }
+.agent-name { font-size:16px; font-weight:600; color:#e0e0e0; margin-bottom:4px; }
+.agent-desc { font-size:12px; color:#888; margin-bottom:14px; line-height:1.5; }
+.field-row { margin:10px 0; }
+.field-row label { display:inline-flex; align-items:center; color:#ccc; font-size:13px; cursor:pointer; }
+.field-row input[type=checkbox] { margin-right:8px; accent-color:#4a8aca; }
+.field-row span.hint { color:#666; font-size:11px; margin-left:6px; }
+.shared-options { display:flex; gap:12px; margin-top:6px; padding-left:22px; }
+.cross-input { background:#111; border:1px solid #334; color:#e0e0e0; padding:6px 10px; border-radius:5px; font-size:12px; width:100%; font-family:Inter,sans-serif; margin-top:4px; }
+.btn-row { margin-top:24px; padding-top:16px; border-top:1px solid #334; }
+.btn { padding:10px 24px; border:none; border-radius:6px; cursor:pointer; font-size:14px; font-family:Inter,sans-serif; font-weight:600; }
+.btn-primary { background:#4a8aca; color:#fff; }
+.btn-primary:hover { background:#5a9ada; }
+.btn-secondary { background:#333; color:#aaa; margin-left:8px; }
+.msg { padding:10px 14px; border-radius:6px; margin:10px 0; font-size:13px; display:none; }
+.msg.success { background:#1f4a1f; border:1px solid #4a8a4a; color:#a0d090; display:block; }
+.msg.error { background:#4a1f1f; border:1px solid #8a4a4a; color:#d09090; display:block; }
+.last-mod { color:#666; font-size:11px; margin-top:6px; }
+.back-link { color:#4a8aca; text-decoration:none; font-size:13px; }
+.back-link:hover { text-decoration:underline; }
+</style></head><body>
+<div class="container">
+<a href="/" class="back-link">\u2190 Zurueck zum Chat</a>
+<h1>\u2699 Access Control</h1>
+<div class="subtitle">Zugriffsrechte pro Agent — Memory, Shared Memory und Cross-Agent-Reads</div>
+<div id="msg" class="msg"></div>
+<div id="agents-container">Lade...</div>
+<div class="btn-row">
+  <button class="btn btn-primary" onclick="saveAccessControl()">Speichern</button>
+  <button class="btn btn-secondary" onclick="loadAccessControl()">Verwerfen</button>
+  <span class="last-mod" id="last-mod"></span>
+</div>
+</div>
+<script>
+let _acData = null;
+const SHARED_OPTIONS = ['webclips', 'email_inbox', 'calendar'];
+
+async function loadAccessControl() {
+  const r = await fetch('/api/access-control');
+  _acData = await r.json();
+  renderAgents();
+  document.getElementById('last-mod').textContent = _acData.last_modified ? 'Zuletzt geaendert: ' + _acData.last_modified : '';
+}
+
+function renderAgents() {
+  const container = document.getElementById('agents-container');
+  container.innerHTML = '';
+  const agents = _acData.agents || {};
+  Object.keys(agents).sort().forEach(name => {
+    const a = agents[name];
+    const shared = a.shared_memory || [];
+    const cross = (a.cross_agent_read || []).join(', ');
+    const sharedHtml = SHARED_OPTIONS.map(opt => {
+      const checked = shared.includes(opt) ? 'checked' : '';
+      return `<label><input type="checkbox" data-agent="${name}" data-shared="${opt}" ${checked}> ${opt}</label>`;
+    }).join(' ');
+    container.innerHTML += `
+      <div class="agent-card">
+        <div class="agent-name">${escHtml(name)}</div>
+        <div class="agent-desc">${escHtml(a.description || '')}</div>
+        <div class="field-row">
+          <label>
+            <input type="checkbox" data-agent="${name}" data-field="own_memory" ${a.own_memory ? 'checked' : ''}>
+            Eigenes Memory aktiv
+          </label>
+        </div>
+        <div class="field-row">
+          <label>Shared Memory Zugriff:</label>
+          <div class="shared-options">${sharedHtml}</div>
+        </div>
+        <div class="field-row">
+          <label>Cross-Agent Read Access (komma-separiert):</label>
+          <input type="text" class="cross-input" data-agent="${name}" data-field="cross_agent_read" value="${escHtml(cross)}" placeholder="z.B. standard, privat">
+        </div>
+      </div>
+    `;
+  });
+}
+
+function escHtml(s) {
+  return String(s || '').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+}
+
+async function saveAccessControl() {
+  if (!_acData) return;
+  // Collect from DOM
+  const agents = _acData.agents || {};
+  Object.keys(agents).forEach(name => {
+    // own_memory
+    const ownBox = document.querySelector(`input[data-agent="${name}"][data-field="own_memory"]`);
+    if (ownBox) agents[name].own_memory = ownBox.checked;
+    // shared_memory
+    const sharedBoxes = document.querySelectorAll(`input[data-agent="${name}"][data-shared]`);
+    agents[name].shared_memory = Array.from(sharedBoxes).filter(b => b.checked).map(b => b.dataset.shared);
+    // cross_agent_read
+    const crossInput = document.querySelector(`input[data-agent="${name}"][data-field="cross_agent_read"]`);
+    if (crossInput) agents[name].cross_agent_read = crossInput.value.split(',').map(s => s.trim()).filter(Boolean);
+  });
+  const msg = document.getElementById('msg');
+  try {
+    const r = await fetch('/api/access-control', {
+      method: 'POST', headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify(_acData)
+    });
+    const d = await r.json();
+    if (d.success) {
+      msg.className = 'msg success';
+      msg.textContent = 'Gespeichert um ' + d.saved_at;
+      document.getElementById('last-mod').textContent = 'Zuletzt geaendert: ' + d.saved_at;
+    } else {
+      msg.className = 'msg error';
+      msg.textContent = 'Fehler: ' + (d.error || 'unbekannt');
+    }
+  } catch(e) {
+    msg.className = 'msg error';
+    msg.textContent = 'Netzwerk-Fehler: ' + e.message;
+  }
+  setTimeout(() => { msg.style.display = 'none'; }, 5000);
+}
+
+loadAccessControl();
+</script>
+</body></html>"""
+    return html
 
 @app.route('/get_prompt', methods=['GET'])
 def get_prompt():
@@ -6028,6 +6564,463 @@ def send_email_draft_route():
         return jsonify({'ok': False, 'error': str(e)})
 
 
+@app.route('/send_email_reply', methods=['POST'])
+def send_email_reply_route():
+    try:
+        spec = request.json
+        send_email_reply(spec)
+        return jsonify({'ok': True, 'subject': spec.get('subject',''), 'to': spec.get('to','')})
+    except Exception as e:
+        return jsonify({'ok': False, 'error': str(e)})
+
+
+# ─── EMAIL HEADER CACHE (in-memory) ────────────────────────────────────────
+_email_header_cache = {}  # key: dir_path -> list of parsed headers
+_email_cache_mtime = {}   # key: dir_path -> last build time
+_EMAIL_CACHE_TTL = 300    # rebuild cache every 5 minutes
+
+def _parse_filename_timestamp(fname):
+    """Extract timestamp from filename like 2025-10-30_16-46-32_... Returns (display, ts)."""
+    import re as _re
+    import datetime as _dt
+    m = _re.match(r'^(\d{4})-(\d{2})-(\d{2})_(\d{2})-(\d{2})-(\d{2})', fname)
+    if m:
+        try:
+            dt = _dt.datetime(int(m.group(1)), int(m.group(2)), int(m.group(3)),
+                              int(m.group(4)), int(m.group(5)), int(m.group(6)))
+            return dt.strftime('%d.%m.%Y %H:%M'), dt.timestamp()
+        except Exception:
+            pass
+    return '', 0
+
+
+def _parse_txt_email(fpath, fname):
+    """Parse .txt email with German header format (Von:, An:, Betreff:, Datum:)."""
+    from email.utils import parsedate_to_datetime as _pdt
+    import re as _re
+    try:
+        with open(fpath, 'r', errors='replace') as f:
+            lines = []
+            for i, line in enumerate(f):
+                if i >= 30:
+                    break
+                lines.append(line)
+        from_raw = subject = date_str = to_raw = cc_raw = message_id = ''
+        for line in lines:
+            low = line.lower()
+            if low.startswith('von:') or low.startswith('from:'):
+                from_raw = line.split(':', 1)[1].strip()
+            elif low.startswith('betreff:') or low.startswith('subject:'):
+                subject = line.split(':', 1)[1].strip()
+            elif low.startswith('datum:') or low.startswith('date:'):
+                date_str = line.split(':', 1)[1].strip()
+            elif low.startswith('an:') or low.startswith('to:'):
+                to_raw = line.split(':', 1)[1].strip()
+            elif low.startswith('cc:') or low.startswith('kopie:'):
+                cc_raw = line.split(':', 1)[1].strip()
+            elif low.startswith('message-id:'):
+                message_id = line.split(':', 1)[1].strip()
+        from_name = ''
+        from_email = from_raw
+        if '<' in from_raw and '>' in from_raw:
+            from_name = from_raw[:from_raw.index('<')].strip().strip('"').replace(',', ' ')
+            from_email = from_raw[from_raw.index('<')+1:from_raw.index('>')]
+        date_display = ''
+        date_ts = 0
+        if date_str:
+            try:
+                dt = _pdt(date_str)
+                date_display = dt.strftime('%d.%m.%Y %H:%M')
+                date_ts = dt.timestamp()
+            except Exception:
+                pass
+        if not date_ts:
+            fn_display, fn_ts = _parse_filename_timestamp(fname)
+            if fn_ts:
+                date_display = date_display or fn_display
+                date_ts = fn_ts
+        return {
+            'message_id': message_id,
+            'from_name': from_name, 'from_email': from_email,
+            'subject': subject, 'date': date_display, 'date_ts': date_ts,
+            'to': to_raw, 'cc': cc_raw,
+        }
+    except Exception:
+        return None
+
+
+def _build_email_cache(sdir):
+    import email as _eml
+    from email.header import decode_header as _dh
+    from email.utils import parsedate_to_datetime as _pdt
+
+    def _dec(val):
+        if not val:
+            return ''
+        try:
+            parts = _dh(val)
+            decoded = []
+            for part, charset in parts:
+                if isinstance(part, bytes):
+                    decoded.append(part.decode(charset or 'utf-8', errors='replace'))
+                else:
+                    decoded.append(part)
+            return ' '.join(decoded)
+        except Exception:
+            return str(val)
+
+    entries = []
+    try:
+        for fname in os.scandir(sdir):
+            if not (fname.name.endswith('.eml') or fname.name.endswith('.txt')):
+                continue
+            try:
+                parsed = None
+                if fname.name.endswith('.eml'):
+                    with open(fname.path, 'r', errors='replace') as f:
+                        header_lines = []
+                        for i, line in enumerate(f):
+                            if i >= 40:
+                                break
+                            header_lines.append(line)
+                    msg = _eml.message_from_string(''.join(header_lines))
+                    from_raw = _dec(msg.get('From', ''))
+                    subject = _dec(msg.get('Subject', ''))
+                    date_str = msg.get('Date', '')
+                    message_id = msg.get('Message-ID', '').strip()
+                    to_raw = _dec(msg.get('To', ''))
+                    cc_raw = _dec(msg.get('Cc', ''))
+                    from_name = ''
+                    from_email = from_raw
+                    if '<' in from_raw and '>' in from_raw:
+                        from_name = from_raw[:from_raw.index('<')].strip().strip('"').replace(',', ' ')
+                        from_email = from_raw[from_raw.index('<')+1:from_raw.index('>')]
+                    date_display = ''
+                    date_ts = 0
+                    try:
+                        dt = _pdt(date_str)
+                        date_display = dt.strftime('%d.%m.%Y %H:%M')
+                        date_ts = dt.timestamp()
+                    except Exception:
+                        pass
+                    if not date_ts:
+                        fn_display, fn_ts = _parse_filename_timestamp(fname.name)
+                        if fn_ts:
+                            date_display = date_display or fn_display
+                            date_ts = fn_ts
+                    if not date_ts:
+                        try:
+                            date_ts = fname.stat().st_mtime
+                        except Exception:
+                            pass
+                    parsed = {
+                        'message_id': message_id,
+                        'from_name': from_name, 'from_email': from_email,
+                        'subject': subject, 'date': date_display, 'date_ts': date_ts,
+                        'to': to_raw, 'cc': cc_raw,
+                    }
+                else:
+                    # .txt with German header format
+                    parsed = _parse_txt_email(fname.path, fname.name)
+                    if parsed and not parsed.get('date_ts'):
+                        try:
+                            parsed['date_ts'] = fname.stat().st_mtime
+                        except Exception:
+                            pass
+
+                if not parsed:
+                    continue
+                # Only include entries that actually look like emails
+                if not (parsed['from_email'] or parsed['subject']):
+                    continue
+
+                entries.append({
+                    **parsed,
+                    '_filename': fname.name,
+                    '_fpath': fname.path,
+                    '_s_from': (parsed['from_name'].replace(',', ' ') + ' ' + parsed['from_email'] + ' ' + fname.name).lower(),
+                    '_s_subj': parsed['subject'].lower(),
+                    '_s_to': (parsed.get('to','') + ' ' + parsed.get('cc','')).lower(),
+                })
+            except Exception:
+                continue
+    except Exception:
+        pass
+    entries.sort(key=lambda e: e.get('date_ts', 0), reverse=True)
+    return entries
+
+
+def _get_email_cache(sdir):
+    import time
+    now = time.time()
+    if sdir in _email_header_cache and (now - _email_cache_mtime.get(sdir, 0)) < _EMAIL_CACHE_TTL:
+        return _email_header_cache[sdir]
+    entries = _build_email_cache(sdir)
+    _email_header_cache[sdir] = entries
+    _email_cache_mtime[sdir] = now
+    print(f"[EMAIL_CACHE] Built cache for {sdir}: {len(entries)} entries", flush=True)
+    return entries
+
+
+@app.route('/api/email-search')
+def email_search_route():
+    agent = request.args.get('agent', 'standard')
+    q = request.args.get('q', '').strip().lower()
+    from_filter = request.args.get('from', '').strip().lower()
+    subj_filter = request.args.get('subject', '').strip().lower()
+    to_filter = request.args.get('to', '').strip().lower()
+    body_filter = request.args.get('body', '').strip().lower()
+    has_field_filter = bool(from_filter or subj_filter or to_filter or body_filter)
+    if len(q) < 2 and not has_field_filter:
+        return jsonify([])
+
+    search_dirs = []
+    speicher = get_agent_speicher(agent)
+    memory_dir = os.path.join(speicher, 'memory')
+    if os.path.exists(memory_dir):
+        search_dirs.append(memory_dir)
+    inbox_dir = os.path.join(BASE, 'email_inbox')
+    if os.path.exists(inbox_dir):
+        search_dirs.append(inbox_dir)
+
+    all_entries = []
+    for sdir in search_dirs:
+        all_entries.extend(_get_email_cache(sdir))
+    # Re-sort merged list
+    all_entries.sort(key=lambda e: e.get('date_ts', 0), reverse=True)
+
+    def _clean_email(s):
+        # Strip mailto: wrappers and angle brackets
+        import re as _re
+        if not s: return ''
+        # Common pattern in .txt files: "user@domain.de<mailto:user@domain.de>"
+        m = _re.search(r'([\w\.\-]+@[\w\.\-]+)', s)
+        return m.group(1) if m else s
+
+    results = []
+    seen_ids = set()
+    seen_dedup = set()
+    for entry in all_entries:
+        if len(results) >= 8:
+            break
+        mid = entry['message_id']
+        # Primary dedup: message_id
+        if mid and mid in seen_ids:
+            continue
+        # Secondary dedup: (clean_from_email, subject, date_ts) — handles iCloud duplicates
+        clean_from = _clean_email(entry['from_email']).lower()
+        dedup_key = (clean_from, entry['subject'].strip(), entry.get('date_ts', 0))
+        if dedup_key in seen_dedup:
+            continue
+        match = True
+        if from_filter:
+            if from_filter not in entry['_s_from']:
+                match = False
+        if subj_filter and match:
+            if subj_filter not in entry['_s_subj']:
+                match = False
+        if to_filter and match:
+            if to_filter not in entry['_s_to']:
+                match = False
+        if not from_filter and not subj_filter and not to_filter and q:
+            if q not in (entry['_s_from'] + ' ' + entry['_s_subj']):
+                match = False
+        if match:
+            if mid:
+                seen_ids.add(mid)
+            seen_dedup.add(dedup_key)
+            results.append({
+                'message_id': entry['message_id'],
+                'from_name': entry['from_name'],
+                'from_email': _clean_email(entry['from_email']),
+                'subject': entry['subject'], 'date': entry['date'],
+                'date_ts': entry['date_ts'],
+                'to': entry['to'], 'cc': entry['cc'],
+                'file': entry.get('_filename', ''),
+                'fpath': entry.get('_fpath', ''),
+            })
+    return jsonify(results[:8])
+
+
+@app.route('/api/email-content')
+def email_content_route():
+    """Load full email content for display in chat."""
+    import email as _email_mod
+    from email.header import decode_header as _dec_hdr
+    agent = request.args.get('agent', 'standard')
+    target_mid = request.args.get('message_id', '').strip()
+    target_from = request.args.get('from_email', '').strip().lower()
+    target_subj = request.args.get('subject', '').strip().lower()
+
+    if not target_mid and not target_from:
+        return jsonify({'ok': False, 'error': 'message_id or from_email required'})
+
+    def _dec(val):
+        if not val:
+            return ''
+        parts = _dec_hdr(val)
+        decoded = []
+        for part, charset in parts:
+            if isinstance(part, bytes):
+                decoded.append(part.decode(charset or 'utf-8', errors='replace'))
+            else:
+                decoded.append(part)
+        return ' '.join(decoded)
+
+    def _get_body(msg):
+        if msg.is_multipart():
+            for part in msg.walk():
+                ct = part.get_content_type()
+                if ct == 'text/plain':
+                    payload = part.get_payload(decode=True)
+                    if payload:
+                        charset = part.get_content_charset() or 'utf-8'
+                        return payload.decode(charset, errors='replace')
+            for part in msg.walk():
+                ct = part.get_content_type()
+                if ct == 'text/html':
+                    payload = part.get_payload(decode=True)
+                    if payload:
+                        charset = part.get_content_charset() or 'utf-8'
+                        import re as _re
+                        html = payload.decode(charset, errors='replace')
+                        return _re.sub(r'<[^>]+>', '', html)[:3000]
+        else:
+            payload = msg.get_payload(decode=True)
+            if payload:
+                charset = msg.get_content_charset() or 'utf-8'
+                return payload.decode(charset, errors='replace')
+        return ''
+
+    search_dirs = []
+    speicher = get_agent_speicher(agent)
+    memory_dir = os.path.join(speicher, 'memory')
+    if os.path.exists(memory_dir):
+        search_dirs.append(memory_dir)
+    inbox_dir = os.path.join(BASE, 'email_inbox')
+    if os.path.exists(inbox_dir):
+        search_dirs.append(inbox_dir)
+
+    def _read_txt_email(fpath, fname):
+        try:
+            with open(fpath, 'r', errors='replace') as f:
+                full = f.read()
+            # Split headers from body (first blank line)
+            header_end = full.find('\n\n')
+            if header_end == -1:
+                header_end = len(full)
+            header_block = full[:header_end]
+            body = full[header_end+2:] if header_end < len(full) else ''
+            headers = {}
+            for line in header_block.split('\n'):
+                for key_de, key_en in [('von:','from'),('an:','to'),('betreff:','subject'),('datum:','date'),('cc:','cc'),('kopie:','cc'),('message-id:','message_id')]:
+                    if line.lower().startswith(key_de) or line.lower().startswith(key_en + ':'):
+                        headers[key_en] = line.split(':', 1)[1].strip()
+                        break
+            return headers, body
+        except Exception:
+            return None, None
+
+    for sdir in search_dirs:
+        try:
+            for fname in os.listdir(sdir):
+                if not (fname.endswith('.eml') or fname.endswith('.txt')):
+                    continue
+                fpath = os.path.join(sdir, fname)
+                try:
+                    if fname.endswith('.txt'):
+                        headers, body = _read_txt_email(fpath, fname)
+                        if not headers:
+                            continue
+                        mid = headers.get('message_id', '').strip()
+                        from_raw_txt = headers.get('from', '')
+                        subj_txt = headers.get('subject', '')
+                        # Match
+                        if target_mid and mid == target_mid:
+                            pass
+                        elif target_from:
+                            if target_from not in from_raw_txt.lower():
+                                continue
+                            if target_subj and target_subj not in subj_txt.lower():
+                                continue
+                        else:
+                            continue
+                        # Build result
+                        from_name = ''
+                        from_email = from_raw_txt
+                        if '<' in from_raw_txt and '>' in from_raw_txt:
+                            from_name = from_raw_txt[:from_raw_txt.index('<')].strip().strip('"')
+                            from_email = from_raw_txt[from_raw_txt.index('<')+1:from_raw_txt.index('>')]
+                        date_display = headers.get('date', '')
+                        try:
+                            from email.utils import parsedate_to_datetime
+                            dt = parsedate_to_datetime(date_display)
+                            date_display = dt.strftime('%d.%m.%Y %H:%M')
+                        except Exception:
+                            pass
+                        if len(body) > 5000:
+                            body = body[:5000] + '\n\n[... gekuerzt, ' + str(len(body)) + ' Zeichen gesamt]'
+                        return jsonify({
+                            'ok': True,
+                            'from_name': from_name, 'from_email': from_email,
+                            'to': headers.get('to', ''), 'cc': headers.get('cc', ''),
+                            'subject': subj_txt, 'date': date_display,
+                            'message_id': mid, 'body': body, 'file': fname,
+                        })
+                    with open(fpath, 'r', errors='replace') as f:
+                        msg = _email_mod.message_from_file(f)
+                    mid = msg.get('Message-ID', '').strip()
+                    if target_mid and mid == target_mid:
+                        pass
+                    elif target_from:
+                        from_raw = _dec(msg.get('From', '')).lower()
+                        subj_raw = _dec(msg.get('Subject', '')).lower()
+                        if target_from not in from_raw:
+                            continue
+                        if target_subj and target_subj not in subj_raw:
+                            continue
+                    else:
+                        continue
+
+                    from_raw = _dec(msg.get('From', ''))
+                    from_name = ''
+                    from_email = from_raw
+                    if '<' in from_raw and '>' in from_raw:
+                        from_name = from_raw[:from_raw.index('<')].strip().strip('"')
+                        from_email = from_raw[from_raw.index('<')+1:from_raw.index('>')]
+
+                    date_display = ''
+                    try:
+                        from email.utils import parsedate_to_datetime
+                        dt = parsedate_to_datetime(msg.get('Date', ''))
+                        date_display = dt.strftime('%d.%m.%Y %H:%M')
+                    except Exception:
+                        date_display = (msg.get('Date', '') or '')[:30]
+
+                    body = _get_body(msg)
+                    if len(body) > 5000:
+                        body = body[:5000] + '\n\n[... gekuerzt, ' + str(len(body)) + ' Zeichen gesamt]'
+
+                    return jsonify({
+                        'ok': True,
+                        'from_name': from_name,
+                        'from_email': from_email,
+                        'to': _dec(msg.get('To', '')),
+                        'cc': _dec(msg.get('Cc', '')),
+                        'subject': _dec(msg.get('Subject', '')),
+                        'date': date_display,
+                        'message_id': mid,
+                        'body': body,
+                        'file': fname,
+                    })
+                except Exception:
+                    continue
+        except Exception:
+            continue
+
+    return jsonify({'ok': False, 'error': 'E-Mail nicht gefunden'})
+
+
 @app.route('/send_whatsapp_draft', methods=['POST'])
 def send_whatsapp_draft_route():
     session_id = request.json.get('session_id', 'default') if request.is_json else 'default'
@@ -6335,7 +7328,9 @@ def process_single_message(msg, kontext_override=None, state=None, **kwargs):
                 print(f"deep_search fallback error: {e}")
 
     # Check for sub-agent delegation (requires user confirmation)
-    if state['agent'] and not kwargs.get('skip_delegation'):
+    # Skip delegation check when email reply context is active
+    _skip_deleg = kwargs.get('skip_delegation') or msg.startswith('[E-MAIL KONTEXT:')
+    if state['agent'] and not _skip_deleg:
         deleg_info = detect_delegation(msg, state['agent'])
         if deleg_info:
             import uuid as _deleg_uuid
@@ -6505,13 +7500,17 @@ def process_single_message(msg, kontext_override=None, state=None, **kwargs):
                     i = idx + 1
             return results
 
-        # Parse CREATE_EMAIL
+        # Parse CREATE_EMAIL (but not CREATE_EMAIL_REPLY)
         email_prefix = '[CREATE_EMAIL:'
         ei = 0
         while ei < len(text):
             eidx = text.find(email_prefix, ei)
             if eidx == -1:
                 break
+            # Skip if this is actually CREATE_EMAIL_REPLY
+            if text[eidx:eidx+len('[CREATE_EMAIL_REPLY:')] == '[CREATE_EMAIL_REPLY:':
+                ei = eidx + 1
+                continue
             jstart = eidx + len(email_prefix)
             depth = 0
             j = jstart
@@ -6554,6 +7553,54 @@ def process_single_message(msg, kontext_override=None, state=None, **kwargs):
             else:
                 ei = eidx + 1
 
+        # Parse CREATE_EMAIL_REPLY
+        er_prefix = '[CREATE_EMAIL_REPLY:'
+        eri = 0
+        while eri < len(text):
+            eridx = text.find(er_prefix, eri)
+            if eridx == -1:
+                break
+            erjstart = eridx + len(er_prefix)
+            depth = 0
+            erj = erjstart
+            erjend = -1
+            erin_str = False
+            eresc = False
+            while erj < len(text):
+                erc = text[erj]
+                if eresc:
+                    eresc = False
+                elif erc == '\\':
+                    eresc = True
+                elif erc == '"' and not eresc:
+                    erin_str = not erin_str
+                elif not erin_str:
+                    if erc == '{':
+                        depth += 1
+                    elif erc == '}':
+                        depth -= 1
+                        if depth == 0:
+                            erjend = erj + 1
+                            break
+                erj += 1
+            if erjend != -1 and erjend < len(text) and text[erjend] == ']':
+                full_block = text[eridx:erjend+1]
+                json_str = text[erjstart:erjend]
+                spec = {}
+                try:
+                    spec = json.loads(json_str)
+                    send_email_reply(spec)
+                    created_emails.append({'ok': True, 'subject': spec.get('subject',''), 'to': spec.get('to',''), 'body': spec.get('body',''), 'reply': True})
+                    marker = f'\n[E-Mail-Reply an {spec.get("to","")} erstellt — Aktion ausgefuehrt]\n'
+                    text = text[:eridx] + marker + text[erjend+1:]
+                    eri = eridx + len(marker)
+                except Exception as ere:
+                    created_emails.append({'ok': False, 'subject': spec.get('subject',''), 'to': '', 'error': str(ere), 'body': spec.get('body',''), 'reply': True})
+                    marker = '\n[E-Mail-Reply fehlgeschlagen]\n'
+                    text = text[:eridx] + marker + text[erjend+1:]
+                    eri = eridx + len(marker)
+            else:
+                eri = eridx + 1
 
         # Parse CREATE_WHATSAPP
         created_whatsapps = []
@@ -6719,14 +7766,18 @@ def process_single_message(msg, kontext_override=None, state=None, **kwargs):
             vid_prompt = m.group(1).strip().rstrip(']')
             _vid_task_id = task_create('video', _task_session_id, estimated_total=180)
             try:
-                fname, fpath = generate_video(
+                fname, fpath, _vid_aspect = generate_video(
                     vid_prompt, state['agent'] or 'standard',
                     state.get('provider', 'anthropic'),
                     task_id=_vid_task_id,
                 )
+                # Detect portrait: API aspect OR prompt keywords
+                _portrait_kws = ['9:16', 'portrait', 'hochformat', 'vertical', 'senkrecht', 'vertikal', 'tiktok', 'reels', 'shorts']
+                _is_portrait = (_vid_aspect == '9:16') or any(kw in vid_prompt.lower() for kw in _portrait_kws)
                 created_videos.append({
                     'filename': fname, 'path': fpath,
                     'prompt': vid_prompt[:100], 'task_id': _vid_task_id,
+                    'is_portrait': _is_portrait,
                 })
                 text = text[:m.start()] + f'\n\n*Video erfolgreich generiert: {fname}. Das Video wird unten angezeigt.*' + text[m.end():]
             except Exception as ve:
@@ -7524,7 +8575,11 @@ def search_preview():
                 'is_notification': is_notif,
             })
         # Sort: from_person first, then highest score, then newest date
-        items.sort(key=lambda x: (not x.get('from_person'), -x['score'], x.get('date','') or '0'), reverse=False)
+        if search_type == 'email':
+            # For email searches: sort by date desc (newest first)
+            items.sort(key=lambda x: x.get('date','') or '', reverse=True)
+        else:
+            items.sort(key=lambda x: (not x.get('from_person'), -x['score'], x.get('date','') or '0'), reverse=False)
         return jsonify({
             'ok': True,
             'results': items,
