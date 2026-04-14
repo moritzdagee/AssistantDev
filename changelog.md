@@ -6,7 +6,32 @@ Format: [Datum] Änderung | Datei | Grund
 
 ## 2026-04-14
 
-### Docs: API Reference, OpenAPI Spec, Git Workflow
+### Global Search Index aufgebaut
+- `GlobalSearchIndex` via `search_engine.py` CLI ausgefuehrt
+- **110.555 Dateien indexiert** in 1480s (~24.7 min), 116 MB Datei
+- Location: `~/Library/Mobile Documents/com~apple~CloudDocs/Downloads shared/.global_search_index.json` (auf Downloads-shared-Ebene, NICHT in claude_datalake/ — so im Code definiert)
+- Verteilung: global=46.288, email_inbox=21.117, privat=29.655, signicat=10.926, trustedcarrier=2.569
+- Unblocked: globale Suche ueber alle Agenten via `/global_search_preview` Route
+
+### Debug-Investigation: E-Mail Reply-Suche "sebastian + Follow" liefert []
+- **Gemeldetes Symptom:** UI findet keine E-Mail fuer Von=sebastian, Betreff=Follow.
+  Erwartet wurde "RE: Follow-up: Neue SOW-Version fuer Ikano" von sebastian.schroeder@ikano.de.
+- **Root Cause:** Kein Bug. Die gesuchte E-Mail existiert nicht im Memory.
+  - Alle 35+ Dateien mit `sebastian_schroeder@ikano.de` im signicat/memory-Ordner tragen
+    einheitlich den Betreff `RE: Signicat - Question regarding IDV for recovery process`.
+  - Volltext-grep ueber signicat/memory nach `SOW-Version` liefert 0 Treffer in .txt/.eml
+    (nur Referenzen in `conversations.json` / `memories.json`).
+  - Eine E-Mail mit Betreff `Follow*` von einem `sebastian*` Absender existiert in keinem Agenten.
+- **Such-Logik (web_server.py `/api/email-search`) bereits korrekt:**
+  - Sub-Agent-Routing: `get_agent_speicher()` mappt `signicat_outbound` → `signicat/memory` (OK)
+  - Content-Matching: `_parse_txt_email` liest Von:/Betreff:/Datum:/An: aus Datei-Inhalt (OK)
+  - Case-insensitive via `.lower()`, partial match via `in` (OK)
+  - Response enthaelt Von, Betreff, Datum, Message-ID, Dateiname (OK)
+- **Verifikation live:**
+  - `?agent=signicat&from=sebastian` → 8 Treffer (alle mit Subject "Re: Signicat - Question...")
+  - `?agent=signicat&subject=Ikano` → 8 Treffer (Laura Moisi / Simonas Vyšniūnas "Re: New Ikano Bank SOW")
+  - `?agent=signicat&from=sebastian&subject=Follow` → `[]` (korrekt, existiert nicht)
+- **Keine Code-Aenderung**, kein Deploy, kein Backup noetig.
 - `docs/API_REFERENCE.md`: Menschenlesbare Dokumentation aller 12 `/api/*` Routes (Parameter, Response-Format, Konventionen)
 - `docs/openapi.yaml`: Maschinenlesbare OpenAPI 3.0 Spec fuer Tooling-Integration (Swagger UI, Postman, Codegen)
 - `docs/GIT_WORKFLOW.md`: Branch-Strategie definiert
@@ -23,6 +48,21 @@ Format: [Datum] Änderung | Datei | Grund
 - Assistant.app neu gestartet mit neuem Code, orphaned watcher-Prozesse gekillt
 - Finaler Zustand: **je genau 1 Prozess pro Watcher** (beide aus ~/AssistantDev/src/ via LaunchAgent)
 - Dateien: `src/app.py`, deployed zu `/Applications/Assistant.app/Contents/Resources/app.py`
+
+### Contact Name-Mismatch Fix (macOS AddressBook)
+- **Problem:** 97 Kontakte mit Namen, die zu keiner ihrer E-Mail-Adressen passen (z.B. `Gotberg Paul (Innovalue) ← verena.hinrichs@me.com`, `Arne Hassel (Barclays) ← sean.walsh@marketsgroup.org`). Ursache unklar — vermutl. Apple Mail Auto-Save mit vertauschten Headers.
+- **Scanner:** NFD-normalisierter Fuzzy-Match pro Kontakt (Name-Tokens vs. E-Mail-Local-Part + Org-vs-Domain). De-dup ueber 5 Source-DBs.
+  - Report: `claude_outputs/contact_namemismatch_20260414_v2.json` + `contact_namemismatch_review_20260414.md`
+- **Fix-Regel (User-Entscheidung):** Bei allen KRITISCH-Faellen wird `ZFIRSTNAME=""`, `ZLASTNAME=<email>`, `ZORGANIZATION=<domain>` gesetzt — macht Kontakt self-consistent, keine Loeschung.
+- **Angewendet:**
+  - 97 Kontakte umbenannt (61 in A42FFC88, 36 in EF91BA64)
+  - 14 E-Mail-Eintraege aus PARTIELL-Kontakten entfernt (nur NO-E-Mails, OK-Adressen + Kontakte bleiben)
+  - `ZMODIFICATIONDATE` aktualisiert → iCloud-Sync triggert automatisch
+- **Backups:**
+  - `Sources/A42FFC88.../AddressBook-v22.abcddb.backup_20260414_135523`
+  - `Sources/EF91BA64.../AddressBook-v22.abcddb.backup_20260414_135523`
+- **Details-Log:** `claude_outputs/contact_fix_applied_20260414.md`
+- **User-Action noetig:** Contacts.app und Mail.app einmal neu starten, damit UI-Cache aktualisiert und iCloud-Sync durchlaeuft.
 
 ### Contact Mismatch Praeventiv-Check (Zukunftssicherung)
 - **Analyse:** User-Aufgabe beschrieb "hunderte E-Mails pro Kontakt" — trifft auf aktuelles Datenmodell nicht zu.
