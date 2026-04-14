@@ -6,6 +6,16 @@ Format: [Datum] Änderung | Datei | Grund
 
 ## 2026-04-14
 
+### Docs: API Reference, OpenAPI Spec, Git Workflow
+- `docs/API_REFERENCE.md`: Menschenlesbare Dokumentation aller 12 `/api/*` Routes (Parameter, Response-Format, Konventionen)
+- `docs/openapi.yaml`: Maschinenlesbare OpenAPI 3.0 Spec fuer Tooling-Integration (Swagger UI, Postman, Codegen)
+- `docs/GIT_WORKFLOW.md`: Branch-Strategie definiert
+  * main = stable, develop = Arbeits-Basis, Working Tree permanent auf develop
+  * Releases: develop → main via `--no-ff` Merge + Tag
+  * Hotfixes: hotfix/* → main → Cherry-Pick in develop (nie Reverse-Merge)
+  * Deploy-Flow dokumentiert (web_server via App-Bundle, watcher via LaunchAgent)
+- Globaler Search-Index wird aufgebaut (`.global_search_index.json`, im Hintergrund)
+
 ### Fix: Rogue email_watcher/kchat_watcher Respawn eliminiert
 - **Root Cause gefunden:** `src/app.py` (Menu-Bar-App) registrierte email_watcher und kchat_watcher als Services, die vom Watchdog alle 15s respawnt wurden
 - Gleichzeitige LaunchAgents (com.moritz.emailwatcher, com.assistantdev.kchat_watcher) starteten dieselben Skripte → doppelte Prozesse mit Race-Conditions
