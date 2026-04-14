@@ -143,11 +143,13 @@ class AssistantApp(rumps.App):
     def __init__(self):
         super().__init__("Assistant", icon=None, title="\U0001F916", quit_button=None)
 
+        # HINWEIS: Email Watcher und kChat Watcher laufen als LaunchAgents
+        # (~/Library/LaunchAgents/com.moritz.emailwatcher.plist /
+        # com.assistantdev.kchat_watcher.plist) — NICHT mehr durch die App starten,
+        # sonst Race-Conditions und doppelte Verarbeitung.
         self.services = [
             Service("Web Server", "web_server.py", port=8080),
-            Service("Email Watcher", "email_watcher.py"),
             Service("Web Clipper", "web_clipper_server.py", port=8081),
-            Service("kChat Watcher", "kchat_watcher.py"),
             Service("Message Dashboard", "message_dashboard.py", is_gui=True, auto_restart=False),
         ]
 
