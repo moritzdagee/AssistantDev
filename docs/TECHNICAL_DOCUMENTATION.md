@@ -672,3 +672,88 @@ JavaScript im Python-HTML-Template: ES6 Unicode-Escapes (`\u{1F310}`) verursache
 - [ ] Rate Limit bei Anthropic erhoehen
 - [ ] Web Clipper Bookmarklet reaktivieren auf Port 8081
 - [ ] Message Queue Plan fertigstellen (Plan liegt vor)
+
+---
+
+## 13. Services (Stand 2026-04-14)
+
+Alle aktiven Python-Services, Daemons und ihre Konfiguration:
+
+| Service | Datei | Port | LaunchAgent | Status |
+|---|---|---|---|---|
+| web_server | `src/web_server.py` | 8080 | ❌ (manueller Start) | RUNNING via `/Applications/Assistant.app/` |
+| web_clipper_server | `src/web_clipper_server.py` | 8081 | ❌ | RUNNING via `src/` |
+| email_watcher | `src/email_watcher.py` | — | ✅ `com.moritz.emailwatcher.plist` | RUNNING |
+| kchat_watcher | `src/kchat_watcher.py` | — | ✅ `com.assistantdev.kchat_watcher.plist` | RUNNING |
+| calendar-export | `scripts/export_calendar.py` | — | ✅ `com.assistantdev.calendar-export.plist` | RUNNING (cron) |
+| message_dashboard | `src/message_dashboard.py` | — | ❌ | nicht aktiv |
+| app (Menu Bar) | `src/app.py` | — | ❌ | nicht aktiv (py2app) |
+| sent_mail_exporter | `src/sent_mail_exporter.py` | — | ❌ | on-demand |
+| rename_existing_emails | `src/rename_existing_emails.py` | — | ❌ | one-off |
+
+**Ports:**
+- `8080`: Web Server (Haupt-UI)
+- `8081`: Web Clipper Server (Chrome Extension)
+
+---
+
+## 14. Bekannte Probleme
+
+### 14.1 email_watcher Mehrfach-Instanz-Problem
+**Symptom:** Mehrere email_watcher.py Prozesse laufen parallel, davon manche aus `/Applications/Assistant.app/Contents/Resources/` (alte Version vom App-Bundle), andere aus `~/AssistantDev/src/` (aktuelle Dev-Version).
+
+**Ursache:** LaunchAgent zeigt auf `src/` (ist korrekt), aber zusaetzlich wurde in der Vergangenheit manuell ein Prozess aus dem App-Bundle gestartet, der nie beendet wurde.
+
+**Impact:** Potenzielle E-Mail-Duplikate in Memory wenn beide Prozesse dieselbe Nachricht verarbeiten (dedupe via PROCESSED_LOG verhindert das meist, aber nicht garantiert bei Race Conditions).
+
+**Fix:** Nicht-LaunchAgent-Instanzen killen:
+```
+ps aux | grep email_watcher | grep -v grep
+kill <PID>  # fuer jeden nicht-LaunchAgent-Prozess
+```
+
+### 14.2 Global Search Index fehlt
+`.global_search_index.json` existiert nicht im BASE-Verzeichnis. Die globale Suche ueber Agenten muss derzeit sequenziell durch die pro-Agent-Indizes iterieren.
+
+### 14.3 Access Control Datei fehlt
+`BASE/config/access_control.json` existiert nicht. Es gibt aktuell keine formelle Zugriffskontrolle auf Agent-Ebene — alle Agenten sind fuer alle Sessions zugaenglich.
+
+---
+
+## 15. Datalake Struktur (Stand 2026-04-14)
+
+Nach Cleanup mit `memory/attachments/` Unterordner:
+
+| Agent | .eml | .txt | .json | attachments/ | contacts | search_index |
+|---|---|---|---|---|---|---|
+| privat | 197 | 21.784 | 5 | 287 | 3 | 15 MB, 15.507 Eintraege |
+| signicat | 224 | 3.187 | 23 | 1.367 | 96 | 2.9 MB, 2.508 Eintraege |
+| standard | 0 | 255 | 1 | 54 | 28 | 328 KB, 270 Eintraege |
+| trustedcarrier | 7 | 548 | 6 | 73 | 5 | 304 KB, 317 Eintraege |
+
+**Global:**
+- `~/.emailwatcher_processed.json`: 2.1 MB, 21.113 Eintraege
+- `BASE/config/email_processed_log.json`: Dual-Write Mirror (wird bei naechstem watcher-Save angelegt)
+- `BASE/config/access_control.json`: nicht vorhanden (Phase 2 Arbeitspaket)
+
+**Cleanup-Regel:**
+- Memory/ enthaelt nur `.eml`, `.txt`, `.json`
+- Memory/attachments/ enthaelt alles andere (PDFs, Bilder, Office-Dokumente, UUID-Dateien)
+
+---
+
+## 16. Disaster Recovery
+
+### email_watcher Dual-Write (seit 2026-04-14)
+
+Der email_watcher.py schreibt den Processed-Log jetzt dual:
+- **Primary:** `~/.emailwatcher_processed.json` (lokal, schnell, LaunchAgent-kompatibel)
+- **Mirror:** `BASE/config/email_processed_log.json` (iCloud, Recovery)
+
+**Recovery-Fall:** Bei Verlust der lokalen Datei (Neuaufsetzen, Home-Reset) laedt `load_processed()` automatisch aus dem iCloud-Mirror und gibt im Log aus:
+```
+[WATCHER] Recovered processed log from iCloud mirror (N entries)
+```
+
+**Implementierung:** Siehe `src/email_watcher.py` Zeilen 33-35, 141-172.
+
