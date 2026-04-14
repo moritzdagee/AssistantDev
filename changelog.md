@@ -6,6 +6,31 @@ Format: [Datum] Änderung | Datei | Grund
 
 ## 2026-04-14
 
+### Fix: Rogue email_watcher/kchat_watcher Respawn eliminiert
+- **Root Cause gefunden:** `src/app.py` (Menu-Bar-App) registrierte email_watcher und kchat_watcher als Services, die vom Watchdog alle 15s respawnt wurden
+- Gleichzeitige LaunchAgents (com.moritz.emailwatcher, com.assistantdev.kchat_watcher) starteten dieselben Skripte → doppelte Prozesse mit Race-Conditions
+- **Fix:** Email Watcher + kChat Watcher aus der `self.services` Liste in `app.py` entfernt (LaunchAgents sind authoritativ)
+- Assistant.app neu gestartet mit neuem Code, orphaned watcher-Prozesse gekillt
+- Finaler Zustand: **je genau 1 Prozess pro Watcher** (beide aus ~/AssistantDev/src/ via LaunchAgent)
+- Dateien: `src/app.py`, deployed zu `/Applications/Assistant.app/Contents/Resources/app.py`
+
+### Contact Mismatch Praeventiv-Check (Zukunftssicherung)
+- **Analyse:** User-Aufgabe beschrieb "hunderte E-Mails pro Kontakt" — trifft auf aktuelles Datenmodell nicht zu.
+  - Agent-contacts.json (privat/signicat/standard/trustedcarrier, 133 Kontakte total) sind 1:1 Name→Email; keine Listen, keine eigenen E-Mails bei fremden Kontakten, 0 kritische Mismatches.
+  - macOS AddressBook (3947 Kontakte, 2382 E-Mails) ist nach `fix_contacts_pollution.py` (2026-04-09) sauber: Sebastian Schroeder Z_PK=238 hat 1 E-Mail (vorher 64). Kein "Bernhard Heinrich" Kontakt existiert.
+  - Fazit: keine Bereinigung noetig, `email_watcher.py` ruft `update_contacts_json` bereits nur fuer `not is_own(contact)` auf — Blacklist besteht.
+- **Hardening:**
+  - `src/email_watcher.py`: Fallback-Liste in `get_own_addresses()` erweitert um 5 fehlende Adressen (moritz@brandshare.me, cremer.moritz@gmx.de, family.cremer@gmail.com, moritz.cremer@trustedcarrier.de, naiaraebertz@gmail.com).
+  - `~/.emailwatcher_own_addresses.json` um dieselben Adressen ergaenzt (backup .backup_*).
+- **Neu: `scripts/contact_watchdog.py`** — taegliche Pruefung beider Quellen, read-only.
+  - macOS AddressBook: warnt bei Kontakten mit ≥5 E-Mails aus ≥3 Domains.
+  - Agent contacts.json: warnt bei eigenen E-Mails unter fremdem Namen.
+  - Schreibt Warnung nach `claude_outputs/contact_watchdog_warning_YYYYMMDD.txt` NUR bei Fund.
+  - Erstrun 2026-04-14: 4 Warnungen (Bitbond/Yalwa-Mitarbeiter mit Mehrfachadressen, eigener Moritz-Cremer-Eintrag) — alles plausibel, keine Action noetig.
+- **LaunchAgent `com.assistantdev.contactwatchdog`** — 09:00 daily, Log `logs/contact_watchdog.log`, geladen und aktiv.
+- Backups: `src/email_watcher.py` in `backups/2026-04-14_12-59-14/`
+- Dateien: `src/email_watcher.py`, `scripts/contact_watchdog.py` (neu), `~/Library/LaunchAgents/com.assistantdev.contactwatchdog.plist` (neu)
+
 ### Architektur-Audit Phase 2 — Access Control UI, Watcher-Konsolidierung, setup.sh, Recovery-Test
 - **Aufgabe 1: Access Control Web UI**
   - `BASE/config/access_control.json` angelegt mit 9 Agenten (privat, signicat, signicat_lamp, signicat_meddpicc, signicat_outbound, signicat_powerpoint, system ward, trustedcarrier, trustedcarrier_instagramm)
