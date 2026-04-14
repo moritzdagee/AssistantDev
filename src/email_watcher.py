@@ -31,6 +31,8 @@ DEFAULT_AGENT = "standard"
 
 # Processed log lives in HOME folder - avoids iCloud permission issues with LaunchAgent
 PROCESSED_LOG = os.path.expanduser("~/.emailwatcher_processed.json")
+# Dual-write mirror in iCloud datalake (for recovery if local is lost)
+PROCESSED_LOG_MIRROR = os.path.join(BASE, "config", "email_processed_log.json")
 OWN_ADDRS_CACHE = os.path.expanduser("~/.emailwatcher_own_addresses.json")
 
 ROUTING = [
@@ -139,18 +141,40 @@ def decode_str(s):
 # ── Processed-Log ────────────────────────────────────────────────────────────
 
 def load_processed():
+    # Primary: local log
     if os.path.exists(PROCESSED_LOG):
         try:
             with open(PROCESSED_LOG) as f:
-                return set(json.load(f))
+                data = json.load(f)
+                if data:
+                    return set(data)
         except Exception:
-            return set()
+            pass
+    # Fallback: iCloud mirror
+    if os.path.exists(PROCESSED_LOG_MIRROR):
+        try:
+            with open(PROCESSED_LOG_MIRROR) as f:
+                data = json.load(f)
+                if data:
+                    print(f'[WATCHER] Recovered processed log from iCloud mirror ({len(data)} entries)', flush=True)
+                    return set(data)
+        except Exception:
+            pass
     return set()
 
 
 def save_processed(processed):
+    data = list(processed)
+    # Primary: local
     with open(PROCESSED_LOG, 'w') as f:
-        json.dump(list(processed), f)
+        json.dump(data, f)
+    # Mirror: iCloud (best-effort, don't fail on error)
+    try:
+        os.makedirs(os.path.dirname(PROCESSED_LOG_MIRROR), exist_ok=True)
+        with open(PROCESSED_LOG_MIRROR, 'w') as f:
+            json.dump(data, f)
+    except Exception as e:
+        print(f'[WATCHER] Warning: mirror write failed: {e}', flush=True)
 
 # ── Routing ──────────────────────────────────────────────────────────────────
 
