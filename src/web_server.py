@@ -35,6 +35,64 @@ import requests
 from flask import Flask, request, jsonify, render_template_string
 from bs4 import BeautifulSoup
 
+# ─── IMAGE HELPERS ───────────────────────────────────────────────────────────
+# Anthropic API limitiert Bild-Dimensionen auf max. 8000 px pro Seite.
+# Groessere Bilder muessen vor dem Senden herunterskaliert werden.
+ANTHROPIC_MAX_IMAGE_DIM = 8000
+_IMAGE_SAFE_DIM = 7900  # kleine Sicherheits-Reserve
+
+
+def downscale_image_b64_if_needed(b64_data, media_type):
+    """Nimmt base64-kodierte Bilddaten und skaliert herunter, falls eine
+    Seite > ANTHROPIC_MAX_IMAGE_DIM. Gibt (neues_b64, neuer_media_type) zurueck.
+    Bei nicht noetiger Skalierung: Original-Daten zurueck.
+    Bei Decode-Fehlern: (None, None) — Caller verwirft das Bild, damit
+    Anthropic die Anfrage nicht wegen Dimensions-Verstoss ablehnt.
+    """
+    if not b64_data:
+        return b64_data, media_type
+    try:
+        import base64 as _b64
+        from PIL import Image as _PILImage, ImageFile as _PILImageFile
+        import io as _io
+
+        _PILImage.MAX_IMAGE_PIXELS = None
+        _PILImageFile.LOAD_TRUNCATED_IMAGES = True
+
+        raw = _b64.b64decode(b64_data)
+        img = _PILImage.open(_io.BytesIO(raw))
+        w, h = img.size
+        if w <= ANTHROPIC_MAX_IMAGE_DIM and h <= ANTHROPIC_MAX_IMAGE_DIM:
+            return b64_data, media_type
+
+        img.thumbnail((_IMAGE_SAFE_DIM, _IMAGE_SAFE_DIM), _PILImage.LANCZOS)
+
+        fmt_map = {
+            'image/png': ('PNG', 'image/png'),
+            'image/jpeg': ('JPEG', 'image/jpeg'),
+            'image/jpg': ('JPEG', 'image/jpeg'),
+            'image/webp': ('WEBP', 'image/webp'),
+            'image/gif': ('PNG', 'image/png'),  # GIF -> PNG nach Resize
+        }
+        out_fmt, out_mime = fmt_map.get((media_type or '').lower(), ('PNG', 'image/png'))
+
+        if out_fmt == 'JPEG' and img.mode in ('RGBA', 'LA', 'P'):
+            img = img.convert('RGB')
+
+        buf = _io.BytesIO()
+        save_kwargs = {}
+        if out_fmt == 'JPEG':
+            save_kwargs['quality'] = 90
+            save_kwargs['optimize'] = True
+        img.save(buf, format=out_fmt, **save_kwargs)
+        new_b64 = _b64.b64encode(buf.getvalue()).decode('utf-8')
+        print(f"[IMG-RESIZE] {w}x{h} -> {img.size[0]}x{img.size[1]} ({media_type} -> {out_mime})", flush=True)
+        return new_b64, out_mime
+    except Exception as _img_ex:
+        print(f"[IMG-RESIZE] Fehler beim Downscalen, Bild wird verworfen: {_img_ex}", flush=True)
+        return None, None
+
+
 # ─── FILE CREATION HELPERS ───────────────────────────────────────────────────
 
 OUTPUT_DIR = os.path.join(os.path.expanduser("~/Library/Mobile Documents/com~apple~CloudDocs/Downloads shared"), "claude_outputs")
@@ -391,8 +449,42 @@ _recover_pending_markers()
 
 # ─── PROVIDER ADAPTERS ────────────────────────────────────────────────────────
 
+def _sanitize_anthropic_images(messages):
+    """Walk message list und downscale alle base64-Bilder, die die
+    Anthropic-Dimensions-Grenze (8000 px) ueberschreiten. Mutiert die
+    Strukturen in-place, damit gecachte Session-Verlaeufe ebenfalls
+    dauerhaft korrigiert sind. Bilder, die nicht herunterskaliert werden
+    koennen (Decode-Fehler / Decompression-Bomb), werden entfernt, damit
+    die gesamte Anfrage nicht 400't.
+    """
+    for msg in messages:
+        content = msg.get('content')
+        if not isinstance(content, list):
+            continue
+        kept = []
+        for part in content:
+            if not isinstance(part, dict) or part.get('type') != 'image':
+                kept.append(part)
+                continue
+            source = part.get('source') or {}
+            if source.get('type') != 'base64':
+                kept.append(part)
+                continue
+            new_b64, new_mime = downscale_image_b64_if_needed(
+                source.get('data'), source.get('media_type')
+            )
+            if not new_b64:
+                print("[IMG-SANITIZE] Oversize-Bild entfernt (Anthropic-Limit 8000 px)", flush=True)
+                continue
+            source['data'] = new_b64
+            source['media_type'] = new_mime
+            kept.append(part)
+        msg['content'] = kept
+
+
 def call_anthropic(api_key, model_id, system_prompt, messages):
     from anthropic import Anthropic
+    _sanitize_anthropic_images(messages)
     client = Anthropic(api_key=api_key)
     r = client.messages.create(model=model_id, max_tokens=4096, system=system_prompt, messages=messages)
     return r.content[0].text
@@ -1735,8 +1827,42 @@ cleanup_agent_files()
 
 # ─── PROVIDER ADAPTERS ────────────────────────────────────────────────────────
 
+def _sanitize_anthropic_images(messages):
+    """Walk message list und downscale alle base64-Bilder, die die
+    Anthropic-Dimensions-Grenze (8000 px) ueberschreiten. Mutiert die
+    Strukturen in-place, damit gecachte Session-Verlaeufe ebenfalls
+    dauerhaft korrigiert sind. Bilder, die nicht herunterskaliert werden
+    koennen (Decode-Fehler / Decompression-Bomb), werden entfernt, damit
+    die gesamte Anfrage nicht 400't.
+    """
+    for msg in messages:
+        content = msg.get('content')
+        if not isinstance(content, list):
+            continue
+        kept = []
+        for part in content:
+            if not isinstance(part, dict) or part.get('type') != 'image':
+                kept.append(part)
+                continue
+            source = part.get('source') or {}
+            if source.get('type') != 'base64':
+                kept.append(part)
+                continue
+            new_b64, new_mime = downscale_image_b64_if_needed(
+                source.get('data'), source.get('media_type')
+            )
+            if not new_b64:
+                print("[IMG-SANITIZE] Oversize-Bild entfernt (Anthropic-Limit 8000 px)", flush=True)
+                continue
+            source['data'] = new_b64
+            source['media_type'] = new_mime
+            kept.append(part)
+        msg['content'] = kept
+
+
 def call_anthropic(api_key, model_id, system_prompt, messages):
     from anthropic import Anthropic
+    _sanitize_anthropic_images(messages)
     client = Anthropic(api_key=api_key)
     r = client.messages.create(model=model_id, max_tokens=4096, system=system_prompt, messages=messages)
     return r.content[0].text
@@ -7740,9 +7866,16 @@ def process_single_message(msg, kontext_override=None, state=None, **kwargs):
     if image_items and provider_key == 'anthropic':
         user_content = []
         for img in image_items:
+            safe_b64, safe_mime = downscale_image_b64_if_needed(img.get('image_b64'), img.get('image_type'))
+            if not safe_b64:
+                print(f"[IMG] Oversize-Bild '{img.get('name','?')}' wird nicht gesendet", flush=True)
+                continue
+            if safe_b64 is not img.get('image_b64'):
+                img['image_b64'] = safe_b64
+                img['image_type'] = safe_mime
             user_content.append({
                 'type': 'image',
-                'source': {'type': 'base64', 'media_type': img['image_type'], 'data': img['image_b64']}
+                'source': {'type': 'base64', 'media_type': safe_mime, 'data': safe_b64}
             })
         user_content.append({'type': 'text', 'text': full_text})
     else:
@@ -9071,6 +9204,10 @@ def load_selected_files():
                     img_data = base64.b64encode(f.read()).decode('utf-8')
                 mime = {'png': 'image/png', 'jpg': 'image/jpeg', 'jpeg': 'image/jpeg',
                         'gif': 'image/gif', 'webp': 'image/webp'}.get(ext.lstrip('.'), 'image/png')
+                img_data, mime = downscale_image_b64_if_needed(img_data, mime)
+                if not img_data:
+                    print(f"[IMG] Oversize-Screenshot '{fname}' uebersprungen", flush=True)
+                    continue
                 state['kontext_items'].append({
                     'name': fname,
                     'content': '[Screenshot]',
@@ -9131,6 +9268,9 @@ def add_file():
         if is_image:
             import base64
             b64 = base64.b64encode(raw).decode('utf-8')
+            b64, image_type = downscale_image_b64_if_needed(b64, image_type)
+            if not b64:
+                return jsonify({'ok': False, 'error': f"Bild '{filename}' konnte nicht verarbeitet werden (zu gross oder beschaedigt)"})
             # Store as image item - will be sent as vision content
             state['kontext_items'].append({
                 'name': filename,

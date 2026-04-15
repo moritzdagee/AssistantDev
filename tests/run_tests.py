@@ -1814,6 +1814,71 @@ test("status.sh prueft kchat_watcher.py",
      "kchat_watcher.py" in _status_sh)
 
 
+section("Image Downscaling fuer Anthropic API 2026-04-15")
+
+# web_server.py muss Helper fuer Anthropic 8000px-Limit definieren
+test("downscale_image_b64_if_needed Helper vorhanden",
+     "def downscale_image_b64_if_needed" in _ws_src)
+
+test("_sanitize_anthropic_images Helper vorhanden",
+     "def _sanitize_anthropic_images" in _ws_src)
+
+test("ANTHROPIC_MAX_IMAGE_DIM Konstante definiert",
+     "ANTHROPIC_MAX_IMAGE_DIM" in _ws_src and "8000" in _ws_src)
+
+test("call_anthropic ruft _sanitize_anthropic_images",
+     _ws_src.count("_sanitize_anthropic_images(messages)") >= 1)
+
+test("load_selected_files nutzt downscale_image_b64_if_needed",
+     _ws_src.count("downscale_image_b64_if_needed") >= 3)
+
+# Funktionaler Test: 9000x9000 Bild muss auf <=8000 skaliert werden
+try:
+    import sys as _fn_sys, base64 as _fn_b64, io as _fn_io
+    _fn_sys.path.insert(0, os.path.expanduser("~/AssistantDev/src"))
+    from web_server import downscale_image_b64_if_needed as _dfn
+    from PIL import Image as _TestImage
+    _big = _TestImage.new('RGB', (9000, 9000), (10, 20, 30))
+    _buf = _fn_io.BytesIO(); _big.save(_buf, 'PNG')
+    _in_b64 = _fn_b64.b64encode(_buf.getvalue()).decode()
+    _out_b64, _out_mime = _dfn(_in_b64, 'image/png')
+    _out_img = _TestImage.open(_fn_io.BytesIO(_fn_b64.b64decode(_out_b64)))
+    test("Oversize 9000x9000 wird auf <=8000 skaliert",
+         max(_out_img.size) <= 8000 and _out_b64 != _in_b64)
+
+    # Kleine Bilder bleiben unveraendert
+    _small = _TestImage.new('RGB', (400, 400), (5, 5, 5))
+    _sbuf = _fn_io.BytesIO(); _small.save(_sbuf, 'PNG')
+    _small_b64 = _fn_b64.b64encode(_sbuf.getvalue()).decode()
+    _res_b64, _res_mime = _dfn(_small_b64, 'image/png')
+    test("Kleines Bild wird nicht veraendert",
+         _res_b64 == _small_b64 and _res_mime == 'image/png')
+
+    # Decode-Fehler: ungueltiges b64 -> (None, None) statt Original
+    _bad_b64, _bad_mime = _dfn("nicht-ein-bild!!!", 'image/png')
+    test("Nicht dekodierbares Bild wird mit (None, None) verworfen",
+         _bad_b64 is None and _bad_mime is None)
+except Exception as _img_test_ex:
+    test("Oversize 9000x9000 wird auf <=8000 skaliert", False, str(_img_test_ex))
+
+# _sanitize_anthropic_images muss kaputte Bilder aus content rausfiltern
+try:
+    from web_server import _sanitize_anthropic_images as _san
+    _msgs = [{'role': 'user', 'content': [
+        {'type': 'text', 'text': 'hi'},
+        {'type': 'image', 'source': {'type': 'base64',
+                                     'media_type': 'image/png',
+                                     'data': 'kaputt!!!'}},
+    ]}]
+    _san(_msgs)
+    _parts = _msgs[0]['content']
+    test("_sanitize_anthropic_images entfernt nicht-dekodierbare Bilder",
+         len(_parts) == 1 and _parts[0].get('type') == 'text')
+except Exception as _san_ex:
+    test("_sanitize_anthropic_images entfernt nicht-dekodierbare Bilder",
+         False, str(_san_ex))
+
+
 # ============================================================
 # ERGEBNIS
 # ============================================================
