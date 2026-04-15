@@ -21,6 +21,9 @@ import logging
 from datetime import datetime
 
 import rumps
+import setproctitle
+
+setproctitle.setproctitle("AssistantDev MenuBar")
 
 # ── Pfade ────────────────────────────────────────────────────────────────────
 
@@ -210,6 +213,28 @@ class AssistantApp(rumps.App):
             callback=self._open_web,
         ))
         self.menu.add(rumps.separator)
+
+        # --- System & Docs Submenu ---
+        sys_menu = rumps.MenuItem("\u2699 System & Docs")
+        sys_menu.add(rumps.MenuItem(
+            "\U0001F4CB Changelog",
+            callback=self._open_changelog,
+        ))
+        sys_menu.add(rumps.MenuItem(
+            "\U0001F4D6 Technische Docs",
+            callback=self._open_docs,
+        ))
+        sys_menu.add(rumps.MenuItem(
+            "\U0001F510 Memory-Berechtigungen",
+            callback=self._open_permissions,
+        ))
+        sys_menu.add(rumps.MenuItem(
+            "\u26A1 System-Status",
+            callback=self._open_admin,
+        ))
+        self.menu.add(sys_menu)
+
+        self.menu.add(rumps.separator)
         self.menu.add(rumps.MenuItem(
             "\u21BB Restart All Services",
             callback=self._restart_all,
@@ -298,6 +323,18 @@ class AssistantApp(rumps.App):
 
     def _open_web(self, _):
         subprocess.Popen(["open", "http://localhost:8080"])
+
+    def _open_admin(self, _):
+        subprocess.Popen(["open", "http://localhost:8080/admin"])
+
+    def _open_changelog(self, _):
+        subprocess.Popen(["open", "http://localhost:8080/admin/changelog"])
+
+    def _open_docs(self, _):
+        subprocess.Popen(["open", "http://localhost:8080/admin/docs"])
+
+    def _open_permissions(self, _):
+        subprocess.Popen(["open", "http://localhost:8080/admin/permissions"])
 
     def _restart_all(self, _):
         def do_restart():

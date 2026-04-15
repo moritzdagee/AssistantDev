@@ -1,0 +1,126 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<style>
+  body { width:260px; font-family:Inter,-apple-system,sans-serif; background:#1a1a1a; color:#e0e0e0; padding:16px; margin:0; font-size:13px; }
+  h2 { margin:0 0 12px; font-size:15px; color:#fff; }
+  .row { display:flex; justify-content:space-between; align-items:center; margin-bottom:8px; }
+  .label { color:#aaa; }
+  .value { color:#fff; font-weight:600; }
+  .status-dot { display:inline-block; width:8px; height:8px; border-radius:50%; margin-right:6px; }
+  .status-dot.active { background:#4caf50; }
+  .status-dot.paused { background:#ff9800; }
+  .status-dot.off { background:#666; }
+  select { background:#2a2a2a; color:#e0e0e0; border:1px solid #444; border-radius:4px; padding:4px 8px; font-size:12px; }
+  .btn-row { display:flex; gap:8px; margin-top:12px; }
+  button { flex:1; padding:8px; border:none; border-radius:6px; font-size:12px; font-weight:600; cursor:pointer; font-family:inherit; }
+  .btn-sync { background:#2563eb; color:#fff; }
+  .btn-sync:hover { background:#1d4ed8; }
+  .btn-pause { background:#333; color:#ccc; }
+  .btn-pause:hover { background:#444; }
+  hr { border:none; border-top:1px solid #333; margin:10px 0; }
+</style>
+</head>
+<body>
+<h2>💬 WhatsApp Watcher</h2>
+
+<div class="row">
+  <span class="label">Agent:</span>
+  <select id="agent-select"></select>
+</div>
+
+<div class="row">
+  <span class="label">Status:</span>
+  <span class="value"><span class="status-dot active" id="status-dot"></span><span id="status-text">Aktiv</span></span>
+</div>
+
+<div class="row">
+  <span class="label">Letzter Sync:</span>
+  <span class="value" id="last-sync">–</span>
+</div>
+
+<div class="row">
+  <span class="label">Heute synchronisiert:</span>
+  <span class="value" id="today-count">0</span>
+</div>
+
+<hr>
+
+<div class="btn-row">
+  <button class="btn-sync" id="btn-sync">Sync jetzt</button>
+  <button class="btn-pause" id="btn-pause">Pause</button>
+</div>
+
+<script>
+async function init() {
+  // Load agents from server
+  try {
+    const r = await fetch('http://localhost:8081/agents');
+    const d = await r.json();
+    const sel = document.getElementById('agent-select');
+    (d.agents || []).forEach(a => {
+      const opt = document.createElement('option');
+      opt.value = a; opt.textContent = a;
+      sel.appendChild(opt);
+    });
+    const stored = await chrome.storage.local.get(['agent']);
+    if (stored.agent) sel.value = stored.agent;
+    sel.onchange = () => chrome.storage.local.set({ agent: sel.value });
+  } catch(e) {
+    document.getElementById('agent-select').innerHTML = '<option>privat</option>';
+  }
+
+  // Load state
+  const state = await chrome.storage.local.get(['lastSync', 'todayCount', 'paused']);
+  if (state.lastSync) {
+    const d = new Date(state.lastSync);
+    document.getElementById('last-sync').textContent = d.toLocaleTimeString('de-DE', {hour:'2-digit',minute:'2-digit'});
+  }
+  document.getElementById('today-count').textContent = (state.todayCount || 0) + ' Nachrichten';
+
+  const paused = !!state.paused;
+  updatePauseUI(paused);
+
+  // Sync button
+  document.getElementById('btn-sync').onclick = async () => {
+    const tabs = await chrome.tabs.query({ url: 'https://web.whatsapp.com/*' });
+    if (tabs.length > 0) {
+      chrome.tabs.sendMessage(tabs[0].id, { action: 'syncNow' });
+      document.getElementById('btn-sync').textContent = '✓ Gesendet';
+      setTimeout(() => { document.getElementById('btn-sync').textContent = 'Sync jetzt'; }, 1500);
+    }
+  };
+
+  // Pause button
+  document.getElementById('btn-pause').onclick = async () => {
+    const s = await chrome.storage.local.get(['paused']);
+    const newPaused = !s.paused;
+    await chrome.storage.local.set({ paused: newPaused });
+    updatePauseUI(newPaused);
+    const tabs = await chrome.tabs.query({ url: 'https://web.whatsapp.com/*' });
+    if (tabs.length > 0) {
+      chrome.tabs.sendMessage(tabs[0].id, { action: newPaused ? 'pause' : 'resume' });
+    }
+  };
+}
+
+function updatePauseUI(paused) {
+  const dot = document.getElementById('status-dot');
+  const txt = document.getElementById('status-text');
+  const btn = document.getElementById('btn-pause');
+  if (paused) {
+    dot.className = 'status-dot paused';
+    txt.textContent = 'Pausiert';
+    btn.textContent = 'Fortsetzen';
+  } else {
+    dot.className = 'status-dot active';
+    txt.textContent = 'Aktiv';
+    btn.textContent = 'Pause';
+  }
+}
+
+init();
+</script>
+</body>
+</html>

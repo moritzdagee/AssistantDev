@@ -4,7 +4,149 @@ Format: [Datum] Änderung | Datei | Grund
 
 ---
 
+## 2026-04-15
+
+### Fix: Contacts-Pollution an der Wurzel — Source-side Prevention + macOS Auto-Population aus
+- **Problem:** Email Watcher und Contact-Extractor uebernahmen From-Header-Namen ungeprueft als Kontakt-Name; macOS contactsd/suggestd injizierte zusaetzlich Mail-Sender als Vorschlag in alle Account-Sources (iCloud/Exchange/Google/CardDAV). Folge: fremde Namen ("Sebastian Schroeder", "Maivika") landeten auf bestehenden Kontakten und sogar der My Card.
+- **Root-Cause:** Name aus `From:` wurde uebernommen, auch wenn die E-Mail-Adresse einem anderen Kontakt gehoerte. macOS-Auto-Population schrieb zusaetzlich eigene Vorschlaege upstream.
+- **Fix-Teil 1 (Code, Source-side):**
+  - `scripts/extract_contacts.py`: `OWN_EMAILS`-Filter in `stage1_scan()` — Mails von eigenen Adressen werden uebersprungen (verhindert My-Card-Pollution beim vCard-Import). Neue Helper `_name_tokens`, `name_matches_email`, `is_strict_name_extension`. From-Namen die nicht zur Mailadresse passen werden verworfen; existierende Namen werden NUR durch echte Erweiterungen ersetzt. Auch Haiku-extrahierte Namen (Stage 2) werden gegen die Mailadresse validiert.
+  - `src/email_watcher.py`: Identische Validierung in `update_contacts_json()` — From-Name wird verworfen wenn Tokens nicht im Local-Part vorkommen; Replacement nur bei strikter Erweiterung.
+- **Fix-Teil 2 (Settings, Upstream):**
+  - `scripts/disable_macos_contacts_autopop.sh` (neu): setzt `com.apple.suggestd` und `com.apple.AddressBook` defaults, oeffnet relevante Settings-Panes (Contacts → "Show Contacts found in Mail" abschalten; Apple Intelligence & Siri → Suggestions fuer Mail/Contacts abschalten), startet `suggestd`/`contactsd` neu.
+- **Backups:** `backups/2026-04-15_07-44-19/` (email_watcher.py, extract_contacts.py)
+- **Verifikation:** `python3 ~/AssistantDev/scripts/contact_watchdog.py` taeglich — sollte ab jetzt keine neuen Pollution-Faelle melden.
+
+### Feature: Dedizierte Memory Management UI
+- **Neue Route `GET /memory`** in `src/web_server.py`: Eigenstaendige Seite zum Durchsuchen und Verwalten von Agent-Memories
+  - Agent-Selector (Dropdown) mit allen bekannten Agenten inkl. Sub-Agenten
+  - Sektion "Working Memory": Liste geladener Files (Name, Prioritaet, Beschreibung, Hinzugefuegt-Datum, Entfernen-Button)
+  - Sektion "Alle Memory-Files": Tabelle aller Dateien im Memory-Verzeichnis (Name, Groesse, Mtime, Vorschau-Button)
+  - Dateisuche mit Autocomplete (nutzt `/api/memory-files-search`)
+  - Volltextsuche-Modal (nutzt `/api/memory/search`)
+  - Dunkles Theme passend zum Admin-Bereich, Vanilla JS, kein Styling-Konflikt
+- **Neue Route `GET /api/memory/list/<agent>`**: JSON-API fuer alle Memory-Files eines Agenten (Dateiname, Groesse, Mtime, Preview)
+- **Tray-Link aktualisiert** (`src/tray_app.py`): `_open_memory` zeigt jetzt auf `/memory` statt `/`
+- **11 neue Tests** in `tests/run_tests.py` (Sektion "Memory UI 2026-04-15"): HTTP 200, Content-Type, Titel, keine Agent-Modal, JS-Funktionen, Selector, Suche
+- **Backups:** `backups/2026-04-15_07-37-56/`
+- **Tests:** 237/238 bestanden (1 vorbestehender Fehler: `/find` im HTML). Alle neuen Tests gruen.
+
+### Fix: /select_agent Race Condition + Recovery-Load + Draft-Persistence
+- **Problem:** Agent-Wechsel via `/select_agent` zerstoerte laufende Sessions — `state['verlauf']=[]` bei jedem Klick, neue `konversation_*.txt` angelegt, auch bei Re-Klick desselben Agents. Bei Agent-Wechsel waehrend laufendem LLM-Call: Race Condition, alte Datei bleibt mit Pending-Marker stehen.
+- **Fix 1 — Processing Guard (`src/web_server.py`):** `/select_agent` prueft `state.get('processing')` und gibt Fehler-JSON zurueck wenn ein LLM-Call laeuft. Kein Agent-Wechsel moeglich waehrend Antwort generiert wird.
+- **Fix 2 — Re-Klick Guard:** Wenn derselbe Agent nochmal gewaehlt wird (`name == state.get('agent')`): kein Reset, kein neuer Dateiname, kein leerer Verlauf — nur System-Prompt-Update und aktuelle Daten zurueckgeben.
+- **Fix 3 — Session-Save vor Wechsel:** `auto_save_session(session_id)` wird defensiv aufgerufen bevor der State auf den neuen Agent umgebaut wird.
+- **Fix 4 — Recovery-Load (`find_latest_konversation`):** Statt immer leeren Verlauf: sucht die juengste `konversation_*.txt` vom heutigen Tag im Speicher-Verzeichnis des neuen Agents. Falls gefunden: parsed sie via `parse_konversation_file()` und laed den Verlauf in den State. Frontend rendert `recovered_messages` aus der Response.
+- **Fix 5 — Draft-Persistence (Frontend):** `localStorage.setItem('draft_' + agentName, text)` bei jedem Input-Event. Beim Agent-Load: Draft aus localStorage zurueckholen. Nach erfolgreichem Send: Draft loeschen.
+- **Neue Helper:** `parse_konversation_file(pfad)` und `find_latest_konversation(speicher, name)` als wiederverwendbare Funktionen extrahiert.
+- **Tests:** 8 neue Tests in Sektion "Agent-Switch Session Protection 2026-04-15" (226/227 gruen, 1 pre-existing fail).
+- **Backups:** `backups/2026-04-15_07-32-03/src/web_server.py`
+
+### Fix: Graceful Shutdown + Write-Through fuer Konversationen
+- **Problem:** Bei `pkill -f web_server.py` gingen Teile aktiver Konversationen verloren — der Auto-Save schrieb erst NACH der vollstaendigen LLM-Antwort. Wurde der Prozess waehrend eines laufenden LLM-Calls beendet, fehlten die letzte Nutzer-Nachricht und die Antwort.
+- **Write-Through mit Pending-Marker (`src/web_server.py`):** Sobald eine Nutzer-Nachricht eingeht, wird sie zusammen mit einem Pending-Marker (`[ANTWORT AUSSTEHEND - Server-Neustart hat diese Antwort unterbrochen]`) sofort in die `konversation_*.txt` geschrieben — BEVOR der LLM-Call startet. Nach Abschluss des LLM-Calls wird der Marker durch die echte Antwort ersetzt. Im schlimmsten Fall (SIGKILL) bleibt die Nutzer-Nachricht erhalten, nur die Antwort fehlt.
+- **Graceful Shutdown Handler:** `signal.SIGTERM` wird abgefangen. Neue Requests werden sofort mit HTTP 503 abgelehnt. Laufende Requests werden bis zu 30 Sekunden abgewartet. Danach werden alle Sessions gesichert und der Prozess sauber beendet. Globaler `_shutdown_event` (threading.Event) + `_active_requests`-Zaehler mit Lock.
+- **Recovery beim Neustart:** Beim Start scannt `_recover_pending_markers()` alle `konversation_*.txt` in allen Agent-Verzeichnissen. Pending-Marker werden durch `[Antwort verloren - Server wurde neu gestartet]` ersetzt, damit der Nutzer sieht was passiert ist.
+- **Neues Script `scripts/deploy.sh`:** Graceful-Deployment-Script. Kopiert Source-Dateien → sendet SIGTERM → wartet bis zu 35s auf sauberes Ende (Fallback: SIGKILL) → startet App neu → Healthcheck via curl.
+- **Backups:** `backups/2026-04-15_07-15-11/src/web_server.py`
+- **Tests:** 218/219 bestanden (1 vorbestehender Fehler: `/find` im HTML — nicht durch diese Aenderung verursacht). Syntax-Check OK. Hauptroute HTTP 200, Server erreichbar.
+
+### Feature: AssistantDev System Tray App — Status-Dashboard, Services, Docs, API-Docs Route
+- **Neue Datei `src/tray_app.py`**: Vollstaendige System Tray App mit pystray/Pillow
+  - Programmatische Icon-Generierung (normal/warn/error) je nach Service-Status
+  - Hintergrund-Status-Checks alle 30s (Web Server, Web Clipper, Email Watcher)
+  - Menue: Dashboard, Services (mit Restart/Toggle), Dokumentation, Komponenten & Pfade
+  - Service-Aktionen: Web Server/Clipper neu starten, Email Watcher starten/stoppen
+- **Neue Route `/api/docs`** in `src/web_server.py`: Auto-generierte API-Dokumentation
+  - Listet alle registrierten Flask-Routen mit Methoden und Docstrings
+  - Dunkles Theme passend zum Admin-Bereich, letztes Update aus changelog.md
+- **LaunchAgent `com.assistantdev.tray.plist`**: Auto-Start bei Login, KeepAlive
+- Backup: backups/2026-04-15_07-26-10/
+
+### Feature: Working Memory System — persistentes Agent-Gedaechtnis
+- **Neue Funktion `load_working_memory(agent_name)`** in `src/web_server.py`:
+  - Liest `[agent]/working_memory/_manifest.json` und laedt alle gelisteten Markdown-Dateien
+  - Token-Zaehlung (len/4), Auto-Cleanup bei Ueberschreitung (niedrige Prioritaet zuerst raus)
+  - Formatierter Block `--- WORKING MEMORY ---` wird zwischen Base-Prompt und GEDAECHTNIS eingefuegt
+- **Neue Verwaltungsfunktionen:** `working_memory_add()`, `working_memory_remove()`, `working_memory_list()`
+- **Agent-seitige Commands** (geparst in `process_single_message()`):
+  - `WORKING_MEMORY_ADD: {"filename": "...", "content": "...", "priority": 1-10, "description": "..."}`
+  - `WORKING_MEMORY_REMOVE: {"filename": "..."}`
+  - `WORKING_MEMORY_LIST: {}`
+- **REST API:** `POST /api/working-memory/<agent>` mit actions: add, remove, list
+- **System Prompt Ergaenzung:** `## WORKING MEMORY` Abschnitt an alle 9 Agent-Definitionen in `config/agents/*.txt` angehaengt
+- **Dateipfad:** `claude_datalake/[agent]/working_memory/` mit `_manifest.json` fuer Metadaten
+- **Tests bestanden:** System Prompt Integration, API add/remove/list, Auto-Cleanup, Command-Parsing, Server Health
+
+### Admin-Bereich + Menu Bar System-Submenu
+- **4 neue Routen in `src/web_server.py`** (eingefuegt vor `if __name__ == '__main__':` via `/tmp/insert_admin_routes.py`, kein Edit-Tool — wegen duplizierter Bloecke):
+  - `GET /admin` — Dashboard mit System-Status (Web 8080 / Clipper 8081 / Email-Watcher Live-Check via socket+pgrep) und Karten-Navigation zu allen vier Unterbereichen plus dem bestehenden `/admin/access-control`.
+  - `GET /admin/changelog` — Rendert `~/AssistantDev/changelog.md` per Mini-Markdown-Renderer (h1/h2/h3, **bold**, `code`, Listen, Code-Fences, hr). HTML-Escape vor Render gegen XSS aus Changelog-Inhalt. Header zeigt Pfad + Groesse + mtime.
+  - `GET /admin/docs` — Tabelle aller Dateien aus `~/AssistantDev/docs/` (5 Eintraege: API_REFERENCE.md, GIT_WORKFLOW.md, TECHNICAL_DOCUMENTATION.md, openapi.yaml, salesforce_clipper_install.md).
+  - `GET /admin/docs/<filename>` — Rendert .md als HTML, .yaml/.yml/.txt als `<pre>`. **Path-traversal-Schutz**: `os.path.realpath` + Praefix-Check, getestet (`/admin/docs/../../etc/hosts` → 404).
+  - `GET /admin/permissions` — Tabelle aller Agents aus `claude_datalake/config/agents/*.txt`. Klassifiziert in **Parent** (eigener `memory/`-Ordner mit Datei-Count) vs **Sub-Agent** (erbt von Parent via Underscore-Praefix). Zusaetzlich: Liste verwaister Memory-Ordner ohne zugehoerige Agent-Definition (system_dirs wie `config`, `email_inbox`, `claude_outputs` werden gefiltert).
+  - Gemeinsames Dark-Theme via `_admin_layout()` + `_ADMIN_CSS` (gold Headlines, blau Links, Karten-Hover, responsive).
+- **`src/app.py` Menu Bar Erweiterung:** neues Submenu `⚙ System & Docs` zwischen "Open Web Interface" und "Restart All Services" mit 4 Items: `📋 Changelog`, `📖 Technische Docs`, `🔐 Memory-Berechtigungen`, `⚡ System-Status`. Callbacks oeffnen jeweils `http://localhost:8080/admin*` via `subprocess.Popen(["open", url])`.
+- **Backups (Pre-Change):** `src/web_server.py.backup_20260415_065442` (392 KB) und `src/app.py.backup_20260415_065442` (12 KB).
+- **Deployment:** beide Dateien nach `/Applications/Assistant.app/Contents/Resources/` kopiert, Web Server via `pkill -f web_server.py` + `open /Applications/Assistant.app` neu gestartet, Menu Bar via `kill 64316` + `open` neu gestartet (neue PID 68727).
+- **Tests (alle gruen):**
+  - Syntax: `python3 -m py_compile` auf web_server.py + app.py + search_engine.py — OK.
+  - HTTP: `/admin` 200, `/admin/changelog` 200, `/admin/docs` 200, `/admin/docs/API_REFERENCE.md` 200, `/admin/permissions` 200.
+  - Regression: `/` 200, `/agents` 200.
+  - Security: `/admin/docs/../../etc/hosts` → 404, `/admin/docs/nonexistent.md` → 404.
+  - Content-Sanity: Permissions-Seite enthaelt `Parent`, `Sub-Agent`, alle 4 Hauptagents (signicat, privat, trustedcarrier, standard), `verwaist`-Sektion. Changelog-Seite rendert heutige `2026-04-15`-Eintraege.
+
+### macOS Prozessnamen via setproctitle
+- `setproctitle` installiert und in allen vier Hauptprozessen eingebaut
+- `web_server.py` → "AssistantDev WebServer"
+- `web_clipper_server.py` → "AssistantDev WebClipper"
+- `email_watcher.py` → "AssistantDev EmailWatcher"
+- `app.py` → "AssistantDev MenuBar"
+- Prozesse sind jetzt in Activity Monitor und `ps aux` unter ihrem Klarnamen sichtbar statt als generisches "python3"
+
+### Email Watcher Backlog gefixt + LaunchAgent-Permission-Bug entdeckt
+- **Symptom:** Email Watcher Prozess lief seit 1 Tag (PID 45788, 17h Uptime), aber `~/.emailwatcher_processed.json` wurde seit Apr 14 13:02 nicht mehr aktualisiert. 9 .eml Dateien (darunter `2026-04-15_00-31-59_AW_Preisindikation_Signicat.eml`, `2026-04-14_19-35-04_Money_received_from_kyb_group_BV.eml`, 4x Daily digest) waren im Inbox aufgelaufen.
+- **Root Cause:** macOS TCC-Permission-Verlust am LaunchAgent. `~/Library/Logs/emailwatcher.log` enthielt **66.447** Eintraege `Fehler: [Errno 1] Operation not permitted: '.../email_inbox'`. Der LaunchAgent (`com.moritz.emailwatcher.plist`, `/usr/bin/python3 src/email_watcher.py`) hat seit dem letzten Restart keinen iCloud-Drive-Zugriff mehr; der Stub `/usr/bin/python3` (resolved auf Xcode-Python) ist nicht in System Settings → Privacy & Security → Files & Folders → iCloud Drive freigeschaltet. Terminal-Python hingegen erbt Full Disk Access von Terminal selbst → listdir auf email_inbox liefert dort die 21126 Dateien problemlos.
+- **Fix (sofort):**
+  - Backup `~/.emailwatcher_processed.backup_20260415_062238.json` (1.3 MB, 21117 Eintraege).
+  - 9 Backlog-Mails ueber das gleiche `process_eml()` aus `email_watcher.py` aus diesem Terminal-Kontext nachverarbeitet (alle 9 ok, 0 Fehler). Routing korrekt: 5x signicat (Daily digests + AW_Preisindikation), 4x standard.
+  - LaunchAgent gestoppt: `launchctl unload ~/Library/LaunchAgents/com.moritz.emailwatcher.plist`.
+  - Frischer Watcher aus Terminal-Kontext gestartet: `nohup python3 src/email_watcher.py > ~/Library/Logs/emailwatcher_terminal.log 2>&1 &` (PID 67461, 14 MB RSS — gesund vs. dem 3 MB festgefahrenen Vorgaenger).
+  - Verifikation: inbox=21126, processed=21126, missing=0. Search-Index `signicat/.search_index.json` enthaelt jetzt die neuen Eintraege (`Daily_digest_updates_from_Alexis_Bischof-Plunkett`, `Report_results_Global_Solutions_Page_MQLs`).
+- **Fix (langfristig — User-Action erforderlich):**
+  - In **System Settings → Privacy & Security → Files & Folders → iCloud Drive** muss `/usr/bin/python3` (bzw. `/Applications/Xcode.app/Contents/Developer/Library/Frameworks/Python3.framework/Versions/3.9/Resources/Python.app/Contents/MacOS/Python`) freigeschaltet werden, damit der LaunchAgent wieder selbststaendig laeuft. Alternativ: Full Disk Access fuer denselben Binary.
+  - Solange das nicht passiert ist, lebt der Watcher als nohup-Prozess aus dieser Terminal-Session — der ueberlebt das Logout bzw. Reboot **nicht**. Beim naechsten Reboot muss der Watcher manuell aus Terminal neu gestartet werden, oder die Permission ist gefixt und der LaunchAgent wieder aktiviert (`launchctl load ~/Library/LaunchAgents/com.moritz.emailwatcher.plist`).
+- **Verbesserungs-Empfehlung:** Watcher sollte nach z.B. 100 aufeinanderfolgenden `Operation not permitted`-Errors mit lautem Exit (osascript notification) sterben, statt 66k Mal still im KeepAlive-Loop weiterzuwursteln. Zusaetzlich ein Watchdog der `inbox_count - processed_count > N` periodisch prueft.
+- **Sebastian Schroeder Mail vom 15.04.2026:** existiert in keinem Apple-Mail-Export. Weder im Inbox noch in irgendeinem Memory-Ordner ist eine .eml von `sebastian*` mit Datum `2026-04-15` zu finden. Konsistent mit dem Befund vom 14.04.: gesuchte Mail ist nie in der Datenbasis angekommen — entweder hat die Apple-Mail-Regel sie nicht exportiert oder die Mail wurde nie empfangen.
+
 ## 2026-04-14
+
+### Semantic RAG Upgrade (Embeddings + Query Expansion + RRF + Contextual Compression)
+- Neue Sektion "TEIL 4 — SEMANTIC RAG" in `src/search_engine.py` (rein additiv, bestehende Pfade unveraendert).
+- Komponenten:
+  - `EmbeddingIndex` pro Agent: `.embedding_index.json` mit chunk-weisen OpenAI `text-embedding-3-small` Vektoren (1536 dim). Index wird **lazy** aufgebaut — neue Dokumente bekommen sofort ein Embedding via async Hook in `SearchIndex.add_file`, bestehende bleiben unveraendert (Migration via `reindex_embeddings()`).
+  - `_chunk_text`: Paragraph-basiertes Chunking ~500 Tokens mit 50-Token Overlap, kurze Dokumente (<1500 chars) als ein einziger Chunk.
+  - `expand_query(query, speicher, n=2)`: LLM erzeugt 2 alternative Formulierungen ueber das fuer den Agenten konfigurierte Modell (Fallback: Anthropic Haiku aus `config/models.json`). Rueckgabe: `[original, variant1, variant2]`.
+  - `rrf_fuse(lists, k=60, top_n=20)`: Reciprocal Rank Fusion fuer beliebig viele Ergebnis-Listen.
+  - `compress_chunk(chunk, query, speicher)`: LLM extrahiert nur die relevanten Saetze — reduziert Kontext-Noise fuer den Agenten.
+  - `hybrid_rag_search(query, speicher, max_results=5)`: orchestriert expand → parallel Keyword (bestehender `HybridSearch`) + Semantic → RRF → Top-5 Kontext-Kompression. Gibt `{'queries', 'semantic', 'results', 'fallback'}` zurueck.
+- **Backward Compatibility garantiert:** `.search_index.json` und `.global_search_index.json` werden **nicht** veraendert. Alle bestehenden Routen/APIs funktionieren unveraendert. Keine neuen Abhaengigkeiten — nur stdlib (`urllib`, `math`, `json`) plus optional `numpy`.
+- **Graceful Fallback** (wichtig: OpenAI-Key hat `QUOTA_EXCEEDED`-Status):
+  - Embedding-Aufruf bei HTTP 429 / fehlendem Key / Netzwerkfehler → `None`, Pipeline degradiert automatisch auf Keyword-only; `hybrid_rag_search` meldet das via `fallback='embedding_unavailable'` bzw. `'no_embedding_index'`.
+  - Query Expansion bei LLM-Fehler → `[original]`, Retrieval laeuft normal weiter.
+  - Contextual Compression bei LLM-Fehler → gibt den Original-Chunk (auf 1200 chars getrimmt) zurueck.
+- **Tests (alle gruen, 17/17)** in `/tmp/test_rag.py`:
+  1. Chunking: short-text → 1 Chunk, long-text → mehrere Chunks, non-empty.
+  2. RRF: formel-genau verifiziert (`1/61 + 1/62 = 0.032522`), korrekte Reihenfolge.
+  3. Query Expansion: live Anthropic-Call lieferte 3 Queries (`['Finde die Mail von Simonas...', 'Mail Simonas Projekt', 'Nachricht Simona Projektbesprechung']`).
+  4. Config-Loading: `models.json` korrekt gelesen, Keys vorhanden.
+  5. Embedding: OpenAI HTTP 429 → graceful fallback verifiziert (keine Exception, `None` zurueck).
+  6. EmbeddingIndex empty-state: lade/such-Pfade crashen nicht.
+  7. Integration: `hybrid_rag_search` auf leerem Pfad liefert `{semantic:False, results:[], ...}`.
+- **Regression-Test (curl, alle 200):** `/`, `/agents`, `/search_preview` nach Deployment.
+- Geaenderte Dateien: `src/search_engine.py` (2213 → 2862 Zeilen). `web_server.py` wurde **nicht** angefasst — der optionale Reindex-Endpoint wurde bewusst uebersprungen, Reindex ist aber als Python-API via `from search_engine import reindex_embeddings; reindex_embeddings(speicher_path)` verfuegbar.
+- Backup: `backups/2026-04-14_13-56-57/src/search_engine.py` (Pre-Change) sowie `/Applications/Assistant.app/Contents/Resources/search_engine.py.backup_*`.
+- Deployment: `search_engine.py` in App-Bundle kopiert, Server neugestartet (App auto-relaunch via `open /Applications/Assistant.app`).
 
 ### Global Search Index aufgebaut
 - `GlobalSearchIndex` via `search_engine.py` CLI ausgefuehrt
