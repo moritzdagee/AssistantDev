@@ -9309,7 +9309,12 @@ def _admin_layout(title, body_html):
 
 
 def _admin_status_check():
-    """Quick status: web (8080) + clipper (8081) + watcher process."""
+    """Quick status: web (8080) + clipper (8081) + watcher process.
+
+    Matches both the Python-script form (`email_watcher.py`) and the compiled
+    app-bundle binary name (`AssistantDev EmailWatcher`) introduced in 508796a.
+    Without this, services running from the bundle show as offline.
+    """
     import socket
     def port_alive(p):
         try:
@@ -9319,13 +9324,17 @@ def _admin_status_check():
             return False
     web_ok = port_alive(8080)
     clip_ok = port_alive(8081)
-    # Email watcher: presence of process matching email_watcher.py
     import subprocess as _sp
-    try:
-        out = _sp.run(["pgrep", "-f", "email_watcher.py"], capture_output=True, text=True, timeout=2)
-        watcher_ok = bool(out.stdout.strip())
-    except Exception:
-        watcher_ok = False
+    def proc_alive(*patterns):
+        for pat in patterns:
+            try:
+                out = _sp.run(["pgrep", "-f", pat], capture_output=True, text=True, timeout=2)
+                if out.stdout.strip():
+                    return True
+            except Exception:
+                pass
+        return False
+    watcher_ok = proc_alive("email_watcher.py", "AssistantDev EmailWatcher")
     return {"web_8080": web_ok, "clipper_8081": clip_ok, "email_watcher": watcher_ok}
 
 
