@@ -6,6 +6,14 @@ Format: [Datum] Änderung | Datei | Grund
 
 ## 2026-04-15
 
+### Fix: EmailWatcher persistent via echtes App-Bundle + FDA-Grant
+- **Problem:** LaunchAgent `com.moritz.emailwatcher` lief zwar, scheiterte aber mit `Operation not permitted` beim Lesen des iCloud-Ordners `email_inbox/`. Ursache: Das Bundle `~/Applications/EmailWatcher.app/Contents/MacOS/EmailWatcher` war nur ein Bash-Wrapper (`exec /usr/bin/python3 ...`), wodurch der effektive Prozess `python3` wurde — macOS TCC prueft gegen den laufenden Prozess, der FDA-Grant fuer das Bundle blieb wirkungslos.
+- **Fix:** Python-Skript via PyInstaller (`--onefile --hidden-import setproctitle --hidden-import search_engine --paths src`) zu einem standalone arm64 Mach-O Binary (~19 MB) kompiliert. Binary ersetzt den Bash-Wrapper unter `~/Applications/EmailWatcher.app/Contents/MacOS/EmailWatcher`. Bundle ad-hoc signiert (`codesign --force --deep --sign -`). LaunchAgent unload/reload.
+- **Verifikation:** Prozess laeuft als `/Users/moritzcremer/Applications/EmailWatcher.app/Contents/MacOS/EmailWatcher` (kein python3 mehr), Log sauber (kein `Operation not permitted`), `email_inbox/processed/` enthaelt 21148 Eintraege — Ordner lesbar, Watcher persistent.
+- **Dateien:** `~/Applications/EmailWatcher.app/Contents/MacOS/EmailWatcher` (neu: Mach-O arm64), `~/Library/LaunchAgents/com.moritz.emailwatcher.plist` (unveraendert — zeigt bereits auf Bundle-Binary). Build-Artefakte in `build_emailwatcher/` (gitignored).
+- **Abhaengigkeit:** `pyinstaller` ueber `python3 -m pip install --user`. Rebuild-Befehl: `~/Library/Python/3.9/bin/pyinstaller --onefile --name EmailWatcher --hidden-import setproctitle --hidden-import search_engine --paths ~/AssistantDev/src ~/AssistantDev/src/email_watcher.py`.
+- **Operatives:** FDA fuer `EmailWatcher.app` wurde zuvor erteilt; Grant greift jetzt korrekt, weil das Bundle selbst der laufende Prozess ist. Kein erneuter TCC-Prompt beim ersten Binary-Tausch.
+
 ### Feat: Working-Memory-Isolation fuer Sub-Agents
 - **Problem:** Sub-Agents (signicat_lamp, signicat_meddpicc, signicat_outbound, signicat_powerpoint, trustedcarrier_instagramm) teilten sich das Working Memory ihres Parent-Agents, weil `load_working_memory()` via `get_agent_speicher()` fuer Sub-Agents den Parent-Pfad zurueckgab. Folge: jeder Sub sah auch die Dateien der anderen Subs und des Parents — keine Isolation.
 - **Fix (`src/web_server.py`):** Neuer Helper `_get_wm_dir(agent_name)`:
