@@ -143,6 +143,39 @@ pkill -f web_server.py
 ```
 (App startet automatisch neu)
 
+## Entwicklungs-Workflow (PFLICHT)
+
+Historisch wurden Aenderungen an `src/web_server.py` und `src/search_engine.py` ueber
+`patch_*.py`-Skripte in `scripts/` gemacht, die per Text-Suche-und-Ersetzen arbeiten.
+Das ist ab sofort **verboten**. Text-Replacement ist fragil, hat zu JS-Breakage gefuehrt
+und macht Aenderungen nicht nachvollziehbar.
+
+**Regeln:**
+- Alle Aenderungen an `src/web_server.py` und `src/search_engine.py` passieren DIREKT
+  mit dem Edit-Tool im jeweiligen Feature-Branch.
+- NIEMALS neue `patch_*.py`-Skripte in `scripts/` erstellen.
+- NIEMALS Text-Replacement-Skripte schreiben, die Source-Dateien suchen und ersetzen.
+- Vor jeder Aenderung: Feature-Branch via `scripts/new_feature.sh <name>` erstellen.
+- Backup der Datei via `scripts/backup.sh` (wie bisher Pflicht).
+- Aenderungen direkt in `src/web_server.py` bzw. `src/search_engine.py`.
+- Nach Aenderung: Syntax-Check, Tests (`python3 tests/run_tests.py`), Deploy via
+  `scripts/deploy.sh`, Abschluss via `scripts/finish_feature.sh <name>`.
+
+**Ausnahme fuer `web_server.py`:** Die Datei enthaelt duplizierte Blocke
+(Zeilen 1-500 entsprechen ungefaehr 570-1100). Wenn beide Blocke synchron geaendert
+werden muessen, darf ein Python-Skript helfen — aber nur durch **strukturiertes
+Parsen** (AST / Zeilen-Ranges), nicht durch Text-Replacement. Fuer normale Bugfixes
+ist Edit-Tool am richtigen Block erste Wahl.
+
+## Stabilitaets-Tools (Selbsthilfe)
+
+Drei Skripte in `scripts/` ermoeglichen schnelle Diagnose und Recovery ohne Claude:
+
+- `bash scripts/status.sh` — Uebersicht: laufende Prozesse, Ports, Git, letzte Logs, Backups
+- `bash scripts/rollback.sh` — interaktives Rollback auf ein Backup von web_server.py / search_engine.py
+- `scripts/watchdog.sh` — laeuft alle 60s via LaunchAgent `com.assistantdev.watchdog`,
+  startet `web_server.py` automatisch neu bei Ausfall. Log: `logs/watchdog.log`.
+
 ## Git Workflow
 
 Repository: github.com/moritzdagee/AssistantDev (private)
