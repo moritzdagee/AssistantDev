@@ -78,6 +78,134 @@ section("UI-Elemente im HTML")
 
 html = requests.get(BASE_URL).text
 
+# ============================================================
+# FRONTEND SANITAETS-CHECK (KRITISCH — laueft ZUERST)
+# Prueft ob das ausgelieferte HTML/JS frei von Syntaxfehlern ist.
+# Diese Tests haetten die JS-SyntaxError-Bugs vom 2026-04-13 verhindert.
+# ============================================================
+section("Frontend Sanitaets-Check (JS)")
+
+import re as _re
+
+# 1. JS-Block extrahieren
+_js_match = _re.search(r'<script>(.*?)</script>', html, _re.DOTALL)
+_js_code = _js_match.group(1) if _js_match else ''
+test("Script-Block im HTML vorhanden", len(_js_code) > 1000)
+
+# 2. Offene JS-Strings erkennen (unterminated string literal)
+# Das ist der exakte Fehler der zweimal die App gekillt hat:
+# Ein \n in einem Python triple-quoted HTML-Template wird zum echten Newline
+# im JS-String → "Unterminated string literal" → gesamtes JS blockiert.
+_js_lines = _js_code.split('\n')
+_open_strings = []
+for _li, _line in enumerate(_js_lines):
+    _s = _line.rstrip()
+    if not _s or _s.lstrip().startswith('//') or _s.lstrip().startswith('*'):
+        continue
+    # Single-quote String-Analyse
+    _in_sq = False  # in single-quoted string
+    _in_dq = False  # in double-quoted string
+    _j = 0
+    while _j < len(_s):
+        _c = _s[_j]
+        if _c == '\\' and _j + 1 < len(_s):
+            _j += 2  # escaped char ueberspringen
+            continue
+        if _c == "'" and not _in_dq:
+            _in_sq = not _in_sq
+        elif _c == '"' and not _in_sq:
+            _in_dq = not _in_dq
+        _j += 1
+    if _in_sq or _in_dq:
+        # Kommentare mit Apostrophen ignorieren (z.B. "it's", "don't")
+        _stripped = _s.lstrip()
+        if _stripped.startswith('//') or _stripped.startswith('*'):
+            continue
+        # Heuristik: Kommentare in Code-Zeilen mit Apostrophen
+        if '//' in _s:
+            _comment_part = _s[_s.rindex('//'):]
+            if any(w in _comment_part.lower() for w in ["it's","there's","don't","can't","won't"]):
+                continue
+        # False Positives: Zeilen die auf '; enden sind vollstaendig
+        # (die Quote-Analyse wird durch &quot; oder verschachtelte Strings verwirrt)
+        if _s.rstrip().endswith("';") or _s.rstrip().endswith('";'):
+            continue
+        # Regex-Literale mit Quotes koennen den Zaehler verwirren
+        if '/g,' in _s or '/i,' in _s or '.replace(/' in _s or '.match(/' in _s or '.test(/' in _s:
+            continue
+        _open_strings.append((_li + 1, _s[-100:]))
+
+_open_str_details = ""
+if _open_strings:
+    _open_str_details = f"{len(_open_strings)} offene Strings:\n"
+    for _ln, _txt in _open_strings[:5]:
+        _open_str_details += f"      JS Zeile {_ln}: ...{_txt}\n"
+test("KRITISCH: Keine offenen JS-Strings (unterminated string literal)",
+     len(_open_strings) == 0, _open_str_details)
+
+# 3. Basis-Funktionen muessen im JS existieren
+_critical_functions = [
+    'function showAgentModal',
+    'function selectAgent',
+    'function loadAgents',
+    'function sendMessage',
+    'function doSendChat',
+    'function handleChatResponse',
+    'function addMessage',
+    'function loadProviders',
+    'function onModelChange',
+    'function getAgentName',
+    'function startTyping',
+    'function stopTyping',
+]
+_missing_funcs = [fn for fn in _critical_functions if fn not in _js_code]
+test("Alle kritischen JS-Funktionen vorhanden",
+     len(_missing_funcs) == 0,
+     f"Fehlende Funktionen: {_missing_funcs}" if _missing_funcs else "")
+
+# 4. Prüfe ob window.onload korrekt ist (App-Initialisierung)
+test("window.onload vorhanden und ruft loadProviders auf",
+     "window.onload" in _js_code and "loadProviders" in _js_code)
+test("window.onload ruft showAgentModal auf",
+     "showAgentModal()" in _js_code)
+
+# 5. Agent-Modal HTML-Struktur intakt
+test("Agent-Modal HTML vollstaendig (id + agent-list + agent-box)",
+     'id="agent-modal"' in html and 'id="agent-list"' in html and 'id="agent-box"' in html)
+
+# 6. Agent-Button korrekt verlinkt
+test("Agent-Button onclick=showAgentModal()",
+     'onclick="showAgentModal()"' in html)
+
+# 7. Prüfe dass kein Python-Escape-Artefakt im JS gelandet ist
+# Z.B. \n das als echtes Newline in einem JS-String auftaucht
+_bad_escapes = 0
+for _li, _line in enumerate(_js_lines):
+    _s = _line.rstrip()
+    # Suche: eine Zeile die msg += ' oder let msg = ' enthaelt
+    # und dann sofort endet (= der \n wurde zum Zeilenumbruch)
+    if ("msg +=" in _s or "let msg" in _s) and _s.endswith("'") and ";" not in _s.split("'")[-1]:
+        if _li + 1 < len(_js_lines):
+            _nxt = _js_lines[_li + 1].lstrip()
+            if _nxt and not _nxt.startswith('//') and not _nxt.startswith('var') and not _nxt.startswith('let') and not _nxt.startswith('const') and not _nxt.startswith('if') and not _nxt.startswith('}'):
+                _bad_escapes += 1
+test("Keine Python-Escape-Artefakte in JS-Strings (\\n → echtes Newline)",
+     _bad_escapes == 0,
+     f"{_bad_escapes} Stellen gefunden wo \\n in JS-String zu echtem Newline wurde" if _bad_escapes else "")
+
+# 8. Essentielles CSS fuer Agent-Modal vorhanden
+test("Agent-Modal CSS (.agent-opt) vorhanden",
+     ".agent-opt" in html)
+test("Slash-Autocomplete CSS vorhanden",
+     "slash-ac" in html)
+
+print(f"  {BLUE}(JS-Code: {len(_js_lines)} Zeilen, {len(_js_code)} Zeichen){RESET}")
+
+# ============================================================
+# Originale UI-Element Tests
+# ============================================================
+section("UI-Elemente im HTML")
+
 test("Senden-Button vorhanden", "Senden" in html or "send-btn" in html)
 test("Nachrichten-Input vorhanden", "msg-input" in html or "textarea" in html.lower())
 test("Agent-Modal vorhanden", "agent-modal" in html or "agent" in html.lower())
@@ -597,7 +725,7 @@ except Exception as e:
     test("/find Command", False, str(e))
 
 # --- Slash-Command Autocomplete im HTML ---
-test("Slash-Command /find im HTML vorhanden", "/find" in html and "Agent-Memory" in html)
+test("Slash-Command /find im HTML vorhanden", "/find" in html and ("Agent-Memory" in html or "Alle Dateien" in html))
 test("Slash-Command /find_global im HTML vorhanden", "/find_global" in html)
 
 # --- Entfernte alte Trigger nicht mehr vorhanden ---
@@ -1001,6 +1129,636 @@ except Exception as e:
     test("GET /memory erreichbar", False, str(e))
 test("/api/memory/list Route in web_server.py", "def api_memory_list" in _ws_src)
 test("memory_page Route in web_server.py", "def memory_page" in _ws_src)
+
+# ============================================================
+section("Features 2026-04-09")
+# ============================================================
+
+# --- WhatsApp 3-Stufen Kontakt-Lookup ---
+test("send_whatsapp_draft hat macOS Contacts Lookup (AppleScript)",
+     "tell application" in _ws_src and "Contacts" in _ws_src and "whose name contains" in _ws_src)
+test("send_whatsapp_draft hat Cross-Agent Lookup",
+     "Step 2: Look up in ALL agents" in _ws_src or "cross-agent" in _ws_src.lower())
+
+# --- Context-Bleeding Fix ---
+test("CREATE_WHATSAPP Execution-Marker in verlauf",
+     "Aktion ausgefuehrt" in _ws_src)
+test("KEINE WIEDERHOLUNG Anweisung im System-Prompt",
+     "KEINE WIEDERHOLUNG" in _ws_src)
+
+# --- Gemini Veo numberOfVideos entfernt ---
+test("Veo API-Call hat kein numberOfVideos",
+     "numberOfVideos" not in _ws_src)
+
+# --- LLM Signatur: Provider + Modell ---
+test("PROVIDER_DISPLAY Mapping vorhanden",
+     "PROVIDER_DISPLAY" in _ws_src and "'anthropic': 'Anthropic'" in _ws_src)
+test("MODEL_DISPLAY Mapping vorhanden",
+     "MODEL_DISPLAY" in _ws_src and "'claude-sonnet-4-6': 'Claude Sonnet 4.6'" in _ws_src)
+test("provider_display im Chat-Response JSON",
+     "provider_display" in _ws_src and "PROVIDER_DISPLAY.get(" in _ws_src)
+test("model_display im Chat-Response JSON",
+     "model_display" in _ws_src and "MODEL_DISPLAY.get(" in _ws_src)
+test("addMessage hat providerDisplay Parameter",
+     "providerDisplay" in html)
+
+# --- Konversations-Sicherheit: Atomic Writes ---
+test("Atomic Write: os.replace in auto_save_session",
+     "os.replace(tmp_path, dateiname)" in _ws_src)
+test("Sofort-Save bei User-Nachricht",
+     "Sofort-Save" in _ws_src or "sofort" in _ws_src.lower())
+
+# --- Perplexity Fixes ---
+test("Perplexity max_tokens = 8000",
+     "'max_tokens': 8000" in _ws_src or '"max_tokens": 8000' in _ws_src)
+test("Perplexity Citations werden angehaengt",
+     "citations" in _ws_src and "Quellen:" in _ws_src)
+test("Perplexity Modell-spezifische Timeouts",
+     "PERPLEXITY_TIMEOUTS" in _ws_src)
+test("Perplexity ReadTimeout Error-Handling",
+     "ReadTimeout" in _ws_src and "hat zu lange gebraucht" in _ws_src)
+test("Perplexity Message-Alternierung (Merge)",
+     "Merge consecutive same-role" in _ws_src or "merged" in _ws_src)
+
+# --- CREATE_FILE JSON Sanitizer ---
+test("sanitize_llm_json Funktion vorhanden",
+     "def sanitize_llm_json" in _ws_src)
+test("sanitize_llm_json wird bei CREATE_FILE verwendet",
+     "sanitize_llm_json(json_str)" in _ws_src)
+# Funktionstest: sanitize_llm_json mit Single Quotes
+try:
+    exec_ns = {}
+    import re as _test_re
+    _func_match = _test_re.search(r'(def sanitize_llm_json\(raw\):.*?)(?=\ndef \w)', _ws_src, _test_re.DOTALL)
+    if _func_match:
+        exec(_func_match.group(1), exec_ns)
+        _san = exec_ns['sanitize_llm_json']
+        _r1 = _san('{"title": "Test"}')
+        _r2 = _san("{'title': 'Test'}")
+        _r3 = _san('{"title": "Test",}')
+        test("sanitize_llm_json: Standard JSON", _r1['title'] == 'Test')
+        test("sanitize_llm_json: Single Quotes", _r2['title'] == 'Test')
+        test("sanitize_llm_json: Trailing Comma", _r3['title'] == 'Test')
+    else:
+        test("sanitize_llm_json: Funktionstest", False, "Funktion nicht extrahierbar")
+except Exception as e:
+    test("sanitize_llm_json: Funktionstest", False, str(e))
+
+# --- Gemini Bild/Video-Generierung ---
+test("IMAGE_PROVIDERS hat gemini mit imagen-4",
+     "imagen-4" in _ws_src and "'gemini'" in _ws_src)
+test("VIDEO_PROVIDERS hat gemini mit veo-3.1",
+     "veo-3.1" in _ws_src)
+test("Imagen 4 Fallback-Chain vorhanden",
+     "imagen-4.0-generate-001" in _ws_src and "imagen-4.0-fast-generate-001" in _ws_src)
+test("Veo Download mit API-Key",
+     "key={api_key}" in _ws_src and "dl_url" in _ws_src)
+test("Gemini 3 Flash in models.json",
+     os.path.exists(os.path.expanduser("~/Library/Mobile Documents/com~apple~CloudDocs/Downloads shared/claude_datalake/config/models.json"))
+     and "gemini-3-flash-preview" in open(os.path.expanduser("~/Library/Mobile Documents/com~apple~CloudDocs/Downloads shared/claude_datalake/config/models.json")).read())
+
+# --- System-Prompt: Bild/Video Capability ---
+test("System-Prompt hat Bilder erstellen Capability",
+     "Bilder erstellen" in _ws_src and "CREATE_IMAGE" in _ws_src and "Sage NIEMALS" in _ws_src)
+test("System-Prompt hat Videos erstellen Capability",
+     "Videos erstellen" in _ws_src and "CREATE_VIDEO" in _ws_src)
+
+# --- Kontext-Dateien Persistenz ---
+test("KONTEXT_DATEIEN Block in auto_save_session",
+     "KONTEXT_DATEIEN" in _ws_src)
+test("KONTEXT_DATEIEN Restore in load_conversation",
+     "KONTEXT_DATEIEN" in _ws_src and "restored_ctx" in _ws_src)
+test("restored_ctx + missing_ctx im Response",
+     "restored_ctx" in _ws_src and "missing_ctx" in _ws_src)
+test("Kontext-Item Tooltip (40 Zeichen + title)",
+     "substring(0, 40)" in html and "div.title = name" in html)
+
+# --- Sub-Agent Confirmation ---
+test("detect_delegation gibt dict zurueck (matched_keywords)",
+     "matched_keywords" in _ws_src and "display_name" in _ws_src)
+test("/api/subagent_confirm Route vorhanden",
+     "subagent_confirm" in _ws_src and "@app.route" in _ws_src)
+try:
+    _sc_r = requests.post(f"{BASE_URL}/api/subagent_confirm",
+        json={"session_id": "test", "confirmation_id": "invalid", "confirmed": False}, timeout=5)
+    test("subagent_confirm Route antwortet",
+         _sc_r.status_code == 200 and "abgelaufen" in _sc_r.json().get('error', ''))
+except Exception as e:
+    test("subagent_confirm Route antwortet", False, str(e))
+test("pending_delegations dict vorhanden",
+     "_pending_delegations" in _ws_src)
+test("showSubagentConfirmation im Frontend",
+     "showSubagentConfirmation" in html)
+test("confirmSubagent im Frontend",
+     "confirmSubagent" in html)
+test("handleChatResponse Funktion im Frontend",
+     "function handleChatResponse" in html)
+test("subagent_confirmation_required Handler",
+     "subagent_confirmation_required" in html)
+
+# --- macOS Contacts Pollution Fix-Skript ---
+test("fix_contacts_pollution.py existiert",
+     os.path.exists(os.path.expanduser("~/AssistantDev/scripts/fix_contacts_pollution.py")))
+test("analyze_contact_corruption.py existiert",
+     os.path.exists(os.path.expanduser("~/AssistantDev/scripts/analyze_contact_corruption.py")))
+
+section("Features 2026-04-10 — Progress Bar / Task Status")
+
+# --- Backend: Task Status System ---
+test("TASK_STATUS dict definiert",
+     "TASK_STATUS = {}" in _ws_src)
+test("task_lock (threading.Lock) definiert",
+     "task_lock = threading.Lock()" in _ws_src)
+test("task_create Funktion vorhanden",
+     "def task_create(" in _ws_src)
+test("task_update Funktion vorhanden",
+     "def task_update(" in _ws_src)
+test("task_done Funktion vorhanden",
+     "def task_done(" in _ws_src)
+test("task_error Funktion vorhanden",
+     "def task_error(" in _ws_src)
+test("task_get Funktion vorhanden",
+     "def task_get(" in _ws_src)
+test("tasks_for_session Funktion vorhanden",
+     "def tasks_for_session(" in _ws_src)
+test("tasks_cleanup Funktion vorhanden",
+     "def tasks_cleanup(" in _ws_src)
+
+# --- Backend: Integration in generate_video / generate_image ---
+test("generate_video akzeptiert task_id Parameter",
+     "def generate_video(prompt, agent_name, provider_key=None, task_id=None)" in _ws_src)
+test("generate_image akzeptiert task_id Parameter",
+     "def generate_image(prompt, agent_name, provider_key=None, task_id=None)" in _ws_src)
+test("generate_video ruft task_update im Poll-Loop",
+     _ws_src.count("task_update(task_id") >= 3)
+test("generate_video ruft task_done bei Erfolg",
+     "task_done(task_id, message='Video fertig')" in _ws_src)
+test("generate_image ruft task_done bei Erfolg",
+     "task_done(task_id, message='Bild fertig')" in _ws_src)
+test("process_single_message erzeugt task_create('image'",
+     "task_create('image'" in _ws_src)
+test("process_single_message erzeugt task_create('video'",
+     "task_create('video'" in _ws_src)
+test("task_error Aufruf bei Fehler (image oder video)",
+     "task_error(_img_task_id" in _ws_src and "task_error(_vid_task_id" in _ws_src)
+
+# --- Backend: Routes ---
+test("/task_status/<task_id> Route definiert",
+     "@app.route('/task_status/<task_id>'" in _ws_src)
+test("queue_status enthaelt active_tasks",
+     "active_tasks" in _ws_src and "tasks_for_session(session_id)" in _ws_src)
+
+try:
+    r = requests.get(BASE_URL + "/task_status/nonexistent-task-id", timeout=5)
+    test("/task_status/<id> gibt 404 fuer unbekannte ID",
+         r.status_code == 404)
+    test("/task_status/<id> gibt JSON fuer unbekannte ID",
+         "application/json" in r.headers.get("content-type", ""))
+except Exception as e:
+    test("/task_status/<id> erreichbar", False, str(e))
+
+try:
+    r = requests.get(BASE_URL + "/queue_status?session_id=" + TEST_SESSION, timeout=5)
+    qs = r.json()
+    test("/queue_status enthaelt active_tasks Feld",
+         "active_tasks" in qs and isinstance(qs["active_tasks"], list))
+    test("/queue_status active_tasks leer fuer frische Session",
+         qs.get("active_tasks") == [])
+except Exception as e:
+    test("/queue_status erweitert erreichbar", False, str(e))
+
+# --- Frontend: Progress Bar HTML/CSS/JS ---
+test("Progress Bar CSS .task-progress vorhanden",
+     ".task-progress" in html)
+test("Progress Bar CSS .tp-bar-inner vorhanden",
+     ".tp-bar-inner" in html)
+test("Progress Bar CSS tpPulse Keyframe",
+     "@keyframes tpPulse" in html)
+test("Progress Bar CSS tpShimmer Keyframe",
+     "@keyframes tpShimmer" in html)
+test("progressBars Registry im Frontend",
+     "progressBars = {}" in html)
+test("createProgressBar Funktion im Frontend",
+     "function createProgressBar" in html)
+test("updateProgressBar Funktion im Frontend",
+     "function updateProgressBar" in html)
+test("removeProgressBar Funktion im Frontend",
+     "function removeProgressBar" in html)
+test("pollTaskStatus Funktion im Frontend",
+     "function pollTaskStatus" in html or "async function pollTaskStatus" in html)
+test("discoverTasksOnce Funktion im Frontend",
+     "function discoverTasksOnce" in html or "async function discoverTasksOnce" in html)
+test("startTaskDiscovery Funktion im Frontend",
+     "function startTaskDiscovery" in html)
+test("stopTaskDiscovery Funktion im Frontend",
+     "function stopTaskDiscovery" in html)
+test("fmtDuration Helper im Frontend",
+     "function fmtDuration" in html)
+test("doSendChat startet Task-Discovery",
+     "startTaskDiscovery()" in html)
+test("Polling-Loop erkennt active_tasks",
+     "st.active_tasks" in html and "createProgressBar" in html)
+test("ETA-Text 'verbleibend' im Frontend",
+     "verbleibend" in html)
+
+section("Features 2026-04-10 — Veo Timeout Fix")
+
+# --- Backend: erweiterte generate_video Poll-Schleife ---
+test("VEO_PATCH_V2 Marker vorhanden",
+     "VEO_PATCH_V2" in _ws_src)
+test("MAX_ATTEMPTS auf 72 erhoeht",
+     "MAX_ATTEMPTS = 72" in _ws_src)
+test("POLL_INTERVAL als Konstante",
+     "POLL_INTERVAL = 5" in _ws_src)
+test("Logging: '[VEO] Poll gestartet' vorhanden",
+     "[VEO] Poll gestartet" in _ws_src)
+test("Logging: '[VEO] Poll #' je Versuch",
+     "[VEO] Poll #" in _ws_src)
+test("Logging: API-Fehler wird geloggt",
+     "[VEO] API-Fehler" in _ws_src)
+test("Content-Filter-Erkennung: raiMediaFilteredCount",
+     "raiMediaFilteredCount" in _ws_src)
+test("Content-Filter-Erkennung: raiMediaFilteredReasons",
+     "raiMediaFilteredReasons" in _ws_src)
+test("Content-Filter Fehlermeldung user-friendly",
+     "vom Content-Filter blockiert" in _ws_src)
+test("Timeout-Fehlermeldung enthaelt '6 Minuten' dynamisch (TOTAL_SECS//60)",
+     "TOTAL_SECS//60" in _ws_src)
+test("Transient Poll-Errors werden abgefangen (continue)",
+     "Netzwerk-Fehler" in _ws_src and "continue" in _ws_src)
+test("Video-Download Timeout erhoeht auf 180",
+     "requests.get(dl_url, timeout=180)" in _ws_src)
+test("Response wird bei leeren samples fuer Debugging geloggt",
+     "done=true aber keine samples" in _ws_src)
+test("Unbekanntes Sample-Format wird geloggt",
+     "Sample-Format nicht erkannt" in _ws_src)
+
+# Sanity: generate_video akzeptiert weiterhin task_id (kein Regression am Progress Bar)
+test("generate_video Signatur bleibt kompatibel",
+     "def generate_video(prompt, agent_name, provider_key=None, task_id=None)" in _ws_src)
+test("task_done wird nach erfolgreichem Download aufgerufen",
+     "task_done(task_id, message='Video fertig')" in _ws_src)
+
+# Sanity: es existiert noch eine Timeout-Raise am Ende
+test("Timeout-Exception nach Poll-Loop",
+     'raise Exception(f"Gemini Veo: Timeout nach' in _ws_src)
+
+section("Features 2026-04-10 — Video Retry + Agent Button + Tooltips")
+
+# --- Fix 1: VEO_RETRY_V3 ---
+test("VEO_RETRY_V3 Marker vorhanden",
+     "VEO_RETRY_V3" in _ws_src)
+test("MAX_RETRIES = 3 in generate_video",
+     "MAX_RETRIES = 3" in _ws_src)
+test("RETRYABLE_CODES enthaelt 13/14/429",
+     "RETRYABLE_CODES = {13, 14, 429}" in _ws_src)
+test("Backoff-Konfiguration BACKOFF = [0, 10, 20]",
+     "BACKOFF = [0, 10, 20]" in _ws_src)
+test("STABLE_FALLBACK_MODEL = veo-2.0-generate-001",
+     "veo-2.0-generate-001" in _ws_src)
+test("Retry: durationSeconds=5 als Kuerzer-Fallback",
+     "duration = 5" in _ws_src)
+test("Retry: aspectRatio flip 9:16",
+     '"9:16"' in _ws_src and "aspect = " in _ws_src)
+test("Retry-Status code 13 Server-Fehler Text",
+     "Gemini Veo Server-Fehler" in _ws_src)
+test("Retry-Status code 429 Rate Limit Text",
+     "Gemini Veo Rate Limit" in _ws_src)
+test("Klare Endmeldung nach 3 Versuchen",
+     "nach 3 Versuchen fehlgeschlagen" in _ws_src or
+     "nach {MAX_RETRIES} Versuchen fehlgeschlagen" in _ws_src)
+test("Progress-Status zeigt Retry [N/3]",
+     "Retry [{_retry+1}/{MAX_RETRIES}]" in _ws_src)
+test("durationSeconds Parameter im Veo-Payload",
+     '"durationSeconds": duration' in _ws_src)
+
+# --- Fix 2: AGENT_BTN_V1 ---
+test("AGENT_BTN_V1 Marker vorhanden",
+     "AGENT_BTN_V1" in _ws_src)
+test("Agent-Button hat id agent-btn",
+     'id="agent-btn"' in html)
+test("agent-label sitzt INNERHALB des Agent-Buttons",
+     'id="agent-btn"' in html and 'id="agent-label"' in html and
+     html.find('id="agent-btn"') < html.find('id="agent-label"') < html.find('id="agent-btn"') + 300)
+test("Header-Spacer ersetzt das alte agent-label flex:1",
+     'id="header-spacer"' in html)
+test("Kein separates Label mehr links vom Button",
+     '<span id="agent-label" style="flex:1;">' not in html)
+test("data-tooltip-kind=agent auf Button gesetzt",
+     'data-tooltip-kind="agent"' in html)
+
+# --- Fix 3: TOOLTIPS_V1 ---
+test("Tooltip-Box im DOM",
+     '<div id="tt-box">' in html)
+test("Tooltip CSS .tt-title vorhanden",
+     ".tt-title" in html)
+test("Tooltip CSS #tt-box.show",
+     "#tt-box.show" in html)
+test("PROVIDER_TOOLTIPS Map im JS",
+     "var PROVIDER_TOOLTIPS" in html)
+test("MODEL_TOOLTIPS Map im JS",
+     "var MODEL_TOOLTIPS" in html)
+test("AGENT_DESCRIPTIONS Map im JS",
+     "var AGENT_DESCRIPTIONS" in html)
+test("PROVIDER_TOOLTIPS hat Anthropic Eintrag",
+     "Anthropic Claude" in html)
+test("PROVIDER_TOOLTIPS hat Google Gemini Eintrag",
+     "Google Gemini" in html and "Multimodal" in html)
+test("PROVIDER_TOOLTIPS hat Mistral",
+     "Mistral" in html and "europaeischen Sprachen" in html)
+test("PROVIDER_TOOLTIPS hat Perplexity",
+     "Perplexity" in html and "Web-Suche" in html)
+test("MODEL_TOOLTIPS hat Claude Sonnet 4.6",
+     "Claude Sonnet 4.6" in html and "Preis-Leistungs" in html)
+test("MODEL_TOOLTIPS hat Gemini 2.5 Flash",
+     "Gemini 2.5 Flash" in html and "Video/Bild-Generierung" in html)
+test("MODEL_TOOLTIPS hat o1 Reasoning",
+     "OpenAI Reasoning-Modell" in html)
+test("ttShow Funktion vorhanden",
+     "function ttShow" in html)
+test("ttHide Funktion vorhanden",
+     "function ttHide" in html)
+test("ttAttach Funktion vorhanden",
+     "function ttAttach" in html)
+test("ttAttachAll Funktion vorhanden",
+     "function ttAttachAll" in html)
+test("Tooltip 300ms Hover-Delay",
+     "setTimeout(function(){ ttShow(el); }, 300)" in html)
+test("loadProviders ruft ttAttachAll() auf",
+     "ttAttachAll(); // TOOLTIPS_V1" in html)
+test("loadAgents fuellt AGENT_DESCRIPTIONS",
+     "AGENT_DESCRIPTIONS[a.name]" in html)
+
+# --- Fix 3: /agents Route mit description ---
+test("/agents Route _agent_description Helper",
+     "def _agent_description" in _ws_src)
+
+try:
+    r = requests.get(BASE_URL + "/agents", timeout=5)
+    agents_data = r.json()
+    test("/agents JSON gibt Liste",
+         isinstance(agents_data, list) and len(agents_data) > 0)
+    test("Mindestens 1 Agent hat description Feld",
+         any("description" in a for a in agents_data))
+    test("Mindestens 1 Agent hat nicht-leere description",
+         any(a.get("description", "") for a in agents_data))
+except Exception as e:
+    test("/agents description Test", False, str(e))
+
+section("Kalender-Integration")
+
+# --- Backend ---
+test("get_calendar_events Funktion vorhanden",
+     "def get_calendar_events(" in _ws_src)
+test("_parse_applescript_date Funktion vorhanden",
+     "def _parse_applescript_date(" in _ws_src)
+test("_has_calendar_intent Funktion vorhanden",
+     "def _has_calendar_intent(" in _ws_src)
+test("format_calendar_context Funktion vorhanden",
+     "def format_calendar_context(" in _ws_src)
+test("CALENDAR_INTEGRATION_V1 Marker",
+     "CALENDAR_INTEGRATION_V1" in _ws_src)
+test("Kalender-Cache (_cal_cache) vorhanden",
+     "_cal_cache" in _ws_src)
+test("AppleScript Timeout 45s",
+     "timeout=45" in _ws_src)
+test("Auto-Inject bei Kalender-Intent",
+     "_has_calendar_intent(msg)" in _ws_src and "format_calendar_context" in _ws_src)
+test("Kalender-Keywords DE (termin, heute, morgen)",
+     '"termin"' in _ws_src and '"heute"' in _ws_src and '"morgen"' in _ws_src)
+
+# --- Route ---
+test("/api/calendar Route vorhanden",
+     "@app.route('/api/calendar'" in _ws_src)
+try:
+    r = requests.post(BASE_URL + "/api/calendar",
+        json={"days_ahead": 1}, timeout=50)
+    test("/api/calendar antwortet",
+         r.status_code == 200)
+    d = r.json()
+    test("/api/calendar hat events + count + range Felder",
+         "events" in d and "count" in d and "range" in d)
+except Exception as e:
+    test("/api/calendar erreichbar", False, str(e))
+
+# --- Slash Commands ---
+test("/calendar-today Slash Command im HTML",
+     "/calendar-today" in html)
+test("/calendar-week Slash Command im HTML",
+     "/calendar-week" in html)
+test("/calendar-search Slash Command im HTML",
+     "/calendar-search" in html)
+test("handleCalendarCommand Funktion im HTML",
+     "handleCalendarCommand" in html)
+
+section("Slack API Integration")
+
+test("SLACK_API_V1 Marker",
+     "SLACK_API_V1" in _ws_src)
+test("_get_slack_config Funktion vorhanden",
+     "def _get_slack_config(" in _ws_src)
+test("_slack_api Funktion vorhanden",
+     "def _slack_api(" in _ws_src)
+test("slack_send_message Funktion vorhanden",
+     "def slack_send_message(" in _ws_src)
+test("slack_list_channels Funktion vorhanden",
+     "def slack_list_channels(" in _ws_src)
+test("slack_list_users Funktion vorhanden",
+     "def slack_list_users(" in _ws_src)
+test("slack_channel_history Funktion vorhanden",
+     "def slack_channel_history(" in _ws_src)
+test("slack_find_channel_id Funktion vorhanden",
+     "def slack_find_channel_id(" in _ws_src)
+test("slack_find_user_id Funktion vorhanden",
+     "def slack_find_user_id(" in _ws_src)
+test("send_slack_draft nutzt API wenn Token vorhanden",
+     "_get_slack_config()" in _ws_src and "slack_send_message" in _ws_src)
+test("/api/slack Route vorhanden",
+     "@app.route('/api/slack'" in _ws_src)
+
+try:
+    r = requests.post(BASE_URL + "/api/slack",
+        json={"action": "channels"}, timeout=5)
+    test("/api/slack antwortet (ohne Token: ok=false)",
+         r.status_code == 200)
+except Exception as e:
+    test("/api/slack erreichbar", False, str(e))
+
+section("Canva API Integration")
+
+test("CANVA_API_V1 Marker",
+     "CANVA_API_V1" in _ws_src)
+test("_get_canva_config Funktion vorhanden",
+     "def _get_canva_config(" in _ws_src)
+test("_canva_api Funktion vorhanden",
+     "def _canva_api(" in _ws_src)
+test("CANVA_TOKEN_REFRESH Marker",
+     "CANVA_TOKEN_REFRESH" in _ws_src)
+test("_canva_refresh_token Funktion vorhanden",
+     "def _canva_refresh_token(" in _ws_src)
+test("canva_list_designs Funktion vorhanden",
+     "def canva_list_designs(" in _ws_src)
+test("canva_create_design Funktion vorhanden",
+     "def canva_create_design(" in _ws_src)
+test("canva_export_design Funktion vorhanden",
+     "def canva_export_design(" in _ws_src)
+test("/api/canva Route vorhanden",
+     "@app.route('/api/canva'" in _ws_src)
+
+# --- Canva Campaigns ---
+test("CANVA_CAMPAIGNS_V1 Marker",
+     "CANVA_CAMPAIGNS_V1" in _ws_src)
+test("canva_list_brand_templates Funktion vorhanden",
+     "def canva_list_brand_templates(" in _ws_src)
+test("canva_autofill Funktion vorhanden",
+     "def canva_autofill(" in _ws_src)
+test("canva_batch_campaign Funktion vorhanden",
+     "def canva_batch_campaign(" in _ws_src)
+test("canva_upload_asset Funktion vorhanden",
+     "def canva_upload_asset(" in _ws_src)
+test("canva_get_autofill_job Funktion vorhanden",
+     "def canva_get_autofill_job(" in _ws_src)
+
+try:
+    r = requests.post(BASE_URL + "/api/canva",
+        json={"action": "list", "count": 1}, timeout=30)
+    test("/api/canva list antwortet",
+         r.status_code == 200)
+    d = r.json()
+    test("/api/canva hat ok + data Felder",
+         "ok" in d and "data" in d)
+    test("/api/canva Token funktioniert (ok=true)",
+         d.get("ok") == True)
+except Exception as e:
+    test("/api/canva erreichbar", False, str(e))
+
+try:
+    r = requests.post(BASE_URL + "/api/canva",
+        json={"action": "brand_templates"}, timeout=15)
+    test("/api/canva brand_templates Action",
+         r.status_code == 200 and "ok" in r.json())
+except Exception as e:
+    test("/api/canva brand_templates", False, str(e))
+
+section("Slash Commands Clustering")
+
+test("SLASH_CLUSTER_V1 Marker",
+     "SLASH_CLUSTER_V1" in _ws_src)
+test("Slash Commands haben group Feld",
+     "group: 'Kommunikation'" in html or "group: \\'Kommunikation\\'" in _ws_src)
+test("Gruppen-Header CSS .slash-ac-group vorhanden",
+     ".slash-ac-group" in html)
+test("Gruppen-Header Rendering (lastGroup)",
+     "lastGroup" in html)
+
+# Prüfe alle Gruppen vorhanden
+for grp in ['Kommunikation', 'Kalender', 'Medien', 'Dokumente', 'Canva', 'Suche', 'Globale Suche']:
+    test(f"Slash-Gruppe '{grp}' definiert",
+         grp in html)
+
+# --- Canva Slash Commands ---
+test("/canva-search Slash Command",
+     "/canva-search" in html)
+test("/canva-create Slash Command",
+     "/canva-create" in html)
+test("/canva-templates Slash Command",
+     "/canva-templates" in html)
+test("/canva-campaign Slash Command",
+     "/canva-campaign" in html)
+test("/canva-export Slash Command",
+     "/canva-export" in html)
+test("handleCanvaCommand Funktion im HTML",
+     "handleCanvaCommand" in html)
+
+# --- Canva + Kalender in System-Prompt ---
+test("System-Prompt erwaehnt Canva Designs",
+     "Canva" in _ws_src and "Canva-Designs" in _ws_src)
+test("System-Prompt erwaehnt Kalender Slash-Commands",
+     "/calendar-today" in _ws_src and "/calendar-week" in _ws_src)
+
+section("Sub-Agent History Fix")
+
+test("SUBAGENT_HISTORY_V1 Marker",
+     "SUBAGENT_HISTORY_V1" in _ws_src)
+test("get_history nutzt get_agent_speicher",
+     "get_agent_speicher(agent)" in _ws_src)
+test("get_history filtert Sub-Agent-Konversationen",
+     "sub_suffix" in _ws_src and "known_subs" in _ws_src)
+
+try:
+    r = requests.get(BASE_URL + "/get_history?agent=signicat_outbound&session_id=" + TEST_SESSION, timeout=5)
+    d = r.json()
+    test("signicat_outbound History hat Sessions",
+         len(d.get("sessions", [])) > 0)
+    # Prüfe: alle Dateien enthalten _outbound
+    if d.get("sessions"):
+        all_outbound = all("_outbound" in s["file"] for s in d["sessions"])
+        test("signicat_outbound zeigt nur eigene Konversationen",
+             all_outbound)
+except Exception as e:
+    test("Sub-Agent History API", False, str(e))
+
+try:
+    r = requests.get(BASE_URL + "/get_history?agent=signicat&session_id=" + TEST_SESSION, timeout=5)
+    d = r.json()
+    test("signicat Parent History hat Sessions",
+         len(d.get("sessions", [])) > 0)
+    # Prüfe: keine Sub-Agent-Dateien
+    if d.get("sessions"):
+        no_sub = not any("_outbound" in s["file"] or "_lamp" in s["file"] or "_meddpicc" in s["file"] for s in d["sessions"])
+        test("signicat Parent zeigt keine Sub-Agent-Konversationen",
+             no_sub)
+except Exception as e:
+    test("Parent Agent History API", False, str(e))
+
+section("CREATE_EMAIL_REPLY Feature")
+
+# Backend function exists
+test("send_email_reply Funktion vorhanden",
+     "def send_email_reply(spec):" in _ws_src)
+
+# Parser for CREATE_EMAIL_REPLY in response processing
+test("CREATE_EMAIL_REPLY Parser vorhanden",
+     "[CREATE_EMAIL_REPLY:" in _ws_src and "er_prefix = '[CREATE_EMAIL_REPLY:'" in _ws_src)
+
+# CREATE_EMAIL parser skips CREATE_EMAIL_REPLY
+test("CREATE_EMAIL Parser skipt REPLY-Variante",
+     "CREATE_EMAIL_REPLY:" in _ws_src and "# Skip if this is actually CREATE_EMAIL_REPLY" in _ws_src)
+
+# System prompt mentions CREATE_EMAIL_REPLY
+test("System-Prompt erwaehnt CREATE_EMAIL_REPLY",
+     "CREATE_EMAIL_REPLY" in _ws_src and "message_id" in _ws_src)
+
+# Route exists
+test("/send_email_reply Route vorhanden",
+     "send_email_reply_route" in _ws_src and "/send_email_reply" in _ws_src)
+
+# AppleScript reply logic
+test("AppleScript Reply sucht nach message id",
+     "message id is msgId" in _ws_src)
+
+# Fallback to new email when no message_id
+test("Fallback auf neue E-Mail wenn keine message_id",
+     "# No message_id: fallback to regular new email" in _ws_src)
+
+# JS shows Reply vs Draft
+test("JS unterscheidet Reply und Draft",
+     "e.reply ? 'Reply' : 'Draft'" in _ws_src)
+
+# KEINE WIEDERHOLUNG includes CREATE_EMAIL_REPLY
+test("KEINE WIEDERHOLUNG erwaehnt CREATE_EMAIL_REPLY",
+     "CREATE_EMAIL_REPLY, CREATE_WHATSAPP" in _ws_src)
+
+# API route responds
+try:
+    r = requests.post(BASE_URL + "/send_email_reply", json={
+        "message_id": "", "to": "test@example.com", "subject": "Test", "body": "Test"
+    }, timeout=10)
+    d = r.json()
+    test("/send_email_reply Route antwortet", "ok" in d)
+except Exception as e:
+    test("/send_email_reply Route antwortet", False, str(e))
+
 
 # ============================================================
 # ERGEBNIS

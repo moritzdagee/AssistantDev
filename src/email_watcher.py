@@ -30,6 +30,7 @@ except ImportError:
 
 BASE = os.path.expanduser("~/Library/Mobile Documents/com~apple~CloudDocs/Downloads shared/claude_datalake")
 WATCH_DIR = os.path.join(BASE, "email_inbox")
+PROCESSED_SUBDIR = os.path.join(WATCH_DIR, "processed")
 DEFAULT_AGENT = "standard"
 
 # Processed log lives in HOME folder - avoids iCloud permission issues with LaunchAgent
@@ -506,6 +507,17 @@ def process_eml(eml_path, processed):
         processed.add(eml_name)
         save_processed(processed)
 
+        # Move .eml out of inbox root so ls shows only pending mail
+        try:
+            os.makedirs(PROCESSED_SUBDIR, exist_ok=True)
+            dest = os.path.join(PROCESSED_SUBDIR, eml_name)
+            if os.path.exists(dest):
+                base, ext = os.path.splitext(eml_name)
+                dest = os.path.join(PROCESSED_SUBDIR, f"{base}_{timestamp}{ext}")
+            os.rename(eml_path, dest)
+        except Exception as e:
+            print(f"  Warning: move-to-processed failed for {eml_name}: {e}")
+
         print(f"  [{direction}] {subject[:50]} -> {agent} ({len(saved_attachments)} Anhaenge)")
         return True
 
@@ -514,6 +526,37 @@ def process_eml(eml_path, processed):
         return False
 
 # ── Main Loop ────────────────────────────────────────────────────────────────
+
+def _migrate_processed_emls(processed):
+    """One-time cleanup: move already-processed .eml files out of inbox root.
+
+    Historically process_eml left the .eml in place, which bloated inbox to 21k+
+    files. Any .eml whose name is in the processed set is moved to PROCESSED_SUBDIR.
+    """
+    os.makedirs(PROCESSED_SUBDIR, exist_ok=True)
+    moved = 0
+    try:
+        entries = os.listdir(WATCH_DIR)
+    except Exception as e:
+        print(f"[MIGRATE] listdir failed: {e}", flush=True)
+        return
+    for fname in entries:
+        if not fname.endswith('.eml'):
+            continue
+        if fname not in processed:
+            continue
+        src = os.path.join(WATCH_DIR, fname)
+        dest = os.path.join(PROCESSED_SUBDIR, fname)
+        if os.path.exists(dest):
+            continue  # already migrated
+        try:
+            os.rename(src, dest)
+            moved += 1
+        except Exception as e:
+            print(f"[MIGRATE] move failed for {fname}: {e}", flush=True)
+    if moved:
+        print(f"[MIGRATE] Moved {moved} already-processed .eml files to {PROCESSED_SUBDIR}", flush=True)
+
 
 def main():
     os.makedirs(WATCH_DIR, exist_ok=True)
@@ -528,13 +571,23 @@ Log:    {PROCESSED_LOG}
 Junk-Filter: Apple Mail Regel (vorgelagert)
 Control+C zum Beenden.
 {'─' * 45}
-""")
+""", flush=True)
+
+    _migrate_processed_emls(processed)
 
     while True:
         try:
             for fname in sorted(os.listdir(WATCH_DIR)):
-                if fname.endswith('.eml') and fname not in processed:
-                    process_eml(os.path.join(WATCH_DIR, fname), processed)
+                if not fname.endswith('.eml'):
+                    continue
+                # Reconcile: .eml in inbox root is authoritative. If it's also
+                # in `processed` (crash between save_processed and the move),
+                # drop the processed entry so process_eml re-runs and moves it.
+                if fname in processed:
+                    print(f"[RECONCILE] {fname} marked processed but still in inbox — re-processing", flush=True)
+                    processed.discard(fname)
+                    save_processed(processed)
+                process_eml(os.path.join(WATCH_DIR, fname), processed)
             time.sleep(5)
         except KeyboardInterrupt:
             print("\nEmail Watcher beendet.")
