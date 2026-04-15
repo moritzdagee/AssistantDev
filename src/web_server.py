@@ -824,10 +824,23 @@ Beispiele:
     return '\n'.join(parts)
 
 
+def _get_wm_dir(agent_name):
+    """Return the working_memory directory for this agent.
+    Parent agents use <speicher>/working_memory/.
+    Sub-agents get an isolated subdir <speicher>/working_memory/_<subname>/ so their
+    working memory is NOT shared with the parent or other sub-agents.
+    The broader agent memory (speicher itself) stays shared by design."""
+    speicher = get_agent_speicher(agent_name) if agent_name else BASE
+    parent = get_parent_agent(agent_name) if agent_name else None
+    if parent:
+        subname = agent_name.split('_', 1)[1]
+        return os.path.join(speicher, 'working_memory', '_' + subname)
+    return os.path.join(speicher, 'working_memory')
+
+
 def load_working_memory(agent_name):
     """Load persistent working memory files for an agent from working_memory/ directory."""
-    speicher = get_agent_speicher(agent_name) if agent_name else os.path.join(BASE, agent_name)
-    wm_dir = os.path.join(speicher, 'working_memory')
+    wm_dir = _get_wm_dir(agent_name)
     manifest_path = os.path.join(wm_dir, '_manifest.json')
     if not os.path.exists(manifest_path):
         return ''
@@ -883,8 +896,7 @@ def load_working_memory(agent_name):
 
 def working_memory_add(agent_name, filename, content, priority=5, description=''):
     """Add a file to agent's working memory."""
-    speicher = get_agent_speicher(agent_name)
-    wm_dir = os.path.join(speicher, 'working_memory')
+    wm_dir = _get_wm_dir(agent_name)
     os.makedirs(wm_dir, exist_ok=True)
     manifest_path = os.path.join(wm_dir, '_manifest.json')
     if os.path.exists(manifest_path):
@@ -914,8 +926,7 @@ def working_memory_add(agent_name, filename, content, priority=5, description=''
 
 def working_memory_remove(agent_name, filename):
     """Remove a file from agent's working memory."""
-    speicher = get_agent_speicher(agent_name)
-    wm_dir = os.path.join(speicher, 'working_memory')
+    wm_dir = _get_wm_dir(agent_name)
     manifest_path = os.path.join(wm_dir, '_manifest.json')
     if not os.path.exists(manifest_path):
         return None
@@ -934,8 +945,7 @@ def working_memory_remove(agent_name, filename):
 
 def working_memory_list(agent_name):
     """List all files in agent's working memory."""
-    speicher = get_agent_speicher(agent_name)
-    wm_dir = os.path.join(speicher, 'working_memory')
+    wm_dir = _get_wm_dir(agent_name)
     manifest_path = os.path.join(wm_dir, '_manifest.json')
     if not os.path.exists(manifest_path):
         return {'max_tokens': 8000, 'auto_cleanup': True, 'files': []}

@@ -6,6 +6,17 @@ Format: [Datum] Änderung | Datei | Grund
 
 ## 2026-04-15
 
+### Feat: Working-Memory-Isolation fuer Sub-Agents
+- **Problem:** Sub-Agents (signicat_lamp, signicat_meddpicc, signicat_outbound, signicat_powerpoint, trustedcarrier_instagramm) teilten sich das Working Memory ihres Parent-Agents, weil `load_working_memory()` via `get_agent_speicher()` fuer Sub-Agents den Parent-Pfad zurueckgab. Folge: jeder Sub sah auch die Dateien der anderen Subs und des Parents — keine Isolation.
+- **Fix (`src/web_server.py`):** Neuer Helper `_get_wm_dir(agent_name)`:
+  - Parent-Agent → `<speicher>/working_memory/` (wie bisher)
+  - Sub-Agent → `<speicher>/working_memory/_<subname>/` (eigener Unterordner mit eigenem `_manifest.json`)
+- Die 4 Funktionen `load_working_memory`, `working_memory_add`, `working_memory_remove`, `working_memory_list` nutzen jetzt ausschliesslich `_get_wm_dir`. Der breitere Memory-Kontext (`<speicher>/` selbst) bleibt weiterhin zwischen Parent und Sub geteilt — wie vom User gewuenscht.
+- **Migration (`/tmp/migrate_wm.py`):** Bestehende `steckbrief_<subname>.md`-Dateien aus dem Parent-Manifest in `working_memory/_<subname>/steckbrief.md` mit eigenem Manifest umgezogen (5 Dateien: 4 signicat-Subs + trustedcarrier_instagramm).
+- **Seed-Script (`/tmp/seed_working_memory.py`):** Impuls an alle 9 Agents (inkl. Subs), einen Steckbrief ins eigene Working Memory zu schreiben. Auto-declines Sub-Agent-Delegation ueber `/api/subagent_confirm` mit `confirmed:false`, damit der angesprochene Agent selbst antwortet.
+- **Tests:** neue Sektion "Working Memory Isolation 2026-04-15" in `tests/run_tests.py` — prueft Helper-Existenz, Unterordner-Pfad, Runtime-Isolation (signicat Parent-WM != signicat_lamp Sub-WM). 477/478 Tests gruen (1 pre-existing Fail unrelated).
+- **Backups:** `backups/2026-04-15_11-03-02/src/web_server.py`
+
 ### Feat: Infrastructure Hardening — Watchdog, Rollback, Status, Workflow-Regeln
 - **`scripts/watchdog.sh` (neu):** prueft `web_server.py` (Port 8080 + Prozess) und startet automatisch neu bei Ausfall. Loggt jeden Restart nach `logs/watchdog.log`. Wird alle 60s via LaunchAgent `com.assistantdev.watchdog` aufgerufen (neue Plist unter `~/Library/LaunchAgents/`).
 - **`scripts/status.sh` (neu):** Ein-Blick-Uebersicht — Services (web_server, web_clipper, email_watcher), Git-Branch + letzter Commit + uncommitted-Count, letzte 20 Zeilen Assistant-Log, vorhandene Backups mit Datum. Fuer Moritz-Selbsthilfe ohne Claude.
