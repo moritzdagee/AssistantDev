@@ -744,13 +744,25 @@ class SearchIndex:
             return self.build_index()
 
     def add_file(self, fname):
-        """Index a single newly added file."""
+        """Index a single newly added file. Also fires an async embedding
+        update so that semantic retrieval is available immediately. Embedding
+        failures are silent — they never block keyword indexing."""
         self._load_index()
         entry = self._index_file(fname)
         if entry:
             with self._lock:
                 self.entries[fname] = entry
             self._save_index()
+            # Fire-and-forget semantic indexing (network-bound, optional).
+            try:
+                t = threading.Thread(
+                    target=index_file_with_embedding,
+                    args=(self.speicher, fname),
+                    daemon=True,
+                )
+                t.start()
+            except Exception:
+                pass
 
     def _save_index(self):
         """Save index to disk."""
@@ -2169,6 +2181,643 @@ def global_search(msg, max_results=50):
 
     feedback['found_count'] = len(results)
     return (results, feedback)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# TEIL 4 — SEMANTIC RAG (Embeddings + Query Expansion + RRF + Compression)
+# ═══════════════════════════════════════════════════════════════════════════════
+# Additive upgrade on top of the keyword pipeline. All calls are wrapped in
+# try/except and fall back to the existing keyword search if the OpenAI or
+# Anthropic/Mistral/Gemini APIs are unreachable, the key is missing, or quota
+# is exceeded. Existing indexes (.search_index.json / .global_search_index.json)
+# are never touched — embeddings live in their own .embedding_index.json files.
+
+import math
+import urllib.request
+import urllib.error
+
+try:
+    import numpy as _np
+    _HAS_NUMPY = True
+except Exception:
+    _HAS_NUMPY = False
+
+_MODELS_JSON_PATH = os.path.expanduser(
+    "~/Library/Mobile Documents/com~apple~CloudDocs/Downloads shared/claude_datalake/config/models.json"
+)
+_EMBEDDING_MODEL = "text-embedding-3-small"
+_EMBEDDING_DIM = 1536
+_EMBEDDING_HTTP_TIMEOUT = 10
+_LLM_HTTP_TIMEOUT = 20
+_RRF_K = 60
+_CHUNK_TARGET_TOKENS = 500
+_CHUNK_OVERLAP_TOKENS = 50
+_TOKEN_CHAR_RATIO = 4          # grobe Heuristik: 1 token ≈ 4 chars
+_MAX_CHUNK_CHARS = _CHUNK_TARGET_TOKENS * _TOKEN_CHAR_RATIO
+_OVERLAP_CHARS = _CHUNK_OVERLAP_TOKENS * _TOKEN_CHAR_RATIO
+_SHORT_DOC_CHAR_LIMIT = 1500   # darunter: ganzes Dokument als ein Chunk
+
+
+def _load_models_config():
+    """Read models.json once per call. Returns dict or None."""
+    try:
+        with open(_MODELS_JSON_PATH, 'r', encoding='utf-8') as f:
+            return json.load(f)
+    except Exception:
+        return None
+
+
+def _get_openai_api_key():
+    cfg = _load_models_config()
+    if not cfg:
+        return None
+    return cfg.get('providers', {}).get('openai', {}).get('api_key') or None
+
+
+def _get_agent_llm(speicher_path):
+    """Return (provider, model_id, api_key) for the given agent's configured
+    chat model. Falls back to the first Anthropic model in models.json."""
+    cfg = _load_models_config() or {}
+    providers = cfg.get('providers', {})
+
+    # Try per-agent config file: [speicher]/memory/models.json
+    agent_cfg_path = os.path.join(speicher_path, 'memory', 'models.json')
+    try:
+        if os.path.exists(agent_cfg_path):
+            with open(agent_cfg_path, 'r', encoding='utf-8') as f:
+                agent_cfg = json.load(f)
+            prov = agent_cfg.get('provider')
+            mid = agent_cfg.get('model')
+            if prov and mid:
+                key = providers.get(prov, {}).get('api_key')
+                if key:
+                    return (prov, mid, key)
+    except Exception:
+        pass
+
+    # Fallback: anthropic haiku if available, otherwise first anthropic model
+    anth = providers.get('anthropic', {})
+    key = anth.get('api_key')
+    if key:
+        models = anth.get('models', [])
+        for m in models:
+            if 'haiku' in m.get('id', '').lower():
+                return ('anthropic', m['id'], key)
+        if models:
+            return ('anthropic', models[0]['id'], key)
+    return (None, None, None)
+
+
+# ─── EMBEDDINGS (OpenAI text-embedding-3-small) ──────────────────────────────
+
+def _call_openai_embedding(texts, api_key):
+    """Batched embedding call. Returns list[list[float]] or None on failure."""
+    if not api_key or not texts:
+        return None
+    # OpenAI accepts up to 2048 inputs per call; we chunk conservatively
+    batch_size = 64
+    all_vecs = []
+    url = "https://api.openai.com/v1/embeddings"
+    for i in range(0, len(texts), batch_size):
+        batch = texts[i:i + batch_size]
+        payload = json.dumps({
+            'model': _EMBEDDING_MODEL,
+            'input': batch,
+        }).encode('utf-8')
+        req = urllib.request.Request(
+            url,
+            data=payload,
+            headers={
+                'Authorization': f'Bearer {api_key}',
+                'Content-Type': 'application/json',
+            },
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=_EMBEDDING_HTTP_TIMEOUT) as resp:
+                body = resp.read()
+                data = json.loads(body.decode('utf-8'))
+            for item in data.get('data', []):
+                all_vecs.append(item.get('embedding', []))
+        except urllib.error.HTTPError as e:
+            print(f"[embedding] HTTP {e.code}: quota/rate limit — fallback aktiv")
+            return None
+        except Exception as e:
+            print(f"[embedding] call failed: {e}")
+            return None
+    return all_vecs if all_vecs else None
+
+
+def embed_text(text):
+    """Embed a single string. Returns list[float] or None."""
+    key = _get_openai_api_key()
+    if not key:
+        return None
+    vecs = _call_openai_embedding([text], key)
+    if not vecs:
+        return None
+    return vecs[0]
+
+
+# ─── CHUNKING ────────────────────────────────────────────────────────────────
+
+def _chunk_text(text, max_chars=None, overlap=None):
+    """Split text into paragraph-aligned chunks of roughly ~500 tokens.
+
+    - Short texts (< _SHORT_DOC_CHAR_LIMIT) return a single chunk.
+    - Paragraphs separated by blank lines are accumulated greedily until the
+      target chunk size is hit, then flushed with `overlap` chars of tail
+      repeated into the next chunk.
+    """
+    if not text:
+        return []
+    max_chars = max_chars or _MAX_CHUNK_CHARS
+    overlap = overlap or _OVERLAP_CHARS
+
+    text = text.strip()
+    if len(text) <= _SHORT_DOC_CHAR_LIMIT:
+        return [text]
+
+    paragraphs = re.split(r'\n\s*\n', text)
+    chunks = []
+    buf = ''
+    for p in paragraphs:
+        p = p.strip()
+        if not p:
+            continue
+        if not buf:
+            buf = p
+            continue
+        if len(buf) + 2 + len(p) <= max_chars:
+            buf = buf + '\n\n' + p
+        else:
+            chunks.append(buf)
+            tail = buf[-overlap:] if overlap and len(buf) > overlap else ''
+            buf = (tail + '\n\n' + p) if tail else p
+    if buf:
+        chunks.append(buf)
+
+    # Safety: if a single paragraph is larger than max_chars, hard-split it
+    final = []
+    for c in chunks:
+        if len(c) <= max_chars:
+            final.append(c)
+            continue
+        step = max_chars - overlap
+        for i in range(0, len(c), max(step, 1)):
+            final.append(c[i:i + max_chars])
+    return final
+
+
+# ─── EMBEDDING INDEX (per agent) ─────────────────────────────────────────────
+
+class EmbeddingIndex:
+    """Per-agent embedding store. Mirrors SearchIndex layout but keeps vectors
+    in a separate .embedding_index.json file so that existing keyword logic is
+    untouched. Lazy: only files added via `add_file` (or the reindex helper)
+    ever get embeddings.
+    """
+
+    def __init__(self, speicher_path):
+        self.speicher = speicher_path
+        self.memory_dir = os.path.join(speicher_path, 'memory')
+        self.index_file = os.path.join(speicher_path, '.embedding_index.json')
+        self.entries = {}   # filename -> {mtime, chunks:[{text, embedding}]}
+        self._lock = threading.Lock()
+        self._loaded = False
+
+    def _load(self):
+        if self._loaded:
+            return
+        if os.path.exists(self.index_file):
+            try:
+                with open(self.index_file, 'r', encoding='utf-8') as f:
+                    self.entries = json.load(f)
+            except Exception:
+                self.entries = {}
+        self._loaded = True
+
+    def _save(self):
+        try:
+            os.makedirs(os.path.dirname(self.index_file), exist_ok=True)
+            with open(self.index_file, 'w', encoding='utf-8') as f:
+                json.dump(self.entries, f, ensure_ascii=False)
+        except Exception as e:
+            print(f"[embedding_index] save error: {e}")
+
+    def _resolve_path(self, fname):
+        p = os.path.join(self.memory_dir, fname)
+        if os.path.exists(p):
+            return p
+        p = os.path.join(self.speicher, fname)
+        if os.path.exists(p):
+            return p
+        return None
+
+    def add_file(self, fname, text=None, api_key=None):
+        """Embed a single file (idempotent by mtime). Returns True on success."""
+        self._load()
+        fpath = self._resolve_path(fname)
+        if not fpath:
+            return False
+        try:
+            mtime = os.path.getmtime(fpath)
+        except Exception:
+            return False
+        existing = self.entries.get(fname)
+        if existing and existing.get('mtime', 0) >= mtime:
+            return True  # already fresh
+
+        if text is None:
+            ext = os.path.splitext(fname.lower())[1]
+            if ext in BINARY_EXTS:
+                return False
+            try:
+                with open(fpath, 'r', encoding='utf-8', errors='replace') as f:
+                    text = f.read(30000)
+            except Exception:
+                return False
+        if not text or not text.strip():
+            return False
+
+        chunks = _chunk_text(text)
+        if not chunks:
+            return False
+
+        key = api_key or _get_openai_api_key()
+        vecs = _call_openai_embedding(chunks, key)
+        if not vecs or len(vecs) != len(chunks):
+            return False
+
+        entry = {
+            'mtime': mtime,
+            'path': fpath,
+            'chunks': [
+                {'text': c, 'embedding': v}
+                for c, v in zip(chunks, vecs)
+            ],
+        }
+        with self._lock:
+            self.entries[fname] = entry
+            self._save()
+        return True
+
+    def search(self, query_vec, max_results=20):
+        """Cosine similarity search. Returns list of
+        {'name', 'chunk', 'score', 'chunk_index'}.
+        """
+        self._load()
+        if not self.entries or not query_vec:
+            return []
+        qv = query_vec
+        q_norm = math.sqrt(sum(x * x for x in qv)) or 1.0
+        scored = []
+        for fname, entry in self.entries.items():
+            for i, chunk in enumerate(entry.get('chunks', [])):
+                v = chunk.get('embedding')
+                if not v:
+                    continue
+                dot = 0.0
+                v_norm_sq = 0.0
+                for a, b in zip(qv, v):
+                    dot += a * b
+                    v_norm_sq += b * b
+                v_norm = math.sqrt(v_norm_sq) or 1.0
+                sim = dot / (q_norm * v_norm)
+                scored.append({
+                    'name': fname,
+                    'chunk': chunk.get('text', ''),
+                    'score': sim,
+                    'chunk_index': i,
+                })
+        scored.sort(key=lambda x: x['score'], reverse=True)
+        return scored[:max_results]
+
+
+_embedding_index_cache = {}
+_embedding_index_lock = threading.Lock()
+
+
+def get_embedding_index(speicher_path):
+    with _embedding_index_lock:
+        idx = _embedding_index_cache.get(speicher_path)
+        if idx is None:
+            idx = EmbeddingIndex(speicher_path)
+            _embedding_index_cache[speicher_path] = idx
+    return idx
+
+
+def index_file_with_embedding(speicher_path, fname, text=None):
+    """Convenience hook: called alongside SearchIndex.add_file so that newly
+    arrived e-mails/web-clips/files get both a keyword and a semantic entry.
+    Silent on failure (OpenAI down / no key / quota)."""
+    try:
+        idx = get_embedding_index(speicher_path)
+        return idx.add_file(fname, text=text)
+    except Exception as e:
+        print(f"[embedding_index] add_file error: {e}")
+        return False
+
+
+# ─── QUERY EXPANSION ─────────────────────────────────────────────────────────
+
+def _call_llm_for_text(provider, model_id, api_key, system_prompt, user_prompt,
+                      max_tokens=300, timeout=None):
+    """Minimal LLM call used for query expansion and compression. Uses urllib
+    so we stay dependency-free. Returns the assistant text or None on failure.
+    """
+    timeout = timeout or _LLM_HTTP_TIMEOUT
+    try:
+        if provider == 'anthropic':
+            payload = json.dumps({
+                'model': model_id,
+                'max_tokens': max_tokens,
+                'system': system_prompt,
+                'messages': [{'role': 'user', 'content': user_prompt}],
+            }).encode('utf-8')
+            req = urllib.request.Request(
+                'https://api.anthropic.com/v1/messages',
+                data=payload,
+                headers={
+                    'x-api-key': api_key,
+                    'anthropic-version': '2023-06-01',
+                    'content-type': 'application/json',
+                },
+            )
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                data = json.loads(resp.read().decode('utf-8'))
+            parts = data.get('content', [])
+            return parts[0].get('text', '') if parts else None
+        elif provider == 'openai':
+            payload = json.dumps({
+                'model': model_id,
+                'max_tokens': max_tokens,
+                'messages': [
+                    {'role': 'system', 'content': system_prompt},
+                    {'role': 'user', 'content': user_prompt},
+                ],
+            }).encode('utf-8')
+            req = urllib.request.Request(
+                'https://api.openai.com/v1/chat/completions',
+                data=payload,
+                headers={
+                    'Authorization': f'Bearer {api_key}',
+                    'Content-Type': 'application/json',
+                },
+            )
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                data = json.loads(resp.read().decode('utf-8'))
+            choices = data.get('choices', [])
+            return choices[0].get('message', {}).get('content') if choices else None
+        elif provider == 'mistral':
+            payload = json.dumps({
+                'model': model_id,
+                'max_tokens': max_tokens,
+                'messages': [
+                    {'role': 'system', 'content': system_prompt},
+                    {'role': 'user', 'content': user_prompt},
+                ],
+            }).encode('utf-8')
+            req = urllib.request.Request(
+                'https://api.mistral.ai/v1/chat/completions',
+                data=payload,
+                headers={
+                    'Authorization': f'Bearer {api_key}',
+                    'Content-Type': 'application/json',
+                },
+            )
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                data = json.loads(resp.read().decode('utf-8'))
+            choices = data.get('choices', [])
+            return choices[0].get('message', {}).get('content') if choices else None
+    except Exception as e:
+        print(f"[llm] {provider} call failed: {e}")
+        return None
+    return None
+
+
+def expand_query(query, speicher_path=None, n_variants=2):
+    """Return a list of search queries: [original, variant1, variant2, ...].
+
+    If the LLM is unreachable, returns [original] so downstream code still
+    runs with the plain query.
+    """
+    original = (query or '').strip()
+    if not original:
+        return []
+    provider, model_id, api_key = _get_agent_llm(speicher_path or '')
+    if not provider:
+        return [original]
+
+    system_prompt = (
+        "Du bist ein Retrieval-Assistent. Der Nutzer sucht in einer persoenlichen "
+        f"Wissensbasis (E-Mails, Web-Clips, Dateien). Formuliere GENAU {n_variants} "
+        "alternative, praegnante Such-Formulierungen zur Nutzer-Anfrage. Nutze "
+        "Synonyme, Entitaeten, verwandte Begriffe. Pro Zeile eine Variante, keine "
+        "Nummerierung, keine Erklaerungen."
+    )
+    user_prompt = f"Anfrage: {original}"
+    out = _call_llm_for_text(provider, model_id, api_key, system_prompt,
+                             user_prompt, max_tokens=200)
+    if not out:
+        return [original]
+    variants = []
+    for line in out.splitlines():
+        line = line.strip(' -*•\t0123456789.)')
+        if line and line.lower() != original.lower():
+            variants.append(line)
+        if len(variants) >= n_variants:
+            break
+    return [original] + variants
+
+
+# ─── RRF FUSION ──────────────────────────────────────────────────────────────
+
+def rrf_fuse(ranked_lists, k=_RRF_K, top_n=20):
+    """Reciprocal Rank Fusion.
+
+    ranked_lists: iterable of lists. Each list contains either strings
+        (document IDs / filenames) or dicts with a 'name' key.
+    Returns a ranked list of {'name', 'rrf_score', 'sources'} entries.
+    """
+    scores = {}
+    sources = {}
+    for lst in ranked_lists:
+        if not lst:
+            continue
+        seen_in_list = set()
+        for rank, item in enumerate(lst, start=1):
+            key = item if isinstance(item, str) else item.get('name')
+            if not key or key in seen_in_list:
+                continue
+            seen_in_list.add(key)
+            scores[key] = scores.get(key, 0.0) + 1.0 / (k + rank)
+            sources.setdefault(key, []).append(rank)
+    fused = [
+        {'name': name, 'rrf_score': score, 'sources': sources[name]}
+        for name, score in scores.items()
+    ]
+    fused.sort(key=lambda x: x['rrf_score'], reverse=True)
+    return fused[:top_n]
+
+
+# ─── CONTEXTUAL COMPRESSION ──────────────────────────────────────────────────
+
+def compress_chunk(chunk_text, query, speicher_path=None, max_tokens=220):
+    """Ask the LLM to distil the chunk down to the sentences that actually
+    answer the query. Falls back to the original chunk (truncated) on failure.
+    """
+    if not chunk_text:
+        return ''
+    provider, model_id, api_key = _get_agent_llm(speicher_path or '')
+    if not provider:
+        return chunk_text[:1200]
+    system_prompt = (
+        "Du erhaeltst einen Textabschnitt und eine Nutzer-Anfrage. Gib NUR die "
+        "Saetze zurueck, die fuer die Anfrage wirklich relevant sind — wortgetreu, "
+        "keine Zusammenfassung, keine Kommentare. Gibt es nichts Relevantes, "
+        "antworte mit dem leeren String."
+    )
+    user_prompt = f"Anfrage: {query}\n\nAbschnitt:\n{chunk_text[:4000]}"
+    out = _call_llm_for_text(provider, model_id, api_key, system_prompt,
+                             user_prompt, max_tokens=max_tokens)
+    if out is None:
+        return chunk_text[:1200]
+    out = out.strip()
+    return out or chunk_text[:1200]
+
+
+# ─── HYBRID RAG SEARCH (top-level orchestrator) ──────────────────────────────
+
+def hybrid_rag_search(query, speicher_path, max_results=5,
+                      fuse_top=20, compress=True):
+    """Full RAG pipeline:
+        1) expand query into {original + variants}
+        2) parallel keyword search (existing HybridSearch) + semantic search
+        3) RRF fusion -> top `fuse_top`
+        4) take first `max_results`, optionally contextually compress
+
+    Returns dict with:
+        queries:    list of all expanded queries
+        semantic:   bool, whether semantic search contributed
+        results:    list of {name, snippet, compressed, score, sources}
+        fallback:   reason string if the hybrid path degraded to keyword-only
+    """
+    out = {'queries': [query], 'semantic': False, 'results': [], 'fallback': None}
+    if not query or not speicher_path:
+        return out
+
+    queries = expand_query(query, speicher_path=speicher_path, n_variants=2)
+    out['queries'] = queries
+
+    # --- Keyword side: run existing HybridSearch per query variant ---
+    keyword_lists = []
+    for q in queries:
+        try:
+            intent = QueryParser.parse(q, force_search=True)
+        except TypeError:
+            intent = QueryParser.parse(q)
+            intent.is_search = True
+        try:
+            results, _ = HybridSearch.search(intent, speicher_path, max_results=30)
+            keyword_lists.append([r['name'] for r in results])
+        except Exception as e:
+            print(f"[rag] keyword search failed for '{q}': {e}")
+            keyword_lists.append([])
+
+    # --- Semantic side: embed each query, search embedding index ---
+    semantic_lists = []
+    chunk_by_key = {}   # fname -> best chunk text seen
+    emb_idx = get_embedding_index(speicher_path)
+    emb_idx._load()
+    if emb_idx.entries:
+        api_key = _get_openai_api_key()
+        q_vecs = _call_openai_embedding(queries, api_key) if api_key else None
+        if q_vecs:
+            out['semantic'] = True
+            for qv in q_vecs:
+                hits = emb_idx.search(qv, max_results=30)
+                semantic_lists.append([h['name'] for h in hits])
+                for h in hits:
+                    prev = chunk_by_key.get(h['name'])
+                    if prev is None or h['score'] > prev[1]:
+                        chunk_by_key[h['name']] = (h['chunk'], h['score'])
+        else:
+            out['fallback'] = 'embedding_unavailable'
+    else:
+        out['fallback'] = 'no_embedding_index'
+
+    # --- RRF fusion ---
+    fused = rrf_fuse(keyword_lists + semantic_lists, k=_RRF_K, top_n=fuse_top)
+    top = fused[:max_results]
+
+    # --- Build output: prefer semantic chunk if we have one, else file head ---
+    results = []
+    memory_dir = os.path.join(speicher_path, 'memory')
+    for item in top:
+        fname = item['name']
+        snippet = ''
+        if fname in chunk_by_key:
+            snippet = chunk_by_key[fname][0]
+        else:
+            fpath = os.path.join(memory_dir, fname)
+            if not os.path.exists(fpath):
+                fpath = os.path.join(speicher_path, fname)
+            try:
+                with open(fpath, 'r', encoding='utf-8', errors='replace') as f:
+                    snippet = f.read(4000)
+            except Exception:
+                snippet = ''
+        compressed = compress_chunk(snippet, query, speicher_path) if compress else snippet
+        results.append({
+            'name': fname,
+            'snippet': snippet,
+            'compressed': compressed,
+            'score': item['rrf_score'],
+            'sources': item['sources'],
+        })
+
+    out['results'] = results
+    return out
+
+
+def reindex_embeddings(speicher_path, limit=None):
+    """Generate embeddings for all files already present in the keyword index
+    of this agent. Safe to re-run — existing fresh entries are skipped."""
+    kw = SearchIndex(speicher_path)
+    kw._load_index()
+    if not kw.entries:
+        kw.build_or_update()
+
+    emb = get_embedding_index(speicher_path)
+    emb._load()
+    api_key = _get_openai_api_key()
+    if not api_key:
+        return {'ok': False, 'reason': 'no_openai_key', 'indexed': 0}
+
+    done = 0
+    skipped = 0
+    failed = 0
+    for fname in list(kw.entries.keys()):
+        if limit and done >= limit:
+            break
+        existing = emb.entries.get(fname)
+        fpath = emb._resolve_path(fname)
+        if not fpath:
+            continue
+        try:
+            mtime = os.path.getmtime(fpath)
+        except Exception:
+            continue
+        if existing and existing.get('mtime', 0) >= mtime:
+            skipped += 1
+            continue
+        ok = emb.add_file(fname, api_key=api_key)
+        if ok:
+            done += 1
+        else:
+            failed += 1
+    return {'ok': True, 'indexed': done, 'skipped': skipped, 'failed': failed,
+            'total_in_keyword_index': len(kw.entries)}
 
 
 # ═══════════════════════════════════════════════════════════════════════════════

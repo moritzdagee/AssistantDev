@@ -4,6 +4,9 @@ import re
 import json
 import base64
 import datetime
+import setproctitle
+
+setproctitle.setproctitle("AssistantDev WebClipper")
 
 app = Flask(__name__)
 app.config['MAX_CONTENT_LENGTH'] = 50 * 1024 * 1024  # 50MB for screenshots

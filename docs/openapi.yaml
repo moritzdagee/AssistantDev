@@ -1,0 +1,271 @@
+openapi: 3.0.3
+info:
+  title: AssistantDev API
+  description: Local Multi-Agent AI Assistant API (localhost-only)
+  version: "1.0"
+  contact:
+    name: AssistantDev
+servers:
+  - url: http://localhost:8080
+    description: Local server
+paths:
+  /api/access-control:
+    get:
+      summary: Lädt Access-Control-Konfiguration
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/AccessControl'}
+    post:
+      summary: Speichert Access-Control
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/AccessControl'}
+      responses:
+        '200':
+          description: Gespeichert
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success: {type: boolean}
+                  saved_at: {type: string, format: date-time}
+        '400':
+          description: Ungültige Eingabe
+  /api/email-search:
+    get:
+      summary: Durchsucht E-Mails im Agent-Memory
+      parameters:
+        - name: agent
+          in: query
+          required: true
+          schema: {type: string}
+        - name: q
+          in: query
+          schema: {type: string, minLength: 2}
+        - name: from
+          in: query
+          schema: {type: string}
+        - name: subject
+          in: query
+          schema: {type: string}
+        - name: to
+          in: query
+          schema: {type: string}
+        - name: body
+          in: query
+          schema: {type: string}
+      responses:
+        '200':
+          description: Bis zu 8 Treffer, nach Datum DESC
+          content:
+            application/json:
+              schema:
+                type: array
+                maxItems: 8
+                items: {$ref: '#/components/schemas/EmailSearchResult'}
+  /api/email-content:
+    get:
+      summary: Lädt vollständigen E-Mail-Inhalt
+      parameters:
+        - name: agent
+          in: query
+          required: true
+          schema: {type: string}
+        - name: message_id
+          in: query
+          schema: {type: string}
+        - name: from_email
+          in: query
+          schema: {type: string}
+        - name: subject
+          in: query
+          schema: {type: string}
+      responses:
+        '200':
+          description: Email-Inhalt oder Fehler
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/EmailContent'}
+  /api/memory-files-search:
+    get:
+      summary: Autocomplete-Suche nach Dateinamen
+      parameters:
+        - name: agent
+          in: query
+          required: true
+          schema: {type: string}
+        - name: q
+          in: query
+          required: true
+          schema: {type: string, minLength: 2}
+      responses:
+        '200':
+          description: OK
+  /api/memory/search:
+    post:
+      summary: Deep Memory Search (Dateiname + Content)
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                agent: {type: string}
+                query: {type: string}
+                filename_filter: {type: string}
+      responses:
+        '200':
+          description: OK
+  /api/context-info:
+    get:
+      summary: Token-Estimates für Session
+      parameters:
+        - name: session_id
+          in: query
+          required: true
+          schema: {type: string}
+      responses:
+        '200':
+          description: OK
+  /api/agent-model-preference:
+    get:
+      summary: Liest Modell-Präferenz pro Agent
+      parameters:
+        - name: agent
+          in: query
+          required: true
+          schema: {type: string}
+      responses:
+        '200':
+          description: OK
+    post:
+      summary: Speichert Modell-Präferenz pro Agent
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                agent: {type: string}
+                provider: {type: string}
+                model: {type: string}
+      responses:
+        '200':
+          description: OK
+  /api/subagent_confirm:
+    post:
+      summary: Bestätigt Sub-Agent-Routing
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [session_id, confirmation_id, confirmed]
+              properties:
+                session_id: {type: string}
+                confirmation_id: {type: string}
+                confirmed: {type: boolean}
+      responses:
+        '200':
+          description: OK
+  /api/calendar:
+    get:
+      summary: Kalender-Events
+      parameters:
+        - name: days_back
+          in: query
+          schema: {type: integer}
+        - name: days_ahead
+          in: query
+          schema: {type: integer}
+        - name: search
+          in: query
+          schema: {type: string}
+      responses:
+        '200':
+          description: OK
+    post:
+      summary: Kalender-Events mit Body-Parameter
+      responses:
+        '200':
+          description: OK
+  /api/slack:
+    post:
+      summary: Slack-API-Proxy
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                action:
+                  type: string
+                  enum: [send, channels, history, users]
+      responses:
+        '200':
+          description: OK
+  /api/canva:
+    post:
+      summary: Canva Connect API Proxy
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                action: {type: string}
+      responses:
+        '200':
+          description: OK
+components:
+  schemas:
+    AccessControl:
+      type: object
+      properties:
+        agents:
+          type: object
+          additionalProperties:
+            type: object
+            properties:
+              own_memory: {type: boolean}
+              shared_memory: {type: array, items: {type: string}}
+              cross_agent_read: {type: array, items: {type: string}}
+              description: {type: string}
+        last_modified: {type: string, format: date-time}
+        version: {type: string}
+    EmailSearchResult:
+      type: object
+      properties:
+        message_id: {type: string}
+        from_name: {type: string}
+        from_email: {type: string}
+        subject: {type: string}
+        date: {type: string, example: "14.04.2026 12:00"}
+        date_ts: {type: number, format: float}
+        to: {type: string}
+        cc: {type: string}
+    EmailContent:
+      type: object
+      properties:
+        ok: {type: boolean}
+        error: {type: string}
+        from_name: {type: string}
+        from_email: {type: string}
+        to: {type: string}
+        cc: {type: string}
+        subject: {type: string}
+        date: {type: string}
+        message_id: {type: string}
+        body: {type: string}
+        file: {type: string}

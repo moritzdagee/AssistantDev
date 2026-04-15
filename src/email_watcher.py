@@ -16,6 +16,9 @@ import datetime
 import re
 import subprocess
 from email.header import decode_header
+import setproctitle
+
+setproctitle.setproctitle("AssistantDev EmailWatcher")
 
 # Search index integration
 try:
@@ -27,10 +30,13 @@ except ImportError:
 
 BASE = os.path.expanduser("~/Library/Mobile Documents/com~apple~CloudDocs/Downloads shared/claude_datalake")
 WATCH_DIR = os.path.join(BASE, "email_inbox")
+PROCESSED_SUBDIR = os.path.join(WATCH_DIR, "processed")
 DEFAULT_AGENT = "standard"
 
 # Processed log lives in HOME folder - avoids iCloud permission issues with LaunchAgent
 PROCESSED_LOG = os.path.expanduser("~/.emailwatcher_processed.json")
+# Dual-write mirror in iCloud datalake (for recovery if local is lost)
+PROCESSED_LOG_MIRROR = os.path.join(BASE, "config", "email_processed_log.json")
 OWN_ADDRS_CACHE = os.path.expanduser("~/.emailwatcher_own_addresses.json")
 
 ROUTING = [
@@ -92,7 +98,9 @@ def get_own_addresses():
     fallback = ["moritz.cremer@me.com", "moritz.cremer@icloud.com",
                 "moritz.cremer@signicat.com", "londoncityfox@gmail.com",
                 "moritz@demoscapital.co", "moritz@vegatechnology.com.br",
-                "moritz.cremer@trustedcarrier.net"]
+                "moritz.cremer@trustedcarrier.net", "moritz@brandshare.me",
+                "cremer.moritz@gmx.de", "family.cremer@gmail.com",
+                "moritz.cremer@trustedcarrier.de", "naiaraebertz@gmail.com"]
     with open(OWN_ADDRS_CACHE, 'w') as f:
         json.dump(fallback, f)
     return fallback
@@ -139,18 +147,40 @@ def decode_str(s):
 # ── Processed-Log ────────────────────────────────────────────────────────────
 
 def load_processed():
+    # Primary: local log
     if os.path.exists(PROCESSED_LOG):
         try:
             with open(PROCESSED_LOG) as f:
-                return set(json.load(f))
+                data = json.load(f)
+                if data:
+                    return set(data)
         except Exception:
-            return set()
+            pass
+    # Fallback: iCloud mirror
+    if os.path.exists(PROCESSED_LOG_MIRROR):
+        try:
+            with open(PROCESSED_LOG_MIRROR) as f:
+                data = json.load(f)
+                if data:
+                    print(f'[WATCHER] Recovered processed log from iCloud mirror ({len(data)} entries)', flush=True)
+                    return set(data)
+        except Exception:
+            pass
     return set()
 
 
 def save_processed(processed):
+    data = list(processed)
+    # Primary: local
     with open(PROCESSED_LOG, 'w') as f:
-        json.dump(list(processed), f)
+        json.dump(data, f)
+    # Mirror: iCloud (best-effort, don't fail on error)
+    try:
+        os.makedirs(os.path.dirname(PROCESSED_LOG_MIRROR), exist_ok=True)
+        with open(PROCESSED_LOG_MIRROR, 'w') as f:
+            json.dump(data, f)
+    except Exception as e:
+        print(f'[WATCHER] Warning: mirror write failed: {e}', flush=True)
 
 # ── Routing ──────────────────────────────────────────────────────────────────
 
@@ -278,9 +308,54 @@ def _extract_name_from_raw(raw_header):
     return None
 
 
+# ── Name-vs-Email Sanity (gegen Contacts-Pollution) ──────────────────────────
+
+def _name_tokens(name):
+    """Lowercase, umlaut-normalisierte Alpha-Tokens (>=2 Zeichen) eines Namens."""
+    if not name:
+        return set()
+    s = name.lower()
+    for a, b in [('ä', 'ae'), ('ö', 'oe'), ('ü', 'ue'), ('ß', 'ss')]:
+        s = s.replace(a, b)
+    return {t for t in re.findall(r'[a-z]+', s) if len(t) >= 2}
+
+
+def _name_matches_email(name, email_addr):
+    """True wenn mind. ein >=3 Zeichen Token aus dem Namen im Local-Part vorkommt.
+    Wenn der Name keine qualifizierten Tokens enthaelt, akzeptieren (Initialen, kurze Tags).
+    """
+    if not name or not email_addr or '@' not in email_addr:
+        return True
+    local = email_addr.split('@')[0].lower()
+    local_clean = re.sub(r'[._\-+]', ' ', local)
+    qual = [t for t in _name_tokens(name) if len(t) >= 3]
+    if not qual:
+        return True
+    return any(t in local_clean for t in qual)
+
+
+def _is_strict_name_extension(old_name, new_name):
+    """True wenn new_name den old_name strikt erweitert (alle alten Tokens enthalten)."""
+    if not old_name:
+        return True
+    old_t = _name_tokens(old_name)
+    new_t = _name_tokens(new_name)
+    return bool(old_t) and old_t.issubset(new_t)
+
+
 def update_contacts_json(memory_dir, contact_addr, contact_name, direction, body):
-    """Aktualisiert contacts.json im Agent-Memory mit neuen Kontaktdaten."""
+    """Aktualisiert contacts.json im Agent-Memory mit neuen Kontaktdaten.
+
+    Schutz vor Contacts-Pollution: ein Name aus dem From:-Header wird nur akzeptiert,
+    wenn er entweder zur E-Mail-Adresse passt (Token im Local-Part) ODER der Name
+    keine qualifizierten Tokens hat. Vorhandene Namen werden NUR ueberschrieben,
+    wenn der neue Name eine echte Erweiterung des alten ist.
+    """
     contacts_path = os.path.join(memory_dir, "contacts.json")
+
+    # Sanity: mismatched From-Names komplett verwerfen
+    if contact_name and not _name_matches_email(contact_name, contact_addr):
+        contact_name = None
 
     # Bestehende Datei laden oder neu erstellen
     data = {'generated': '', 'period_months': 0, 'agent': '', 'total_contacts': 0, 'contacts': []}
@@ -308,9 +383,14 @@ def update_contacts_json(memory_dir, contact_addr, contact_name, direction, body
         else:
             existing['received'] = existing.get('received', 0) + 1
         existing['last_contact'] = today
-        # Name updaten wenn besser
-        if contact_name and (not existing.get('name') or len(contact_name) > len(existing.get('name', ''))):
-            existing['name'] = contact_name
+        # Name updaten nur wenn neuer Name echte Erweiterung des alten ist
+        if contact_name:
+            existing_name = existing.get('name') or ''
+            if not existing_name:
+                existing['name'] = contact_name
+            elif (len(contact_name) > len(existing_name)
+                    and _is_strict_name_extension(existing_name, contact_name)):
+                existing['name'] = contact_name
         # Titel/Telefon nur setzen wenn noch leer
         if direction == 'IN' and body:
             title, phone = _extract_signature_info(body)
@@ -427,6 +507,17 @@ def process_eml(eml_path, processed):
         processed.add(eml_name)
         save_processed(processed)
 
+        # Move .eml out of inbox root so ls shows only pending mail
+        try:
+            os.makedirs(PROCESSED_SUBDIR, exist_ok=True)
+            dest = os.path.join(PROCESSED_SUBDIR, eml_name)
+            if os.path.exists(dest):
+                base, ext = os.path.splitext(eml_name)
+                dest = os.path.join(PROCESSED_SUBDIR, f"{base}_{timestamp}{ext}")
+            os.rename(eml_path, dest)
+        except Exception as e:
+            print(f"  Warning: move-to-processed failed for {eml_name}: {e}")
+
         print(f"  [{direction}] {subject[:50]} -> {agent} ({len(saved_attachments)} Anhaenge)")
         return True
 
@@ -435,6 +526,37 @@ def process_eml(eml_path, processed):
         return False
 
 # ── Main Loop ────────────────────────────────────────────────────────────────
+
+def _migrate_processed_emls(processed):
+    """One-time cleanup: move already-processed .eml files out of inbox root.
+
+    Historically process_eml left the .eml in place, which bloated inbox to 21k+
+    files. Any .eml whose name is in the processed set is moved to PROCESSED_SUBDIR.
+    """
+    os.makedirs(PROCESSED_SUBDIR, exist_ok=True)
+    moved = 0
+    try:
+        entries = os.listdir(WATCH_DIR)
+    except Exception as e:
+        print(f"[MIGRATE] listdir failed: {e}", flush=True)
+        return
+    for fname in entries:
+        if not fname.endswith('.eml'):
+            continue
+        if fname not in processed:
+            continue
+        src = os.path.join(WATCH_DIR, fname)
+        dest = os.path.join(PROCESSED_SUBDIR, fname)
+        if os.path.exists(dest):
+            continue  # already migrated
+        try:
+            os.rename(src, dest)
+            moved += 1
+        except Exception as e:
+            print(f"[MIGRATE] move failed for {fname}: {e}", flush=True)
+    if moved:
+        print(f"[MIGRATE] Moved {moved} already-processed .eml files to {PROCESSED_SUBDIR}", flush=True)
+
 
 def main():
     os.makedirs(WATCH_DIR, exist_ok=True)
@@ -449,13 +571,23 @@ Log:    {PROCESSED_LOG}
 Junk-Filter: Apple Mail Regel (vorgelagert)
 Control+C zum Beenden.
 {'─' * 45}
-""")
+""", flush=True)
+
+    _migrate_processed_emls(processed)
 
     while True:
         try:
             for fname in sorted(os.listdir(WATCH_DIR)):
-                if fname.endswith('.eml') and fname not in processed:
-                    process_eml(os.path.join(WATCH_DIR, fname), processed)
+                if not fname.endswith('.eml'):
+                    continue
+                # Reconcile: .eml in inbox root is authoritative. If it's also
+                # in `processed` (crash between save_processed and the move),
+                # drop the processed entry so process_eml re-runs and moves it.
+                if fname in processed:
+                    print(f"[RECONCILE] {fname} marked processed but still in inbox — re-processing", flush=True)
+                    processed.discard(fname)
+                    save_processed(processed)
+                process_eml(os.path.join(WATCH_DIR, fname), processed)
             time.sleep(5)
         except KeyboardInterrupt:
             print("\nEmail Watcher beendet.")

@@ -1,0 +1,32 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- Optional Autostart fuer Message Dashboard. NICHT automatisch geladen.
+     Zum Aktivieren:
+       cp ~/AssistantDev/scripts/com.assistantdev.dashboard.plist.optional \
+          ~/Library/LaunchAgents/com.assistantdev.dashboard.plist
+       launchctl load ~/Library/LaunchAgents/com.assistantdev.dashboard.plist
+-->
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.assistantdev.dashboard</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/usr/bin/python3</string>
+        <string>/Users/moritzcremer/AssistantDev/src/message_dashboard.py</string>
+    </array>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <false/>
+    <key>StandardOutPath</key>
+    <string>/tmp/message_dashboard.log</string>
+    <key>StandardErrorPath</key>
+    <string>/tmp/message_dashboard_error.log</string>
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>/usr/local/bin:/usr/bin:/bin</string>
+    </dict>
+</dict>
+</plist>
