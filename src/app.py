@@ -69,7 +69,20 @@ class Service:
 
     @property
     def running(self):
-        return self.process is not None and self.process.poll() is None
+        # Own subprocess alive?
+        if self.process is not None and self.process.poll() is None:
+            return True
+        # Externally managed (e.g. LaunchAgent com.assistantdev.webserver):
+        # if the port is bound, the service is up — don't try to spawn a
+        # competing copy.
+        if self.port is not None:
+            import socket
+            try:
+                with socket.create_connection(("127.0.0.1", self.port), timeout=0.3):
+                    return True
+            except Exception:
+                pass
+        return False
 
     @property
     def status_emoji(self):

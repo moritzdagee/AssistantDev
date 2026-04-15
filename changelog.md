@@ -6,6 +6,23 @@ Format: [Datum] Änderung | Datei | Grund
 
 ## 2026-04-15
 
+### Fix: Oversize-Bilder umgehen Downscaler wegen PIL DecompressionBombError
+- **Problem:** Der bestehende Downscaler hat bei sehr grossen Bildern (> 178 MP Default-Limit von Pillow) eine `DecompressionBombError` geworfen und im `except`-Zweig stillschweigend die Original-Base64-Daten zurueckgegeben. Ergebnis: Anthropic lehnte die Anfrage dennoch mit `messages.22.content.1.image.source.base64.data: At least one of the image dimensions exceed max allowed size: 8000 pixels` ab — der gleiche Fehler wie vorher, nur jetzt bei aelteren Session-Verlaeufen.
+- **Fix (`src/web_server.py`):**
+  - `downscale_image_b64_if_needed` setzt `PIL.Image.MAX_IMAGE_PIXELS = None` und `ImageFile.LOAD_TRUNCATED_IMAGES = True`, sodass auch extrem grosse oder teilweise defekte Bilder dekodiert und verkleinert werden.
+  - Bleibt das Decoding trotzdem erfolglos, liefert der Helper jetzt `(None, None)` statt der Original-Daten.
+  - `_sanitize_anthropic_images` (beide duplizierte Blocke) wirft solche Bilder komplett aus der Message-Content-Liste, bevor die Anfrage rausgeht — der Turn geht durch, das defekte Bild fehlt nur.
+  - Die drei weiteren Call-Sites (`add_file`, `load_selected_files`, Anthropic-User-Content-Build) pruefen das `None`-Resultat und ueberspringen das betroffene Bild mit Log-Meldung bzw. Upload-Fehler.
+- **Tests:** zwei neue Tests in `tests/run_tests.py` — nicht dekodierbares Bild → `(None, None)`, `_sanitize_anthropic_images` entfernt defekte Bild-Parts aus `content`. Suite jetzt bei 492 Tests, alle gruen.
+
+### Fix: Bilder > 8000 px crashen Anthropic-Chat (400 invalid_request_error)
+- **Problem:** Hochaufgeloeste Screenshots oder Uploads (z. B. Retina-Display-Captures, Kamera-Fotos) haben Kantenlaengen > 8000 px. Der Anthropic-API-Endpoint bricht solche Requests mit `messages.*.content.*.image.source.base64.data: At least one of the image dimensions exceed max allowed size: 8000 pixels` ab — der ganze Turn schlaegt fehl.
+- **Fix (`src/web_server.py`):**
+  - Neuer Helper `downscale_image_b64_if_needed(b64, mime)` nutzt Pillow, um Bilder mit einer Seite > 8000 px auf max. 7900 px (Lanczos) herunterzuskalieren. Format bleibt erhalten (GIF → PNG beim Resize).
+  - Neuer Helper `_sanitize_anthropic_images(messages)` geht vor jedem Anthropic-Call durch die Messages und korrigiert oversize Bilder in-place — schuetzt auch Session-Verlaeufe, die vor dem Fix geladen wurden. Eingebaut in beide `call_anthropic`-Definitionen (duplizierter Block).
+  - Downscaling greift direkt beim Upload in `add_file` (User-Drop) und in `load_selected_files` (Auto-Load von Screenshots) sowie defensiv beim Build des Anthropic-User-Content.
+- **Tests:** neue Sektion "Image Downscaling fuer Anthropic API 2026-04-15" in `tests/run_tests.py` (7 neue Tests inkl. funktionalem 9000×9000→7900 Resize-Check).
+
 ### Fix: Status-Check erkennt App-Bundle-Prozesse ("Agents offline"-Fehlalarm)
 - **Problem:** Nach Commit 508796a laufen `web_server` und `email_watcher` als kompilierte App-Bundle-Binaries (`AssistantDev WebServer`, `AssistantDev EmailWatcher`) statt als `python *.py`. Die Status-Checks prueften weiterhin via `pgrep -f web_server.py` / `email_watcher.py` und meldeten "offline", obwohl die Services einwandfrei liefen (Port 8080 antwortet HTTP 200). Zusaetzlich verursachte dies Crashloop-Log-Spam, weil parallele MenuBar-Instanzen ihre eigenen Python-Prozesse spawnen wollten und jedes Mal an "Address already in use" scheiterten.
 - **Fix (`scripts/status.sh`):** `check_proc` akzeptiert optional ein zweites Argument (Bundle-Name) und prueft zusaetzlich via `pgrep -f "AssistantDev WebServer"` etc. kchat_watcher wird jetzt auch ausgewiesen.
