@@ -1258,6 +1258,77 @@ end tell'''
                      stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     return True
 
+def send_email_reply(spec):
+    """Opens Apple Mail reply to an existing email identified by message_id."""
+    import subprocess
+    to      = spec.get('to', '')
+    subject = spec.get('subject', '')
+    body    = spec.get('body', '')
+    cc      = spec.get('cc', '')
+    message_id = spec.get('message_id', '')
+    quote_original = spec.get('quote_original', True)
+
+    def esc(s):
+        s = s.replace('\\', '\\\\')
+        s = s.replace('"', '\\"')
+        s = s.replace('\n', '\\n')
+        s = s.replace('\r', '')
+        return s
+
+    # Build CC recipients AppleScript lines
+    cc_lines = ''
+    if cc:
+        for addr in [a.strip() for a in cc.split(',') if a.strip()]:
+            cc_lines += f'\n            make new cc recipient at end of cc recipients with properties {{address:"{esc(addr)}"}}'
+
+    # AppleScript: try to find message by message-id and reply, fallback to new email
+    if message_id:
+        script = f'''tell application "Mail"
+    set foundMsg to missing value
+    set msgId to "{esc(message_id)}"
+    repeat with acct in accounts
+        repeat with mbox in mailboxes of acct
+            try
+                set msgs to (messages of mbox whose message id is msgId)
+                if (count of msgs) > 0 then
+                    set foundMsg to item 1 of msgs
+                    exit repeat
+                end if
+            end try
+        end repeat
+        if foundMsg is not missing value then exit repeat
+    end repeat
+    if foundMsg is not missing value then
+        set replyMsg to reply foundMsg with opening window
+        delay 0.5
+        tell replyMsg
+            set subject to "{esc(subject)}"
+            set content to "{esc(body)}"{cc_lines}
+        end tell
+    else
+        set newMessage to make new outgoing message with properties {{subject:"{esc(subject)}", content:"{esc(body)}", visible:true}}
+        tell newMessage
+            make new to recipient at end of to recipients with properties {{address:"{esc(to)}"}}{cc_lines}
+        end tell
+    end if
+    activate
+end tell'''
+    else:
+        # No message_id: fallback to regular new email
+        script = f'''tell application "Mail"
+    set newMessage to make new outgoing message with properties {{subject:"{esc(subject)}", content:"{esc(body)}", visible:true}}
+    tell newMessage
+        make new to recipient at end of to recipients with properties {{address:"{esc(to)}"}}{cc_lines}
+    end tell
+    activate
+end tell'''
+
+    result = subprocess.run(['osascript', '-e', script],
+                          capture_output=True, text=True, timeout=30)
+    if result.returncode != 0:
+        raise Exception(f"AppleScript Fehler: {result.stderr.strip()}")
+    return True
+
 def send_whatsapp_draft(spec, agent_name=None):
     """Opens WhatsApp with a pre-filled message. Looks up phone in contacts.json, then macOS Contacts."""
     import subprocess

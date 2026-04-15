@@ -24,6 +24,16 @@ ADDRESSBOOK_GLOB = os.path.join(HOME, 'Library/Application Support/AddressBook/S
 POLLUTION_EMAIL_THRESHOLD = 5
 POLLUTION_DOMAIN_THRESHOLD = 3
 
+# Eigene Adressen — die duerfen ohne Limit auf der My Card sein.
+OWN_EMAILS = {
+    'moritz.cremer@me.com', 'moritz.cremer@icloud.com',
+    'moritz.cremer@signicat.com', 'londoncityfox@gmail.com',
+    'moritz@demoscapital.co', 'moritz@vegatechnology.com.br',
+    'moritz.cremer@trustedcarrier.net', 'moritz@brandshare.me',
+    'cremer.moritz@gmx.de', 'family.cremer@gmail.com',
+    'moritz.cremer@trustedcarrier.de', 'naiaraebertz@gmail.com',
+}
+
 
 def load_own_addrs():
     try:
@@ -54,11 +64,35 @@ def check_addressbook(warnings):
                 cur2.execute('SELECT ZADDRESS FROM ZABCDEMAILADDRESS WHERE ZOWNER=?', (z_pk,))
                 addrs = [a for (a,) in cur2.fetchall() if a]
                 domains = {a.split('@')[-1].lower() for a in addrs if '@' in a}
-                if len(domains) >= POLLUTION_DOMAIN_THRESHOLD:
-                    warnings.append(
-                        f'[AddressBook] Z_PK={z_pk} {nm!r} (org={org!r}): '
-                        f'{len(addrs)} E-Mails aus {len(domains)} Domains'
-                    )
+                if len(domains) < POLLUTION_DOMAIN_THRESHOLD:
+                    continue
+                # Sanity vor dem Flaggen: mindestens eine Adresse muss weder
+                # zum Kontaktnamen passen noch eine eigene Adresse sein.
+                # Sonst ist der Kontakt einfach jemand mit vielen Accounts
+                # (oder die eigene My Card).
+                name_toks = [t for t in norm(nm).split() if len(t) >= 3]
+                suspicious = False
+                for a in addrs:
+                    if '@' not in a:
+                        continue
+                    al = a.lower()
+                    if al in OWN_EMAILS:
+                        # Eigene E-Mail auf fremdem Kontakt ist suspect, auf My Card ok.
+                        if norm(nm) not in (norm('Moritz Cremer'), norm('Moritz')):
+                            suspicious = True
+                            break
+                        continue
+                    local = al.split('@')[0]
+                    local_clean = re.sub(r'[._\-+]', ' ', local)
+                    if name_toks and not any(t in local_clean for t in name_toks):
+                        suspicious = True
+                        break
+                if not suspicious:
+                    continue
+                warnings.append(
+                    f'[AddressBook] Z_PK={z_pk} {nm!r} (org={org!r}): '
+                    f'{len(addrs)} E-Mails aus {len(domains)} Domains'
+                )
         finally:
             conn.close()
 

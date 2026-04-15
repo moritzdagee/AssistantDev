@@ -6,6 +6,17 @@ Format: [Datum] Änderung | Datei | Grund
 
 ## 2026-04-15
 
+### Fix: Email Watcher Inbox-Bloat + Auto-Reconcile
+- **Problem:** `email_inbox/` enthielt 21.130 `.eml`-Dateien — `process_eml` hat Mails nie aus dem Inbox-Root entfernt. Am 06.04. wurde Memory neu aufgebaut, aber `~/.emailwatcher_processed.json` nicht zurueckgesetzt. Folge: Mails die zwar als "processed" galten, aber im aktiven Memory fehlten, konnten nicht wiederhergestellt werden (Beispiel: `2026-04-01_17-05-12_New_booking_Sebastian_Schroeder_for_Seba.eml`).
+- **Root-Cause:** `process_eml` endete nach `save_processed()` ohne die `.eml`-Quelle zu verschieben. Kein Auto-Reconcile wenn Mail physisch im Inbox lag aber im processed-Set war.
+- **Fix:**
+  - `src/email_watcher.py` `process_eml()`: nach erfolgreichem Write verschiebt die `.eml` nach `email_inbox/processed/`. Bei Namenskollision wird Timestamp angehaengt.
+  - `src/email_watcher.py` `_migrate_processed_emls()` (neu): Einmal-Migration beim Startup — alle bereits-processed `.eml` aus Inbox-Root nach `email_inbox/processed/` verschieben.
+  - `src/email_watcher.py` `main()` Loop: Reconcile — findet der Watcher eine `.eml` im Inbox-Root die auch im processed-Set ist, wird der Eintrag verworfen und die Mail neu verarbeitet (Safety-Net fuer Crashes zwischen `save_processed` und Move).
+  - Verwaiste iCloud-Konflikt-Dateien `email_watcher_processed.json` + `email_watcher_processed 2.json` im datalake-Root nach `backups/orphan_tracker_files_2026-04-15_08-12-xx/` archiviert (aktiver Mirror ist `config/email_processed_log.json`).
+- **Backups:** `backups/2026-04-15_08-09-59/src/email_watcher.py`, `backups/orphan_tracker_files_2026-04-15_08-12-xx/`
+- **Operatives:** Betroffene Schroeder-Mail (2026-04-01) manuell aus `~/.emailwatcher_processed.json` entfernt und re-processed → neue Datei in `signicat/memory/` generiert. LaunchAgent `com.moritz.emailwatcher` hat keine iCloud-TCC-Permission und wurde unloaded; Watcher laeuft bis auf Weiteres manuell aus Terminal-Shell-Kontext.
+
 ### Fix: Contacts-Pollution an der Wurzel — Source-side Prevention + macOS Auto-Population aus
 - **Problem:** Email Watcher und Contact-Extractor uebernahmen From-Header-Namen ungeprueft als Kontakt-Name; macOS contactsd/suggestd injizierte zusaetzlich Mail-Sender als Vorschlag in alle Account-Sources (iCloud/Exchange/Google/CardDAV). Folge: fremde Namen ("Sebastian Schroeder", "Maivika") landeten auf bestehenden Kontakten und sogar der My Card.
 - **Root-Cause:** Name aus `From:` wurde uebernommen, auch wenn die E-Mail-Adresse einem anderen Kontakt gehoerte. macOS-Auto-Population schrieb zusaetzlich eigene Vorschlaege upstream.
@@ -369,6 +380,8 @@ Format: [Datum] Änderung | Datei | Grund
 - **NEU:** Backend-Route `GET /api/email-search?agent=X&q=Y` — parst .eml Header (From, Subject, Date, Message-ID, To, Cc)
 - Alle 453 Tests bestanden
 - Dateien: `src/web_server.py`, `scripts/patch_email_reply_search.py`
+
+## 2026-04-13
 
 ### LLM-Modell Audit, API-Tests & models.json Update
 - Alle 5 Provider getestet (Anthropic, OpenAI, Mistral, Perplexity, Gemini)
