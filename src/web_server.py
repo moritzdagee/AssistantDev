@@ -6,6 +6,18 @@ import uuid
 import copy
 import webbrowser
 import re
+import signal
+import sys
+import setproctitle
+
+setproctitle.setproctitle("AssistantDev WebServer")
+
+PENDING_MARKER = '[ANTWORT AUSSTEHEND - Server-Neustart hat diese Antwort unterbrochen]'
+RECOVERY_MARKER = '[Antwort verloren - Server wurde neu gestartet]'
+
+_shutdown_event = threading.Event()
+_active_requests = 0
+_active_requests_lock = threading.Lock()
 
 # Search engine
 try:
@@ -281,6 +293,7 @@ def send_email_draft(spec):
     subject = spec.get('subject', '')
     body    = spec.get('body', '')
     cc      = spec.get('cc', '')
+    sender  = spec.get('from', '')
 
     # Escape for AppleScript - handle all special chars
     def esc(s):
@@ -291,19 +304,18 @@ def send_email_draft(spec):
         return s
 
     cc_line = f'\n        make new cc recipient at end of cc recipients with properties {{address:\"{esc(cc)}\"}}' if cc else ''
+    sender_line = f'\n    set sender of newMessage to "{esc(sender)}"' if sender else ''
 
     script = f'''tell application "Mail"
     set newMessage to make new outgoing message with properties {{subject:"{esc(subject)}", content:"{esc(body)}", visible:true}}
     tell newMessage
         make new to recipient at end of to recipients with properties {{address:"{esc(to)}"}}{cc_line}
-    end tell
+    end tell{sender_line}
     activate
 end tell'''
 
-    result = subprocess.run(['osascript', '-e', script], 
-                          capture_output=True, text=True, timeout=10)
-    if result.returncode != 0:
-        raise Exception(f"AppleScript Fehler: {result.stderr.strip()}")
+    subprocess.Popen(['osascript', '-e', script],
+                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     return True
 
 BASE = os.path.expanduser("~/Library/Mobile Documents/com~apple~CloudDocs/Downloads shared/claude_datalake")
@@ -342,6 +354,38 @@ def cleanup_agent_files():
             print(f"Cleanup error {fname}: {e}")
 
 cleanup_agent_files()
+
+# ─── RECOVERY: Pending-Marker aus abgebrochenen Sessions ersetzen ─────────────
+def _recover_pending_markers():
+    recovered = 0
+    try:
+        for agent_dir in os.listdir(BASE):
+            agent_path = os.path.join(BASE, agent_dir)
+            if not os.path.isdir(agent_path):
+                continue
+            for fname in os.listdir(agent_path):
+                if not fname.startswith('konversation_') or not fname.endswith('.txt'):
+                    continue
+                fpath = os.path.join(agent_path, fname)
+                try:
+                    with open(fpath, 'r', encoding='utf-8', errors='replace') as f:
+                        content = f.read()
+                    if PENDING_MARKER in content:
+                        content = content.replace(PENDING_MARKER, RECOVERY_MARKER)
+                        tmp = fpath + '.tmp'
+                        with open(tmp, 'w', encoding='utf-8') as f:
+                            f.write(content)
+                        os.replace(tmp, fpath)
+                        recovered += 1
+                        print(f'[RECOVERY] Pending-Marker ersetzt in {agent_dir}/{fname}')
+                except Exception as e:
+                    print(f'[RECOVERY] Fehler bei {agent_dir}/{fname}: {e}')
+    except Exception as e:
+        print(f'[RECOVERY] Scan-Fehler: {e}')
+    if recovered:
+        print(f'[RECOVERY] {recovered} Konversation(en) mit Pending-Marker repariert')
+
+_recover_pending_markers()
 
 # ─── PROVIDER ADAPTERS ────────────────────────────────────────────────────────
 
@@ -778,6 +822,125 @@ Beispiele:
     return '\n'.join(parts)
 
 
+def load_working_memory(agent_name):
+    """Load persistent working memory files for an agent from working_memory/ directory."""
+    speicher = get_agent_speicher(agent_name) if agent_name else os.path.join(BASE, agent_name)
+    wm_dir = os.path.join(speicher, 'working_memory')
+    manifest_path = os.path.join(wm_dir, '_manifest.json')
+    if not os.path.exists(manifest_path):
+        return ''
+    try:
+        with open(manifest_path, 'r', encoding='utf-8') as f:
+            manifest = json.load(f)
+    except Exception:
+        return ''
+    max_tokens = manifest.get('max_tokens', 8000)
+    files = manifest.get('files', [])
+    if not files:
+        return ''
+    files_sorted = sorted(files, key=lambda x: (-x.get('priority', 5), x.get('added', '')))
+    parts = []
+    total_text = ''
+    cleanup_warnings = []
+    for entry in files_sorted:
+        fname = entry.get('filename', '')
+        fpath = os.path.join(wm_dir, fname)
+        if not os.path.exists(fpath):
+            continue
+        try:
+            with open(fpath, 'r', encoding='utf-8', errors='ignore') as f:
+                content = f.read()
+        except Exception:
+            continue
+        candidate = total_text + content
+        if len(candidate) / 4 > max_tokens:
+            cleanup_warnings.append(fname)
+            continue
+        total_text = candidate
+        prio = entry.get('priority', 5)
+        parts.append(f"[{fname}] (Prioritaet: {prio}):\n{content}")
+    if not parts and not cleanup_warnings:
+        return ''
+    result = '\n\n--- WORKING MEMORY ---\n'
+    result += '\n\n'.join(parts)
+    for w in cleanup_warnings:
+        result += f'\n[Working Memory Auto-Cleanup: {w} entfernt (Token-Limit erreicht)]'
+    result += '\n--- ENDE WORKING MEMORY ---\n'
+    if cleanup_warnings:
+        remaining = [e for e in files if e.get('filename') not in cleanup_warnings]
+        manifest['files'] = remaining
+        try:
+            tmp = manifest_path + '.tmp'
+            with open(tmp, 'w', encoding='utf-8') as f:
+                json.dump(manifest, f, ensure_ascii=False, indent=2)
+            os.replace(tmp, manifest_path)
+        except Exception:
+            pass
+    return result
+
+
+def working_memory_add(agent_name, filename, content, priority=5, description=''):
+    """Add a file to agent's working memory."""
+    speicher = get_agent_speicher(agent_name)
+    wm_dir = os.path.join(speicher, 'working_memory')
+    os.makedirs(wm_dir, exist_ok=True)
+    manifest_path = os.path.join(wm_dir, '_manifest.json')
+    if os.path.exists(manifest_path):
+        with open(manifest_path, 'r', encoding='utf-8') as f:
+            manifest = json.load(f)
+    else:
+        manifest = {'max_tokens': 8000, 'auto_cleanup': True, 'files': []}
+    fpath = os.path.join(wm_dir, filename)
+    tmp = fpath + '.tmp'
+    with open(tmp, 'w', encoding='utf-8') as f:
+        f.write(content)
+    os.replace(tmp, fpath)
+    manifest['files'] = [e for e in manifest['files'] if e.get('filename') != filename]
+    manifest['files'].append({
+        'filename': filename,
+        'added': datetime.datetime.now().strftime('%Y-%m-%d'),
+        'added_by': 'agent',
+        'priority': priority,
+        'description': description,
+    })
+    tmp_m = manifest_path + '.tmp'
+    with open(tmp_m, 'w', encoding='utf-8') as f:
+        json.dump(manifest, f, ensure_ascii=False, indent=2)
+    os.replace(tmp_m, manifest_path)
+    return manifest
+
+
+def working_memory_remove(agent_name, filename):
+    """Remove a file from agent's working memory."""
+    speicher = get_agent_speicher(agent_name)
+    wm_dir = os.path.join(speicher, 'working_memory')
+    manifest_path = os.path.join(wm_dir, '_manifest.json')
+    if not os.path.exists(manifest_path):
+        return None
+    with open(manifest_path, 'r', encoding='utf-8') as f:
+        manifest = json.load(f)
+    manifest['files'] = [e for e in manifest['files'] if e.get('filename') != filename]
+    fpath = os.path.join(wm_dir, filename)
+    if os.path.exists(fpath):
+        os.remove(fpath)
+    tmp_m = manifest_path + '.tmp'
+    with open(tmp_m, 'w', encoding='utf-8') as f:
+        json.dump(manifest, f, ensure_ascii=False, indent=2)
+    os.replace(tmp_m, manifest_path)
+    return manifest
+
+
+def working_memory_list(agent_name):
+    """List all files in agent's working memory."""
+    speicher = get_agent_speicher(agent_name)
+    wm_dir = os.path.join(speicher, 'working_memory')
+    manifest_path = os.path.join(wm_dir, '_manifest.json')
+    if not os.path.exists(manifest_path):
+        return {'max_tokens': 8000, 'auto_cleanup': True, 'files': []}
+    with open(manifest_path, 'r', encoding='utf-8') as f:
+        return json.load(f)
+
+
 def ensure_output_dir():
     os.makedirs(OUTPUT_DIR, exist_ok=True)
     return OUTPUT_DIR
@@ -997,6 +1160,7 @@ def send_email_draft(spec):
     subject = spec.get('subject', '')
     body    = spec.get('body', '')
     cc      = spec.get('cc', '')
+    sender  = spec.get('from', '')
 
     # Escape for AppleScript - handle all special chars
     def esc(s):
@@ -1007,19 +1171,91 @@ def send_email_draft(spec):
         return s
 
     cc_line = f'\n        make new cc recipient at end of cc recipients with properties {{address:\"{esc(cc)}\"}}' if cc else ''
+    sender_line = f'\n    set sender of newMessage to "{esc(sender)}"' if sender else ''
 
     script = f'''tell application "Mail"
     set newMessage to make new outgoing message with properties {{subject:"{esc(subject)}", content:"{esc(body)}", visible:true}}
     tell newMessage
         make new to recipient at end of to recipients with properties {{address:"{esc(to)}"}}{cc_line}
-    end tell
+    end tell{sender_line}
     activate
 end tell'''
 
-    result = subprocess.run(['osascript', '-e', script],
-                          capture_output=True, text=True, timeout=10)
-    if result.returncode != 0:
-        raise Exception(f"AppleScript Fehler: {result.stderr.strip()}")
+    subprocess.Popen(['osascript', '-e', script],
+                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    return True
+
+def send_email_reply(spec):
+    """Opens Apple Mail reply to an existing email identified by message_id."""
+    import subprocess
+    to      = spec.get('to', '')
+    subject = spec.get('subject', '')
+    body    = spec.get('body', '')
+    cc      = spec.get('cc', '')
+    sender  = spec.get('from', '')
+    message_id = spec.get('message_id', '')
+    quote_original = spec.get('quote_original', True)
+
+    def esc(s):
+        s = s.replace('\\', '\\\\')
+        s = s.replace('"', '\\"')
+        s = s.replace('\n', '\\n')
+        s = s.replace('\r', '')
+        return s
+
+    # Build CC recipients AppleScript lines
+    cc_lines = ''
+    if cc:
+        for addr in [a.strip() for a in cc.split(',') if a.strip()]:
+            cc_lines += f'\n            make new cc recipient at end of cc recipients with properties {{address:"{esc(addr)}"}}'
+
+    # AppleScript: try to find message by message-id and reply, fallback to new email
+    if message_id:
+        script = f'''tell application "Mail"
+    set foundMsg to missing value
+    set msgId to "{esc(message_id)}"
+    repeat with acct in accounts
+        repeat with mbox in mailboxes of acct
+            try
+                set msgs to (messages of mbox whose message id is msgId)
+                if (count of msgs) > 0 then
+                    set foundMsg to item 1 of msgs
+                    exit repeat
+                end if
+            end try
+        end repeat
+        if foundMsg is not missing value then exit repeat
+    end repeat
+    if foundMsg is not missing value then
+        set replyMsg to reply foundMsg with opening window
+        delay 0.5
+        tell replyMsg
+            set subject to "{esc(subject)}"
+            set content to "{esc(body)}"{cc_lines}
+        end tell
+        {f'set sender of replyMsg to "{esc(sender)}"' if sender else ''}
+    else
+        set newMessage to make new outgoing message with properties {{subject:"{esc(subject)}", content:"{esc(body)}", visible:true}}
+        tell newMessage
+            make new to recipient at end of to recipients with properties {{address:"{esc(to)}"}}{cc_lines}
+        end tell
+        {f'set sender of newMessage to "{esc(sender)}"' if sender else ''}
+    end if
+    activate
+end tell'''
+    else:
+        # No message_id: fallback to regular new email
+        sender_line = f'\n    set sender of newMessage to "{esc(sender)}"' if sender else ''
+        script = f'''tell application "Mail"
+    set newMessage to make new outgoing message with properties {{subject:"{esc(subject)}", content:"{esc(body)}", visible:true}}
+    tell newMessage
+        make new to recipient at end of to recipients with properties {{address:"{esc(to)}"}}{cc_lines}
+    end tell{sender_line}
+    activate
+end tell'''
+
+    subprocess.Popen(['osascript', '-e', script],
+                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     return True
 
 def send_email_reply(spec):
@@ -1991,7 +2227,7 @@ def generate_video(prompt, agent_name, provider_key=None, task_id=None):
                 f.write(vr.content)
             print(f"[VEO] Video gespeichert: {fpath} ({len(vr.content)} bytes)", flush=True)
             task_done(task_id, message='Video fertig')
-            return fname, fpath
+            return fname, fpath, aspect
 
         # Fallback: base64 encoded video
         vid_b64 = samples[0].get('bytesBase64Encoded', samples[0].get('video', {}).get('bytesBase64Encoded', ''))
@@ -2001,7 +2237,7 @@ def generate_video(prompt, agent_name, provider_key=None, task_id=None):
             with open(fpath, 'wb') as f:
                 f.write(base64.b64decode(vid_b64))
             task_done(task_id, message='Video fertig')
-            return fname, fpath
+            return fname, fpath, aspect
 
         # Bekanntes Format nicht erkannt → volle Debug-Ausgabe
         sample_preview = _vjson.dumps(samples[0])[:500]
@@ -3101,7 +3337,56 @@ HTML = """<!DOCTYPE html>
   .code-block-wrapper { position:relative; background:#0d0d0d; border:1px solid #333; border-radius:6px; margin:8px 0; padding:0; }
   .code-block-wrapper pre { margin:0; padding:10px 12px; white-space:pre-wrap; word-wrap:break-word; font-size:12px; }
   .code-block-lang { position:absolute; top:4px; left:10px; font-size:9px; color:#555; text-transform:uppercase; font-family:Inter,sans-serif; }
-  .code-copy-btn { position:absolute; top:4px; right:6px; background:rgba(255,255,255,0.06); border:1px solid rgba(255,255,255,0.12); border-radius:5px; color:#888; font-size:11px; padding:2px 8px; cursor:pointer; transition:background 0.15s, color 0.15s; z-index:10; font-family:Inter,sans-serif; }
+  /* Email Search Modal */
+  #email-search-modal { display:none; position:fixed; inset:0; background:rgba(0,0,0,0.85); z-index:200; align-items:center; justify-content:center; }
+  #email-search-modal.show { display:flex; }
+  #email-search-box { background:#1a1a1a; border:1px solid #333; border-radius:12px; padding:20px; width:600px; max-width:92vw; max-height:85vh; display:flex; flex-direction:column; }
+  #email-search-box h2 { margin:0 0 12px; font-size:16px; color:#e0e0e0; }
+  .esm-filters { display:flex; gap:8px; margin-bottom:10px; flex-wrap:wrap; }
+  .esm-filter { flex:1; min-width:120px; }
+  .esm-filter label { display:block; font-size:10px; color:#666; margin-bottom:3px; text-transform:uppercase; letter-spacing:0.5px; }
+  .esm-filter input { width:100%; background:#111; border:1px solid #333; border-radius:5px; color:#e0e0e0; padding:6px 8px; font-size:13px; font-family:Inter,sans-serif; box-sizing:border-box; }
+  .esm-filter input:focus { border-color:#4a8aca; outline:none; }
+  .esm-filter input::placeholder { color:#555; }
+  #esm-results { flex:1; overflow-y:auto; max-height:50vh; margin-top:8px; }
+  .esm-result { padding:10px 12px; border:1px solid #2a2a3e; border-radius:8px; margin:5px 0; cursor:pointer; transition:background 0.15s, border-color 0.15s; background:#111; }
+  .esm-result:hover { background:#1a1a3a; border-color:#4a8aca; }
+  .esm-result-from { font-size:13px; color:#e0e0e0; }
+  .esm-result-email { font-size:11px; color:#777; margin-left:4px; }
+  .esm-result-subject { font-size:12px; color:#aaa; margin-top:3px; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+  .esm-result-date { font-size:10px; color:#555; float:right; }
+  .esm-result-meta { font-size:10px; color:#555; margin-top:2px; }
+  .esm-hint { text-align:center; color:#555; font-size:12px; padding:20px 0; }
+  .esm-loading { text-align:center; color:#888; font-size:12px; padding:15px 0; }
+  .esm-footer { display:flex; justify-content:flex-end; margin-top:10px; gap:8px; }
+  .esm-btn { padding:6px 16px; border-radius:6px; border:none; cursor:pointer; font-size:13px; font-family:Inter,sans-serif; }
+  .esm-btn-close { background:#333; color:#aaa; }
+  .esm-btn-close:hover { background:#444; color:#fff; }
+  /* Email Card in Chat */
+  .email-card { background:#1a1a2e; border:1px solid #334; border-radius:10px; margin:8px 0; overflow:hidden; font-family:Inter,sans-serif; }
+  .email-card-header { padding:12px 16px 8px; border-bottom:1px solid #2a2a3e; }
+  .email-card-label { font-size:10px; color:#6a8aca; text-transform:uppercase; letter-spacing:1px; font-weight:600; margin-bottom:8px; }
+  .email-card-row { font-size:12px; color:#bbb; margin:3px 0; line-height:1.5; }
+  .email-card-row strong { color:#e0e0e0; font-weight:500; min-width:60px; display:inline-block; }
+  .email-card-subject { font-size:14px; color:#e8e8e8; font-weight:600; margin:6px 0 2px; }
+  .email-card-date { font-size:11px; color:#666; }
+  .email-card-body { padding:12px 16px; max-height:400px; overflow-y:auto; font-size:13px; color:#ccc; line-height:1.6; white-space:pre-wrap; word-wrap:break-word; border-top:1px solid #2a2a3e; }
+  .email-card-body::-webkit-scrollbar { width:6px; }
+  .email-card-body::-webkit-scrollbar-thumb { background:#444; border-radius:3px; }
+  .email-card-msgid { padding:4px 16px 8px; font-size:10px; color:#444; word-break:break-all; }
+  .email-card-actions { padding:8px 16px 12px; display:flex; gap:8px; border-top:1px solid #2a2a3e; }
+  .email-card-btn { padding:6px 16px; border-radius:6px; border:none; cursor:pointer; font-size:12px; font-family:Inter,sans-serif; transition:background 0.15s; }
+  .email-card-btn-reply { background:#4a8aca; color:#fff; }
+  .email-card-btn-reply:hover { background:#5a9ada; }
+  .email-card-btn-close { background:#333; color:#aaa; }
+  .email-card-btn-close:hover { background:#444; color:#fff; }
+  .email-search-card { background:#1a1a2e; border:1px solid #334; border-radius:8px; padding:10px 14px; margin:6px 0; cursor:pointer; transition:background 0.15s, border-color 0.15s; }
+  .email-search-card:hover { background:#22224a; border-color:#4a8aca; }
+  .email-search-card-from { font-size:13px; color:#e0e0e0; }
+  .email-search-card-email { font-size:11px; color:#888; margin-left:4px; }
+  .email-search-card-subject { font-size:12px; color:#aaa; margin-top:3px; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+  .email-search-card-date { font-size:10px; color:#555; float:right; }
+    .code-copy-btn { position:absolute; top:4px; right:6px; background:rgba(255,255,255,0.06); border:1px solid rgba(255,255,255,0.12); border-radius:5px; color:#888; font-size:11px; padding:2px 8px; cursor:pointer; transition:background 0.15s, color 0.15s; z-index:10; font-family:Inter,sans-serif; }
   .code-copy-btn:hover { background:rgba(255,255,255,0.14); color:#fff; }
   .code-copy-btn.copied { color:#4caf50; border-color:#4caf50; }
   .output-block { position:relative; background:#0f1a0f; border-left:3px solid #4a8a4a; border-radius:4px; padding:12px 16px; margin:8px 0; }
@@ -3149,6 +3434,7 @@ HTML = """<!DOCTYPE html>
   <div id="header-spacer" style="flex:1;"></div><!-- AGENT_BTN_V1 -->
   <button class="hdr-btn" onclick="newSession()" style="background:#2a3a2a;border-color:#4a6a4a;color:#a0d090;">+ Neu <span class="shortcut-label">[N]</span></button>
   <button id="agent-btn" class="hdr-btn" data-tooltip-kind="agent" onclick="showAgentModal()"><span id="agent-label">Kein Agent</span> <span class="shortcut-label">[A]</span></button>
+  <button id="admin-btn" class="hdr-btn" onclick="window.open('/admin/access-control', '_blank')" title="Access Control">\u2699 Admin</button>
   <select id="provider-select" class="hdr-select" onchange="onProviderChange()">
     <option>Anthropic</option>
   </select>
@@ -3234,6 +3520,24 @@ HTML = """<!DOCTYPE html>
     <div class="new-agent-row">
       <input type="text" class="new-agent-input" id="new-agent-name" placeholder="Neuer Agent..." />
       <button class="new-agent-btn" onclick="createAgent()">+ Neu</button>
+    </div>
+  </div>
+</div>
+
+<div id="email-search-modal">
+  <div id="email-search-box">
+    <h2>\u2709 E-Mail suchen</h2>
+    <div class="esm-filters">
+      <div class="esm-filter"><label>Von</label><input type="text" id="esm-from" placeholder="Absender..." /></div>
+      <div class="esm-filter"><label>Betreff</label><input type="text" id="esm-subject" placeholder="Betreff..." /></div>
+    </div>
+    <div class="esm-filters">
+      <div class="esm-filter"><label>An / CC</label><input type="text" id="esm-to" placeholder="Empfaenger..." /></div>
+      <div class="esm-filter"><label>Freitext</label><input type="text" id="esm-body" placeholder="Inhalt..." /></div>
+    </div>
+    <div id="esm-results"><div class="esm-hint">Mindestens 2 Zeichen in ein Feld eingeben...</div></div>
+    <div class="esm-footer">
+      <button class="esm-btn esm-btn-close" onclick="closeEmailSearchModal()">Schliessen</button>
     </div>
   </div>
 </div>
@@ -3551,6 +3855,16 @@ async function selectAgent(name) {
   document.getElementById('msg-input').placeholder = 'Nachricht an ' + displayName + '...';
   document.getElementById('messages').innerHTML = '';
   document.getElementById('ctx-items').innerHTML = '';
+  // Restore draft text for this agent
+  var savedDraft = localStorage.getItem('draft_' + name);
+  if (savedDraft) { document.getElementById('msg-input').value = savedDraft; autoResize(document.getElementById('msg-input')); }
+  // Render recovered messages from today's session
+  if (data.recovered_messages && data.recovered_messages.length > 0) {
+    data.recovered_messages.forEach(function(m) {
+      if (m.role === 'user') { addUserMsg(m.content); }
+      else if (m.role === 'assistant') { addBotMsg(m.content); }
+    });
+  }
   // Restore saved provider/model preference for this agent (synchronous from response)
   if (data.pref_provider && data.pref_model) {
     try {
@@ -3853,6 +4167,7 @@ function addMessage(role, text, modelName, providerDisplay, modelDisplay) {
     addSectionCopyButtons(div, text);
   } else {
     div.innerHTML = '<div class="bubble"><pre>' + escHtml(text) + '</pre></div><div class="meta">' + meta + '</div>';
+    addCodeCopyButtons(div);
   }
   msgs.appendChild(div);
   scrollDown();
@@ -3872,14 +4187,46 @@ function copyToClipboard(text, btn, label) {
 }
 
 function addCodeCopyButtons(msgEl) {
+  // Handle custom code-block-wrapper (renderCodeBlocks fallback)
   var blocks = msgEl.querySelectorAll('.code-block-wrapper');
   blocks.forEach(function(wrapper) {
+    if (wrapper.querySelector('.code-copy-btn')) return;
     var code = wrapper.getAttribute('data-code');
     if (!code) return;
     var btn = document.createElement('button');
     btn.className = 'code-copy-btn';
     btn.textContent = 'Kopieren';
     btn.onclick = function() { copyToClipboard(code, btn, 'Kopieren'); };
+    wrapper.appendChild(btn);
+  });
+  // Handle marked.js rendered <pre><code> blocks
+  var pres = msgEl.querySelectorAll('pre');
+  pres.forEach(function(pre) {
+    if (pre.closest('.code-block-wrapper') || pre.closest('.output-block')) return;
+    if (pre.parentNode.classList && pre.parentNode.classList.contains('code-block-wrapper')) return;
+    if (pre.querySelector('.code-copy-btn')) return;
+    var codeEl = pre.querySelector('code');
+    var codeText = codeEl ? codeEl.textContent : pre.textContent;
+    if (!codeText || codeText.trim().length < 2) return;
+    // Wrap in code-block-wrapper for consistent styling
+    var wrapper = document.createElement('div');
+    wrapper.className = 'code-block-wrapper';
+    pre.parentNode.insertBefore(wrapper, pre);
+    wrapper.appendChild(pre);
+    // Detect language from class (marked adds language-xxx)
+    if (codeEl) {
+      var langClass = (codeEl.className || '').match(/language-(\w+)/);
+      if (langClass) {
+        var langLabel = document.createElement('span');
+        langLabel.className = 'code-block-lang';
+        langLabel.textContent = langClass[1];
+        wrapper.insertBefore(langLabel, pre);
+      }
+    }
+    var btn = document.createElement('button');
+    btn.className = 'code-copy-btn';
+    btn.textContent = 'Kopieren';
+    btn.onclick = function() { copyToClipboard(codeText, btn, 'Kopieren'); };
     wrapper.appendChild(btn);
   });
 }
@@ -4106,8 +4453,11 @@ function addVideoPreview(vid) {
   const msgs = document.getElementById('messages');
   const div = document.createElement('div');
   div.style.cssText = 'text-align:center;padding:12px 0;';
-  div.innerHTML = '<video controls style="max-width:600px;border-radius:8px;border:1px solid #333;"><source src="/download_file?path=' + encodeURIComponent(vid.path) + '" type="video/mp4"></video><br>' +
-    '<span style="font-size:11px;color:#888;font-family:Inter,sans-serif;">' + vid.filename + '</span><br>' +
+  var videoStyle = vid.is_portrait
+    ? 'max-width:280px;max-height:500px;aspect-ratio:9/16;border-radius:8px;border:1px solid #333;display:block;margin:0 auto;'
+    : 'max-width:600px;border-radius:8px;border:1px solid #333;';
+  div.innerHTML = '<video controls style="' + videoStyle + '"><source src="/download_file?path=' + encodeURIComponent(vid.path) + '" type="video/mp4"></video><br>' +
+    '<span style="font-size:11px;color:#888;font-family:Inter,sans-serif;">' + vid.filename + (vid.is_portrait ? ' (Portrait 9:16)' : '') + '</span><br>' +
     '<a href="/download_file?path=' + encodeURIComponent(vid.path) + '" download="' + vid.filename + '" ' +
     'style="display:inline-block;margin-top:6px;background:#f0c060;color:#111;padding:6px 20px;border-radius:6px;font-size:12px;font-weight:700;text-decoration:none;font-family:Inter,sans-serif;">\u2b07 Video herunterladen</a>';
   msgs.appendChild(div);
@@ -4590,6 +4940,8 @@ const _SLASH_COMMANDS = [
   // SLASH_CLUSTER_V1: Gruppierte Slash Commands
   // ─── Kommunikation ───
   {cmd: '/create-email', label: '/create-email', desc: 'E-Mail Draft erstellen', template: 'Erstelle eine E-Mail an [Empfaenger] zum Thema: ', group: 'Kommunikation'},
+  {cmd: '/create-email-reply', label: '/create-email-reply', desc: 'E-Mail Antwort erstellen', template: 'Antworte auf die E-Mail von [Absender] zum Thema [Betreff]: ', group: 'Kommunikation'},
+  {cmd: '/reply', label: '/reply [suche]', desc: 'E-Mail suchen und im Chat oeffnen', template: '/reply ', group: 'Kommunikation'},
   {cmd: '/create-whatsapp', label: '/create-whatsapp', desc: 'WhatsApp-Nachricht', template: 'Schreibe eine WhatsApp-Nachricht an [Name]: ', group: 'Kommunikation'},
   {cmd: '/create-slack', label: '/create-slack', desc: 'Slack-Nachricht', template: 'Schreibe eine Slack-Nachricht an [#channel oder Name]: ', group: 'Kommunikation'},
   // ─── Kalender ───
@@ -4634,6 +4986,9 @@ let _slashAcIdx = -1;
 function onInputHandler(el) {
   autoResize(el);
   const val = el.value;
+  // Draft-save: persist typed text per agent
+  var _draftAgent = getAgentName();
+  if (_draftAgent && _draftAgent !== 'Kein Agent') { localStorage.setItem('draft_' + (document.getElementById('agent-label').dataset.agentName || _draftAgent), val); }
   // Show/filter slash dropdown when typing "/"
   if (val.startsWith('/') && !val.includes(' ')) {
     showSlashAutocomplete(el, val);
@@ -4699,8 +5054,174 @@ function hideSlashAutocomplete() {
   _slashAcIdx = -1;
 }
 
+// ─── EMAIL SEARCH MODAL + CHAT FLOW ───────────────────────────────────
+let _emailContext = null;
+let _esmDebounce = null;
+
+function showEmailSearchModal() {
+  document.getElementById('esm-from').value = '';
+  document.getElementById('esm-subject').value = '';
+  document.getElementById('esm-to').value = '';
+  document.getElementById('esm-body').value = '';
+  document.getElementById('esm-results').innerHTML = '<div class="esm-hint">Mindestens 2 Zeichen in ein Feld eingeben...</div>';
+  var m = document.getElementById('email-search-modal');
+  m.classList.add('show'); m.style.display = 'flex';
+  setTimeout(function() { document.getElementById('esm-from').focus(); }, 100);
+}
+
+function closeEmailSearchModal() {
+  var m = document.getElementById('email-search-modal');
+  m.classList.remove('show'); m.style.display = 'none';
+}
+
+function _esmDoSearch() {
+  var from = document.getElementById('esm-from').value.trim();
+  var subj = document.getElementById('esm-subject').value.trim();
+  var to = document.getElementById('esm-to').value.trim();
+  var body = document.getElementById('esm-body').value.trim();
+  // Need at least 2 chars in any field
+  var q = from || subj || to || body;
+  if (!q || q.length < 2) { document.getElementById('esm-results').innerHTML = '<div class="esm-hint">Mindestens 2 Zeichen in ein Feld eingeben...</div>'; return; }
+  document.getElementById('esm-results').innerHTML = '<div class="esm-loading">Suche...</div>';
+  var agent = getAgentName();
+  var params = 'agent=' + encodeURIComponent(agent);
+  if (from) params += '&from=' + encodeURIComponent(from);
+  if (subj) params += '&subject=' + encodeURIComponent(subj);
+  if (to) params += '&to=' + encodeURIComponent(to);
+  if (body) params += '&body=' + encodeURIComponent(body);
+  // Also send combined q for backwards compat
+  params += '&q=' + encodeURIComponent([from, subj, to, body].filter(Boolean).join(' '));
+  fetch('/api/email-search?' + params)
+    .then(function(r) { return r.json(); })
+    .then(function(results) {
+      var container = document.getElementById('esm-results');
+      if (!results || results.length === 0) {
+        container.innerHTML = '<div class="esm-hint">Keine E-Mails gefunden</div>';
+        return;
+      }
+      container.innerHTML = '';
+      results.forEach(function(item, idx) {
+        var div = document.createElement('div');
+        div.className = 'esm-result';
+        div.innerHTML = '<div><span class="esm-result-from">' + escHtml(item.from_name || item.from_email) + '</span>'
+          + (item.from_name ? '<span class="esm-result-email">&lt;' + escHtml(item.from_email) + '&gt;</span>' : '')
+          + '<span class="esm-result-date">' + escHtml(item.date) + '</span></div>'
+          + '<div class="esm-result-subject">' + escHtml(item.subject || '(kein Betreff)') + '</div>'
+          + (item.to ? '<div class="esm-result-meta">An: ' + escHtml(item.to).substring(0,60) + '</div>' : '');
+        div.onclick = function() { _esmSelectEmail(item); };
+        container.appendChild(div);
+      });
+    })
+    .catch(function(e) { document.getElementById('esm-results').innerHTML = '<div class="esm-hint">Fehler: ' + escHtml(e.message) + '</div>'; });
+}
+
+function _esmSelectEmail(item) {
+  closeEmailSearchModal();
+  _openEmailInChat(item);
+}
+
+// Attach search listeners on DOMContentLoaded
+document.addEventListener('DOMContentLoaded', function() {
+  ['esm-from','esm-subject','esm-to','esm-body'].forEach(function(id) {
+    var el = document.getElementById(id);
+    if (el) {
+      el.addEventListener('input', function() {
+        clearTimeout(_esmDebounce);
+        _esmDebounce = setTimeout(_esmDoSearch, 250);
+      });
+      el.addEventListener('keydown', function(e) {
+        if (e.key === 'Escape') closeEmailSearchModal();
+      });
+    }
+  });
+  var modal = document.getElementById('email-search-modal');
+  if (modal) modal.addEventListener('click', function(e) { if (e.target === modal) closeEmailSearchModal(); });
+});
+
+function _openEmailInChat(emailMeta) {
+  addStatusMsg('Lade E-Mail...');
+  var agent = getAgentName();
+  fetch('/api/email-content?agent=' + encodeURIComponent(agent) + '&message_id=' + encodeURIComponent(emailMeta.message_id || '') + '&from_email=' + encodeURIComponent(emailMeta.from_email || '') + '&subject=' + encodeURIComponent(emailMeta.subject || ''))
+    .then(function(r) { return r.json(); })
+    .then(function(data) {
+      if (!data.ok) { addStatusMsg('E-Mail konnte nicht geladen werden: ' + (data.error || 'unbekannt')); return; }
+      _showEmailCard(data);
+    })
+    .catch(function(e) { addStatusMsg('Fehler: ' + e.message); });
+}
+
+function _showEmailCard(email) {
+  var msgs = document.getElementById('messages');
+  var div = document.createElement('div');
+  div.className = 'msg assistant';
+  var time = new Date().toLocaleTimeString('de-DE', {hour:'2-digit', minute:'2-digit'});
+  var fromDisplay = email.from_name ? escHtml(email.from_name) + ' &lt;' + escHtml(email.from_email) + '&gt;' : escHtml(email.from_email);
+  var bodyText = email.body || '(kein Inhalt)';
+  var ccDisplay = email.cc ? escHtml(email.cc) : '';
+  var cardId = 'ec-' + Date.now();
+  var html = '<div class="bubble"><div class="email-card">'
+    + '<div class="email-card-header">'
+    + '<div class="email-card-label">\\u2709 E-Mail</div>'
+    + '<div class="email-card-subject">' + escHtml(email.subject || '(kein Betreff)') + '</div>'
+    + '<div class="email-card-row"><strong>Von:</strong> ' + fromDisplay + '</div>'
+    + '<div class="email-card-row"><strong>An:</strong> ' + escHtml(email.to || '') + '</div>'
+    + (ccDisplay ? '<div class="email-card-row"><strong>CC:</strong> ' + ccDisplay + '</div>' : '')
+    + '<div class="email-card-date">' + escHtml(email.date || '') + '</div>'
+    + '</div>'
+    + '<div class="email-card-body">' + escHtml(bodyText) + '</div>'
+    + (email.message_id ? '<div class="email-card-msgid">Message-ID: ' + escHtml(email.message_id) + '</div>' : '')
+    + '<div class="email-card-actions">'
+    + '<button class="email-card-btn email-card-btn-reply" data-card="' + cardId + '">Antworten</button>'
+    + '<button class="email-card-btn email-card-btn-close" data-card="' + cardId + '">Schliessen</button>'
+    + '</div>'
+    + '</div></div><div class="meta">' + time + '</div>';
+  div.innerHTML = html;
+  div.id = cardId;
+  msgs.appendChild(div);
+  scrollDown();
+
+  div.querySelector('.email-card-btn-reply').onclick = function() {
+    var ownAddrs = ['moritz.cremer@me.com', 'londoncityfox@gmail.com', 'moritz.cremer@signicat.com'];
+    var ccParts = [];
+    [email.to || '', email.cc || ''].forEach(function(field) {
+      if (!field) return;
+      field.split(',').forEach(function(addr) {
+        addr = addr.trim();
+        var em = addr.includes('<') ? addr.substring(addr.indexOf('<')+1, addr.indexOf('>')) : addr;
+        if (em && !ownAddrs.includes(em.toLowerCase().trim())) ccParts.push(addr);
+      });
+    });
+    _emailContext = {
+      from_email: email.from_email || '',
+      from_name: email.from_name || '',
+      subject: email.subject || '',
+      message_id: email.message_id || '',
+      cc: ccParts.join(', ')
+    };
+    addStatusMsg('E-Mail-Kontext gesetzt. Schreibe jetzt deine Antwort-Anweisung.');
+    document.getElementById('msg-input').focus();
+    this.textContent = '\\u2713 Kontext gesetzt';
+    this.style.background = '#2a5a2a';
+    this.onclick = null;
+  };
+  div.querySelector('.email-card-btn-close').onclick = function() { div.remove(); };
+}
+
+function _getAndClearEmailContext() {
+  if (!_emailContext) return null;
+  var ctx = _emailContext;
+  _emailContext = null;
+  return ctx;
+}
+
 function selectSlashCmd(inputEl, cmd) {
   var entry = _SLASH_COMMANDS.find(c => c.cmd === cmd);
+  if (cmd === '/create-email-reply' || cmd === '/reply') {
+    inputEl.value = '';
+    hideSlashAutocomplete();
+    showEmailSearchModal();
+    return;
+  }
   if (entry && entry.template) {
     inputEl.value = entry.template;
     hideSlashAutocomplete();
@@ -5081,6 +5602,8 @@ async function sendMessage() {
   const text = input.value.trim();
   if (!text) return;
   input.value = ''; input.style.height = 'auto';
+  var _sendAgent = document.getElementById('agent-label').dataset.agentName;
+  if (_sendAgent) { localStorage.removeItem('draft_' + _sendAgent); }
   hideSlashAutocomplete();
 
   // /find and /find_global commands — intercept, do NOT send to AI
@@ -5303,6 +5826,12 @@ async function handleCanvaCommand(text) {
 }
 
 async function doSendChat(text) {
+  // Inject email context if set (one-time use)
+  var ectx = _getAndClearEmailContext();
+  if (ectx) {
+    var ctxBlock = '[E-MAIL KONTEXT: Von: ' + ectx.from_email + (ectx.from_name ? ' (' + ectx.from_name + ')' : '') + ', Betreff: ' + ectx.subject + ', Message-ID: ' + ectx.message_id + (ectx.cc ? ', CC: ' + ectx.cc : '') + ']\\n\\nUser-Anweisung: ';
+    text = ctxBlock + text;
+  }
   startTyping(text.substring(0,50));
   startTaskDiscovery();
   let data;
@@ -5630,11 +6159,71 @@ def close_session():
     close_current_session(state)
     return jsonify({'ok': True})
 
+def parse_konversation_file(pfad):
+    """Parse a konversation_*.txt file into a verlauf list (list of dicts with role/content)."""
+    try:
+        with open(pfad, 'r', encoding='utf-8', errors='replace') as f:
+            raw = f.read()
+        messages = []
+        lines = raw.split('\n')
+        i = 0
+        while i < len(lines) and not lines[i].startswith('[') and not lines[i].startswith('Du: '):
+            i += 1
+        current_role = None
+        current_content = []
+        for line in lines[i:]:
+            if line.startswith('Du: '):
+                if current_role and current_content:
+                    messages.append({'role': current_role, 'content': '\n'.join(current_content).strip()})
+                current_role = 'user'
+                current_content = [line[4:]]
+            elif line.startswith('Assistant: '):
+                if current_role and current_content:
+                    messages.append({'role': current_role, 'content': '\n'.join(current_content).strip()})
+                current_role = 'assistant'
+                current_content = [line[11:]]
+            elif current_role:
+                current_content.append(line)
+        if current_role and current_content:
+            messages.append({'role': current_role, 'content': '\n'.join(current_content).strip()})
+        return [m for m in messages if m['content'].strip()]
+    except Exception as e:
+        print(f'[PARSE] Error parsing {pfad}: {e}')
+        return []
+
+
+def find_latest_konversation(speicher, name):
+    """Find the most recent konversation file for today. Returns (path, verlauf) or (None, [])."""
+    import glob as _glob_mod
+    today = datetime.datetime.now().strftime("%Y-%m-%d")
+    parent = get_parent_agent(name)
+    if parent:
+        sub_label = name.split('_', 1)[1]
+        pattern = os.path.join(speicher, 'konversation_' + today + '_*_' + sub_label + '.txt')
+    else:
+        pattern = os.path.join(speicher, 'konversation_' + today + '_*.txt')
+    files = sorted(_glob_mod.glob(pattern))
+    if parent:
+        pass
+    else:
+        files = [f for f in files if '_' not in os.path.basename(f).replace('konversation_' + today + '_', '', 1).replace('.txt', '') or os.path.basename(f).count('_') == 2]
+    if not files:
+        return None, []
+    latest = files[-1]
+    verlauf = parse_konversation_file(latest)
+    return latest, verlauf
+
+
 @app.route('/select_agent', methods=['POST'])
 def select_agent():
     session_id = request.json.get('session_id', 'default')
     state = get_session(session_id)
     name = request.json['agent']
+
+    # Guard: block agent switch while processing
+    if state.get('processing'):
+        return jsonify({'ok': False, 'error': 'Agent-Wechsel nicht moeglich waehrend eine Antwort generiert wird. Bitte warte bis die Antwort fertig ist.'})
+
     prompt_file = os.path.join(AGENTS_DIR, name + '.txt')
     if not os.path.exists(prompt_file):
         return jsonify({'ok': False, 'error': f'Agent "{name}" nicht gefunden (keine .txt Datei)'})
@@ -5660,10 +6249,13 @@ def select_agent():
     # Migrate old conversations not yet indexed
     migrated = migrate_old_conversations(speicher)
 
+    # Build working memory (persistent agent knowledge base)
+    wm_ctx = load_working_memory(name)
+
     # Build memory context (always from parent's storage)
     display_name = get_agent_display_name(name)
     memory_ctx = build_memory_context(speicher, display_name)
-    system_prompt = base_prompt + memory_ctx
+    system_prompt = base_prompt + wm_ctx + memory_ctx
 
     # Memory info for UI
     index = load_index(speicher)
@@ -5675,18 +6267,42 @@ def select_agent():
     else:
         memory_info = None
 
-    # Conversation log: sub-agents add their name as suffix
-    datum = datetime.datetime.now().strftime("%Y-%m-%d_%H-%M")
-    parent = get_parent_agent(name)
-    if parent:
-        sub_label = name.split('_', 1)[1]
-        dateiname = os.path.join(speicher, 'konversation_' + datum + '_' + sub_label + '.txt')
+    # Load saved provider/model preference for this agent
+    agent_prefs = _load_agent_prefs()
+    agent_pref = agent_prefs.get(name, {})
+    pref_provider = agent_pref.get('provider', '')
+    pref_model = agent_pref.get('model', '')
+
+    # Re-click same agent: keep current session, don't reset
+    if name == state.get('agent'):
+        state['system_prompt'] = system_prompt
+        return jsonify({'ok': True, 'memory_info': memory_info, 'base_prompt': system_prompt,
+                        'pref_provider': pref_provider, 'pref_model': pref_model})
+
+    # Save current session before switching (defensive)
+    if state.get('agent') and state.get('verlauf'):
+        auto_save_session(session_id)
+
+    # Try to resume today's latest conversation for the new agent
+    latest_path, latest_verlauf = find_latest_konversation(speicher, name)
+    if latest_path and latest_verlauf:
+        dateiname = latest_path
+        new_verlauf = latest_verlauf
     else:
-        dateiname = os.path.join(speicher, 'konversation_' + datum + '.txt')
-    tmp_path = dateiname + '.tmp'
-    with open(tmp_path, 'w') as f:
-        f.write('Agent: ' + name + '\nDatum: ' + datum + '\n\n')
-    os.replace(tmp_path, dateiname)
+        # Create new conversation file
+        datum = datetime.datetime.now().strftime("%Y-%m-%d_%H-%M")
+        parent = get_parent_agent(name)
+        if parent:
+            sub_label = name.split('_', 1)[1]
+            dateiname = os.path.join(speicher, 'konversation_' + datum + '_' + sub_label + '.txt')
+        else:
+            dateiname = os.path.join(speicher, 'konversation_' + datum + '.txt')
+        new_verlauf = []
+    if not latest_path:
+        tmp_path = dateiname + '.tmp'
+        with open(tmp_path, 'w') as f:
+            f.write('Agent: ' + name + '\nDatum: ' + datetime.datetime.now().strftime("%Y-%m-%d_%H-%M") + '\n\n')
+        os.replace(tmp_path, dateiname)
 
     # Add file creation capability to system prompt
     file_capability = """
@@ -5707,10 +6323,10 @@ Fuer PowerPoint (.pptx):
 [CREATE_FILE:pptx:{"title":"Praesentation","slides":[{"type":"title","heading":"Untertitel"},{"type":"content","heading":"Folientitel","body":"Einleitungstext","bullets":["Punkt 1","Punkt 2"],"footer":"Fusszeile"}]}]
 
 Fuer E-Mail-Draft (oeffnet Apple Mail):
-[CREATE_EMAIL:{"to":"empfaenger@example.com","cc":"","subject":"Betreff","body":"E-Mail Text hier"}]
+[CREATE_EMAIL:{"to":"empfaenger@example.com","cc":"","subject":"Betreff","body":"E-Mail Text hier","from":"optionale-absender@example.com"}]
 
 Fuer E-Mail-Antwort (oeffnet Apple Mail Reply mit korrektem Threading):
-[CREATE_EMAIL_REPLY:{"message_id":"<original-message-id@domain.com>","to":"absender@example.com","cc":"andere@example.com","subject":"Re: Betreff","body":"Antworttext hier","quote_original":true}]
+[CREATE_EMAIL_REPLY:{"message_id":"<original-message-id@domain.com>","to":"absender@example.com","cc":"andere@example.com","subject":"Re: Betreff","body":"Antworttext hier","quote_original":true,"from":"optionale-absender@example.com"}]
 
 WICHTIG: Du schickst NIEMALS eine E-Mail direkt ab. Du erstellst IMMER nur einen Draft der in Apple Mail geoeffnet wird. Das gilt fuer alle Formulierungen: 'schreibe', 'sende', 'schick', 'antworte', 'reply', 'forward' — immer CREATE_EMAIL oder CREATE_EMAIL_REPLY, niemals direkt senden.
 
@@ -5723,6 +6339,7 @@ Wenn du auf eine E-Mail antwortest (z.B. "antworte auf diese E-Mail", "reply", "
 - body: Dein Antworttext
 - quote_original: true wenn das Original zitiert werden soll (Standard), false wenn nicht
 - Falls keine message_id verfuegbar: verwende CREATE_EMAIL als Fallback
+- from: (Optional) Absender-E-Mail-Adresse. Wenn angegeben, wird dieser Account in Apple Mail als Sender verwendet. Nur setzen wenn ein bestimmter Absender-Account gewuenscht ist.
 
 Verwende dies immer wenn der Nutzer ein Dokument, eine Tabelle, PDF, Praesentation oder E-Mail benoetigt.
 
@@ -5752,15 +6369,9 @@ WICHTIG: Slack-Nachrichten werden NIEMALS automatisch gesendet. Die App wird geo
 
     system_prompt = system_prompt + file_capability
 
-    # Load saved provider/model preference for this agent
-    agent_prefs = _load_agent_prefs()
-    agent_pref = agent_prefs.get(name, {})
-    pref_provider = agent_pref.get('provider', '')
-    pref_model = agent_pref.get('model', '')
-
     update_dict = {
         'agent': name, 'system_prompt': system_prompt, 'speicher': speicher,
-        'verlauf': [], 'dateiname': dateiname, 'kontext_items': [], 'session_files': []
+        'verlauf': new_verlauf, 'dateiname': dateiname, 'kontext_items': [], 'session_files': []
     }
     # Set provider/model from saved preference (if available)
     if pref_provider:
@@ -5774,7 +6385,8 @@ WICHTIG: Slack-Nachrichten werden NIEMALS automatisch gesendet. Die App wird geo
     if build_index_async and state.get('speicher'):
         build_index_async(state['speicher'])
     return jsonify({'ok': True, 'memory_info': memory_info, 'base_prompt': system_prompt,
-                    'pref_provider': pref_provider, 'pref_model': pref_model})
+                    'pref_provider': pref_provider, 'pref_model': pref_model,
+                    'recovered_messages': new_verlauf if new_verlauf else []})
 
 
 @app.route('/new_conversation', methods=['POST'])
@@ -5795,6 +6407,184 @@ def new_conversation():
     state['kontext_items'] = []
     state['session_files'] = []
     return jsonify({'ok': True})
+
+# ─── ACCESS CONTROL ───────────────────────────────────────────────────────
+ACCESS_CONTROL_FILE = os.path.join(BASE, "config", "access_control.json")
+
+def _load_access_control():
+    try:
+        with open(ACCESS_CONTROL_FILE, 'r') as f:
+            return json.load(f)
+    except Exception:
+        return {"agents": {}, "last_modified": "", "version": "1.0"}
+
+
+@app.route('/api/access-control', methods=['GET'])
+def api_access_control_get():
+    return jsonify(_load_access_control())
+
+
+@app.route('/api/access-control', methods=['POST'])
+def api_access_control_post():
+    import datetime as _dt
+    data = request.get_json(silent=True)
+    if not data or 'agents' not in data:
+        return jsonify({'success': False, 'error': 'Ungueltige Eingabe: agents fehlt'}), 400
+    # Validate: each agent must exist as .txt in AGENTS_DIR
+    valid_agents = set()
+    if os.path.exists(AGENTS_DIR):
+        for fname in os.listdir(AGENTS_DIR):
+            if fname.endswith('.txt') and '.backup_' not in fname:
+                valid_agents.add(fname[:-4])
+    for agent in data['agents'].keys():
+        if agent not in valid_agents:
+            return jsonify({'success': False, 'error': f'Unbekannter Agent: {agent}'}), 400
+    # Write
+    data['last_modified'] = _dt.datetime.now().isoformat()
+    data.setdefault('version', '1.0')
+    try:
+        os.makedirs(os.path.dirname(ACCESS_CONTROL_FILE), exist_ok=True)
+        with open(ACCESS_CONTROL_FILE, 'w') as f:
+            json.dump(data, f, indent=2, ensure_ascii=False)
+        return jsonify({'success': True, 'saved_at': data['last_modified']})
+    except Exception as e:
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+
+@app.route('/admin/access-control', methods=['GET'])
+def admin_access_control_page():
+    html = """<!DOCTYPE html>
+<html><head><meta charset="UTF-8"><title>Access Control — AssistantDev</title>
+<style>
+* { box-sizing:border-box; }
+body { background:#1a1a2e; color:#e0e0e0; font-family:-apple-system,Inter,sans-serif; margin:0; padding:30px; }
+h1 { color:#f0c060; font-size:24px; margin:0 0 8px; }
+.subtitle { color:#888; font-size:13px; margin-bottom:24px; }
+.container { max-width:900px; margin:0 auto; }
+.agent-card { background:#22224a; border:1px solid #334; border-radius:10px; padding:18px; margin:12px 0; }
+.agent-name { font-size:16px; font-weight:600; color:#e0e0e0; margin-bottom:4px; }
+.agent-desc { font-size:12px; color:#888; margin-bottom:14px; line-height:1.5; }
+.field-row { margin:10px 0; }
+.field-row label { display:inline-flex; align-items:center; color:#ccc; font-size:13px; cursor:pointer; }
+.field-row input[type=checkbox] { margin-right:8px; accent-color:#4a8aca; }
+.field-row span.hint { color:#666; font-size:11px; margin-left:6px; }
+.shared-options { display:flex; gap:12px; margin-top:6px; padding-left:22px; }
+.cross-input { background:#111; border:1px solid #334; color:#e0e0e0; padding:6px 10px; border-radius:5px; font-size:12px; width:100%; font-family:Inter,sans-serif; margin-top:4px; }
+.btn-row { margin-top:24px; padding-top:16px; border-top:1px solid #334; }
+.btn { padding:10px 24px; border:none; border-radius:6px; cursor:pointer; font-size:14px; font-family:Inter,sans-serif; font-weight:600; }
+.btn-primary { background:#4a8aca; color:#fff; }
+.btn-primary:hover { background:#5a9ada; }
+.btn-secondary { background:#333; color:#aaa; margin-left:8px; }
+.msg { padding:10px 14px; border-radius:6px; margin:10px 0; font-size:13px; display:none; }
+.msg.success { background:#1f4a1f; border:1px solid #4a8a4a; color:#a0d090; display:block; }
+.msg.error { background:#4a1f1f; border:1px solid #8a4a4a; color:#d09090; display:block; }
+.last-mod { color:#666; font-size:11px; margin-top:6px; }
+.back-link { color:#4a8aca; text-decoration:none; font-size:13px; }
+.back-link:hover { text-decoration:underline; }
+</style></head><body>
+<div class="container">
+<a href="/" class="back-link">\u2190 Zurueck zum Chat</a>
+<h1>\u2699 Access Control</h1>
+<div class="subtitle">Zugriffsrechte pro Agent — Memory, Shared Memory und Cross-Agent-Reads</div>
+<div id="msg" class="msg"></div>
+<div id="agents-container">Lade...</div>
+<div class="btn-row">
+  <button class="btn btn-primary" onclick="saveAccessControl()">Speichern</button>
+  <button class="btn btn-secondary" onclick="loadAccessControl()">Verwerfen</button>
+  <span class="last-mod" id="last-mod"></span>
+</div>
+</div>
+<script>
+let _acData = null;
+const SHARED_OPTIONS = ['webclips', 'email_inbox', 'calendar'];
+
+async function loadAccessControl() {
+  const r = await fetch('/api/access-control');
+  _acData = await r.json();
+  renderAgents();
+  document.getElementById('last-mod').textContent = _acData.last_modified ? 'Zuletzt geaendert: ' + _acData.last_modified : '';
+}
+
+function renderAgents() {
+  const container = document.getElementById('agents-container');
+  container.innerHTML = '';
+  const agents = _acData.agents || {};
+  Object.keys(agents).sort().forEach(name => {
+    const a = agents[name];
+    const shared = a.shared_memory || [];
+    const cross = (a.cross_agent_read || []).join(', ');
+    const sharedHtml = SHARED_OPTIONS.map(opt => {
+      const checked = shared.includes(opt) ? 'checked' : '';
+      return `<label><input type="checkbox" data-agent="${name}" data-shared="${opt}" ${checked}> ${opt}</label>`;
+    }).join(' ');
+    container.innerHTML += `
+      <div class="agent-card">
+        <div class="agent-name">${escHtml(name)}</div>
+        <div class="agent-desc">${escHtml(a.description || '')}</div>
+        <div class="field-row">
+          <label>
+            <input type="checkbox" data-agent="${name}" data-field="own_memory" ${a.own_memory ? 'checked' : ''}>
+            Eigenes Memory aktiv
+          </label>
+        </div>
+        <div class="field-row">
+          <label>Shared Memory Zugriff:</label>
+          <div class="shared-options">${sharedHtml}</div>
+        </div>
+        <div class="field-row">
+          <label>Cross-Agent Read Access (komma-separiert):</label>
+          <input type="text" class="cross-input" data-agent="${name}" data-field="cross_agent_read" value="${escHtml(cross)}" placeholder="z.B. standard, privat">
+        </div>
+      </div>
+    `;
+  });
+}
+
+function escHtml(s) {
+  return String(s || '').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+}
+
+async function saveAccessControl() {
+  if (!_acData) return;
+  // Collect from DOM
+  const agents = _acData.agents || {};
+  Object.keys(agents).forEach(name => {
+    // own_memory
+    const ownBox = document.querySelector(`input[data-agent="${name}"][data-field="own_memory"]`);
+    if (ownBox) agents[name].own_memory = ownBox.checked;
+    // shared_memory
+    const sharedBoxes = document.querySelectorAll(`input[data-agent="${name}"][data-shared]`);
+    agents[name].shared_memory = Array.from(sharedBoxes).filter(b => b.checked).map(b => b.dataset.shared);
+    // cross_agent_read
+    const crossInput = document.querySelector(`input[data-agent="${name}"][data-field="cross_agent_read"]`);
+    if (crossInput) agents[name].cross_agent_read = crossInput.value.split(',').map(s => s.trim()).filter(Boolean);
+  });
+  const msg = document.getElementById('msg');
+  try {
+    const r = await fetch('/api/access-control', {
+      method: 'POST', headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify(_acData)
+    });
+    const d = await r.json();
+    if (d.success) {
+      msg.className = 'msg success';
+      msg.textContent = 'Gespeichert um ' + d.saved_at;
+      document.getElementById('last-mod').textContent = 'Zuletzt geaendert: ' + d.saved_at;
+    } else {
+      msg.className = 'msg error';
+      msg.textContent = 'Fehler: ' + (d.error || 'unbekannt');
+    }
+  } catch(e) {
+    msg.className = 'msg error';
+    msg.textContent = 'Netzwerk-Fehler: ' + e.message;
+  }
+  setTimeout(() => { msg.style.display = 'none'; }, 5000);
+}
+
+loadAccessControl();
+</script>
+</body></html>"""
+    return html
 
 @app.route('/get_prompt', methods=['GET'])
 def get_prompt():
@@ -6115,6 +6905,453 @@ def send_email_reply_route():
         return jsonify({'ok': False, 'error': str(e)})
 
 
+# ─── EMAIL HEADER CACHE (in-memory) ────────────────────────────────────────
+_email_header_cache = {}  # key: dir_path -> list of parsed headers
+_email_cache_mtime = {}   # key: dir_path -> last build time
+_EMAIL_CACHE_TTL = 300    # rebuild cache every 5 minutes
+
+def _parse_filename_timestamp(fname):
+    """Extract timestamp from filename like 2025-10-30_16-46-32_... Returns (display, ts)."""
+    import re as _re
+    import datetime as _dt
+    m = _re.match(r'^(\d{4})-(\d{2})-(\d{2})_(\d{2})-(\d{2})-(\d{2})', fname)
+    if m:
+        try:
+            dt = _dt.datetime(int(m.group(1)), int(m.group(2)), int(m.group(3)),
+                              int(m.group(4)), int(m.group(5)), int(m.group(6)))
+            return dt.strftime('%d.%m.%Y %H:%M'), dt.timestamp()
+        except Exception:
+            pass
+    return '', 0
+
+
+def _parse_txt_email(fpath, fname):
+    """Parse .txt email with German header format (Von:, An:, Betreff:, Datum:)."""
+    from email.utils import parsedate_to_datetime as _pdt
+    import re as _re
+    try:
+        with open(fpath, 'r', errors='replace') as f:
+            lines = []
+            for i, line in enumerate(f):
+                if i >= 30:
+                    break
+                lines.append(line)
+        from_raw = subject = date_str = to_raw = cc_raw = message_id = ''
+        for line in lines:
+            low = line.lower()
+            if low.startswith('von:') or low.startswith('from:'):
+                from_raw = line.split(':', 1)[1].strip()
+            elif low.startswith('betreff:') or low.startswith('subject:'):
+                subject = line.split(':', 1)[1].strip()
+            elif low.startswith('datum:') or low.startswith('date:'):
+                date_str = line.split(':', 1)[1].strip()
+            elif low.startswith('an:') or low.startswith('to:'):
+                to_raw = line.split(':', 1)[1].strip()
+            elif low.startswith('cc:') or low.startswith('kopie:'):
+                cc_raw = line.split(':', 1)[1].strip()
+            elif low.startswith('message-id:'):
+                message_id = line.split(':', 1)[1].strip()
+        from_name = ''
+        from_email = from_raw
+        if '<' in from_raw and '>' in from_raw:
+            from_name = from_raw[:from_raw.index('<')].strip().strip('"').replace(',', ' ')
+            from_email = from_raw[from_raw.index('<')+1:from_raw.index('>')]
+        date_display = ''
+        date_ts = 0
+        if date_str:
+            try:
+                dt = _pdt(date_str)
+                date_display = dt.strftime('%d.%m.%Y %H:%M')
+                date_ts = dt.timestamp()
+            except Exception:
+                pass
+        if not date_ts:
+            fn_display, fn_ts = _parse_filename_timestamp(fname)
+            if fn_ts:
+                date_display = date_display or fn_display
+                date_ts = fn_ts
+        return {
+            'message_id': message_id,
+            'from_name': from_name, 'from_email': from_email,
+            'subject': subject, 'date': date_display, 'date_ts': date_ts,
+            'to': to_raw, 'cc': cc_raw,
+        }
+    except Exception:
+        return None
+
+
+def _build_email_cache(sdir):
+    import email as _eml
+    from email.header import decode_header as _dh
+    from email.utils import parsedate_to_datetime as _pdt
+
+    def _dec(val):
+        if not val:
+            return ''
+        try:
+            parts = _dh(val)
+            decoded = []
+            for part, charset in parts:
+                if isinstance(part, bytes):
+                    decoded.append(part.decode(charset or 'utf-8', errors='replace'))
+                else:
+                    decoded.append(part)
+            return ' '.join(decoded)
+        except Exception:
+            return str(val)
+
+    entries = []
+    try:
+        for fname in os.scandir(sdir):
+            if not (fname.name.endswith('.eml') or fname.name.endswith('.txt')):
+                continue
+            try:
+                parsed = None
+                if fname.name.endswith('.eml'):
+                    with open(fname.path, 'r', errors='replace') as f:
+                        header_lines = []
+                        for i, line in enumerate(f):
+                            if i >= 40:
+                                break
+                            header_lines.append(line)
+                    msg = _eml.message_from_string(''.join(header_lines))
+                    from_raw = _dec(msg.get('From', ''))
+                    subject = _dec(msg.get('Subject', ''))
+                    date_str = msg.get('Date', '')
+                    message_id = msg.get('Message-ID', '').strip()
+                    to_raw = _dec(msg.get('To', ''))
+                    cc_raw = _dec(msg.get('Cc', ''))
+                    from_name = ''
+                    from_email = from_raw
+                    if '<' in from_raw and '>' in from_raw:
+                        from_name = from_raw[:from_raw.index('<')].strip().strip('"').replace(',', ' ')
+                        from_email = from_raw[from_raw.index('<')+1:from_raw.index('>')]
+                    date_display = ''
+                    date_ts = 0
+                    try:
+                        dt = _pdt(date_str)
+                        date_display = dt.strftime('%d.%m.%Y %H:%M')
+                        date_ts = dt.timestamp()
+                    except Exception:
+                        pass
+                    if not date_ts:
+                        fn_display, fn_ts = _parse_filename_timestamp(fname.name)
+                        if fn_ts:
+                            date_display = date_display or fn_display
+                            date_ts = fn_ts
+                    if not date_ts:
+                        try:
+                            date_ts = fname.stat().st_mtime
+                        except Exception:
+                            pass
+                    parsed = {
+                        'message_id': message_id,
+                        'from_name': from_name, 'from_email': from_email,
+                        'subject': subject, 'date': date_display, 'date_ts': date_ts,
+                        'to': to_raw, 'cc': cc_raw,
+                    }
+                else:
+                    # .txt with German header format
+                    parsed = _parse_txt_email(fname.path, fname.name)
+                    if parsed and not parsed.get('date_ts'):
+                        try:
+                            parsed['date_ts'] = fname.stat().st_mtime
+                        except Exception:
+                            pass
+
+                if not parsed:
+                    continue
+                # Only include entries that actually look like emails
+                if not (parsed['from_email'] or parsed['subject']):
+                    continue
+
+                entries.append({
+                    **parsed,
+                    '_filename': fname.name,
+                    '_fpath': fname.path,
+                    '_s_from': (parsed['from_name'].replace(',', ' ') + ' ' + parsed['from_email'] + ' ' + fname.name).lower(),
+                    '_s_subj': parsed['subject'].lower(),
+                    '_s_to': (parsed.get('to','') + ' ' + parsed.get('cc','')).lower(),
+                })
+            except Exception:
+                continue
+    except Exception:
+        pass
+    entries.sort(key=lambda e: e.get('date_ts', 0), reverse=True)
+    return entries
+
+
+def _get_email_cache(sdir):
+    import time
+    now = time.time()
+    if sdir in _email_header_cache and (now - _email_cache_mtime.get(sdir, 0)) < _EMAIL_CACHE_TTL:
+        return _email_header_cache[sdir]
+    entries = _build_email_cache(sdir)
+    _email_header_cache[sdir] = entries
+    _email_cache_mtime[sdir] = now
+    print(f"[EMAIL_CACHE] Built cache for {sdir}: {len(entries)} entries", flush=True)
+    return entries
+
+
+@app.route('/api/email-search')
+def email_search_route():
+    agent = request.args.get('agent', 'standard')
+    q = request.args.get('q', '').strip().lower()
+    from_filter = request.args.get('from', '').strip().lower()
+    subj_filter = request.args.get('subject', '').strip().lower()
+    to_filter = request.args.get('to', '').strip().lower()
+    body_filter = request.args.get('body', '').strip().lower()
+    has_field_filter = bool(from_filter or subj_filter or to_filter or body_filter)
+    if len(q) < 2 and not has_field_filter:
+        return jsonify([])
+
+    search_dirs = []
+    speicher = get_agent_speicher(agent)
+    memory_dir = os.path.join(speicher, 'memory')
+    if os.path.exists(memory_dir):
+        search_dirs.append(memory_dir)
+    inbox_dir = os.path.join(BASE, 'email_inbox')
+    if os.path.exists(inbox_dir):
+        search_dirs.append(inbox_dir)
+
+    all_entries = []
+    for sdir in search_dirs:
+        all_entries.extend(_get_email_cache(sdir))
+    # Re-sort merged list
+    all_entries.sort(key=lambda e: e.get('date_ts', 0), reverse=True)
+
+    def _clean_email(s):
+        # Strip mailto: wrappers and angle brackets
+        import re as _re
+        if not s: return ''
+        # Common pattern in .txt files: "user@domain.de<mailto:user@domain.de>"
+        m = _re.search(r'([\w\.\-]+@[\w\.\-]+)', s)
+        return m.group(1) if m else s
+
+    results = []
+    seen_ids = set()
+    seen_dedup = set()
+    for entry in all_entries:
+        if len(results) >= 8:
+            break
+        mid = entry['message_id']
+        # Primary dedup: message_id
+        if mid and mid in seen_ids:
+            continue
+        # Secondary dedup: (clean_from_email, subject, date_ts) — handles iCloud duplicates
+        clean_from = _clean_email(entry['from_email']).lower()
+        dedup_key = (clean_from, entry['subject'].strip(), entry.get('date_ts', 0))
+        if dedup_key in seen_dedup:
+            continue
+        match = True
+        if from_filter:
+            if from_filter not in entry['_s_from']:
+                match = False
+        if subj_filter and match:
+            if subj_filter not in entry['_s_subj']:
+                match = False
+        if to_filter and match:
+            if to_filter not in entry['_s_to']:
+                match = False
+        if not from_filter and not subj_filter and not to_filter and q:
+            if q not in (entry['_s_from'] + ' ' + entry['_s_subj']):
+                match = False
+        if match:
+            if mid:
+                seen_ids.add(mid)
+            seen_dedup.add(dedup_key)
+            results.append({
+                'message_id': entry['message_id'],
+                'from_name': entry['from_name'],
+                'from_email': _clean_email(entry['from_email']),
+                'subject': entry['subject'], 'date': entry['date'],
+                'date_ts': entry['date_ts'],
+                'to': entry['to'], 'cc': entry['cc'],
+                'file': entry.get('_filename', ''),
+                'fpath': entry.get('_fpath', ''),
+            })
+    return jsonify(results[:8])
+
+
+@app.route('/api/email-content')
+def email_content_route():
+    """Load full email content for display in chat."""
+    import email as _email_mod
+    from email.header import decode_header as _dec_hdr
+    agent = request.args.get('agent', 'standard')
+    target_mid = request.args.get('message_id', '').strip()
+    target_from = request.args.get('from_email', '').strip().lower()
+    target_subj = request.args.get('subject', '').strip().lower()
+
+    if not target_mid and not target_from:
+        return jsonify({'ok': False, 'error': 'message_id or from_email required'})
+
+    def _dec(val):
+        if not val:
+            return ''
+        parts = _dec_hdr(val)
+        decoded = []
+        for part, charset in parts:
+            if isinstance(part, bytes):
+                decoded.append(part.decode(charset or 'utf-8', errors='replace'))
+            else:
+                decoded.append(part)
+        return ' '.join(decoded)
+
+    def _get_body(msg):
+        if msg.is_multipart():
+            for part in msg.walk():
+                ct = part.get_content_type()
+                if ct == 'text/plain':
+                    payload = part.get_payload(decode=True)
+                    if payload:
+                        charset = part.get_content_charset() or 'utf-8'
+                        return payload.decode(charset, errors='replace')
+            for part in msg.walk():
+                ct = part.get_content_type()
+                if ct == 'text/html':
+                    payload = part.get_payload(decode=True)
+                    if payload:
+                        charset = part.get_content_charset() or 'utf-8'
+                        import re as _re
+                        html = payload.decode(charset, errors='replace')
+                        return _re.sub(r'<[^>]+>', '', html)[:3000]
+        else:
+            payload = msg.get_payload(decode=True)
+            if payload:
+                charset = msg.get_content_charset() or 'utf-8'
+                return payload.decode(charset, errors='replace')
+        return ''
+
+    search_dirs = []
+    speicher = get_agent_speicher(agent)
+    memory_dir = os.path.join(speicher, 'memory')
+    if os.path.exists(memory_dir):
+        search_dirs.append(memory_dir)
+    inbox_dir = os.path.join(BASE, 'email_inbox')
+    if os.path.exists(inbox_dir):
+        search_dirs.append(inbox_dir)
+
+    def _read_txt_email(fpath, fname):
+        try:
+            with open(fpath, 'r', errors='replace') as f:
+                full = f.read()
+            # Split headers from body (first blank line)
+            header_end = full.find('\n\n')
+            if header_end == -1:
+                header_end = len(full)
+            header_block = full[:header_end]
+            body = full[header_end+2:] if header_end < len(full) else ''
+            headers = {}
+            for line in header_block.split('\n'):
+                for key_de, key_en in [('von:','from'),('an:','to'),('betreff:','subject'),('datum:','date'),('cc:','cc'),('kopie:','cc'),('message-id:','message_id')]:
+                    if line.lower().startswith(key_de) or line.lower().startswith(key_en + ':'):
+                        headers[key_en] = line.split(':', 1)[1].strip()
+                        break
+            return headers, body
+        except Exception:
+            return None, None
+
+    for sdir in search_dirs:
+        try:
+            for fname in os.listdir(sdir):
+                if not (fname.endswith('.eml') or fname.endswith('.txt')):
+                    continue
+                fpath = os.path.join(sdir, fname)
+                try:
+                    if fname.endswith('.txt'):
+                        headers, body = _read_txt_email(fpath, fname)
+                        if not headers:
+                            continue
+                        mid = headers.get('message_id', '').strip()
+                        from_raw_txt = headers.get('from', '')
+                        subj_txt = headers.get('subject', '')
+                        # Match
+                        if target_mid and mid == target_mid:
+                            pass
+                        elif target_from:
+                            if target_from not in from_raw_txt.lower():
+                                continue
+                            if target_subj and target_subj not in subj_txt.lower():
+                                continue
+                        else:
+                            continue
+                        # Build result
+                        from_name = ''
+                        from_email = from_raw_txt
+                        if '<' in from_raw_txt and '>' in from_raw_txt:
+                            from_name = from_raw_txt[:from_raw_txt.index('<')].strip().strip('"')
+                            from_email = from_raw_txt[from_raw_txt.index('<')+1:from_raw_txt.index('>')]
+                        date_display = headers.get('date', '')
+                        try:
+                            from email.utils import parsedate_to_datetime
+                            dt = parsedate_to_datetime(date_display)
+                            date_display = dt.strftime('%d.%m.%Y %H:%M')
+                        except Exception:
+                            pass
+                        if len(body) > 5000:
+                            body = body[:5000] + '\n\n[... gekuerzt, ' + str(len(body)) + ' Zeichen gesamt]'
+                        return jsonify({
+                            'ok': True,
+                            'from_name': from_name, 'from_email': from_email,
+                            'to': headers.get('to', ''), 'cc': headers.get('cc', ''),
+                            'subject': subj_txt, 'date': date_display,
+                            'message_id': mid, 'body': body, 'file': fname,
+                        })
+                    with open(fpath, 'r', errors='replace') as f:
+                        msg = _email_mod.message_from_file(f)
+                    mid = msg.get('Message-ID', '').strip()
+                    if target_mid and mid == target_mid:
+                        pass
+                    elif target_from:
+                        from_raw = _dec(msg.get('From', '')).lower()
+                        subj_raw = _dec(msg.get('Subject', '')).lower()
+                        if target_from not in from_raw:
+                            continue
+                        if target_subj and target_subj not in subj_raw:
+                            continue
+                    else:
+                        continue
+
+                    from_raw = _dec(msg.get('From', ''))
+                    from_name = ''
+                    from_email = from_raw
+                    if '<' in from_raw and '>' in from_raw:
+                        from_name = from_raw[:from_raw.index('<')].strip().strip('"')
+                        from_email = from_raw[from_raw.index('<')+1:from_raw.index('>')]
+
+                    date_display = ''
+                    try:
+                        from email.utils import parsedate_to_datetime
+                        dt = parsedate_to_datetime(msg.get('Date', ''))
+                        date_display = dt.strftime('%d.%m.%Y %H:%M')
+                    except Exception:
+                        date_display = (msg.get('Date', '') or '')[:30]
+
+                    body = _get_body(msg)
+                    if len(body) > 5000:
+                        body = body[:5000] + '\n\n[... gekuerzt, ' + str(len(body)) + ' Zeichen gesamt]'
+
+                    return jsonify({
+                        'ok': True,
+                        'from_name': from_name,
+                        'from_email': from_email,
+                        'to': _dec(msg.get('To', '')),
+                        'cc': _dec(msg.get('Cc', '')),
+                        'subject': _dec(msg.get('Subject', '')),
+                        'date': date_display,
+                        'message_id': mid,
+                        'body': body,
+                        'file': fname,
+                    })
+                except Exception:
+                    continue
+        except Exception:
+            continue
+
+    return jsonify({'ok': False, 'error': 'E-Mail nicht gefunden'})
+
+
 @app.route('/send_whatsapp_draft', methods=['POST'])
 def send_whatsapp_draft_route():
     session_id = request.json.get('session_id', 'default') if request.is_json else 'default'
@@ -6422,7 +7659,9 @@ def process_single_message(msg, kontext_override=None, state=None, **kwargs):
                 print(f"deep_search fallback error: {e}")
 
     # Check for sub-agent delegation (requires user confirmation)
-    if state['agent'] and not kwargs.get('skip_delegation'):
+    # Skip delegation check when email reply context is active
+    _skip_deleg = kwargs.get('skip_delegation') or msg.startswith('[E-MAIL KONTEXT:')
+    if state['agent'] and not _skip_deleg:
         deleg_info = detect_delegation(msg, state['agent'])
         if deleg_info:
             import uuid as _deleg_uuid
@@ -6498,11 +7737,13 @@ def process_single_message(msg, kontext_override=None, state=None, **kwargs):
         user_content = full_text
 
     state['verlauf'].append({'role': 'user', 'content': user_content})
-    # Sofort-Save: User-Nachricht sofort sichern (auch wenn Antwort noch aussteht)
+    # Write-Through: User-Nachricht + Pending-Marker sofort auf Disk schreiben
+    state['verlauf'].append({'role': 'assistant', 'content': PENDING_MARKER})
     for _sid_imm, _st_imm in sessions.items():
         if _st_imm is state:
             auto_save_session(_sid_imm)
             break
+    state['verlauf'].pop()  # Pending-Marker aus In-Memory-Verlauf entfernen
     try:
         config = load_models()
         provider_key = state.get('provider', 'anthropic')
@@ -6543,6 +7784,49 @@ def process_single_message(msg, kontext_override=None, state=None, **kwargs):
                     state['verlauf'].pop()  # remove MEMORY_SEARCH response
             except Exception as mse:
                 print(f"MEMORY_SEARCH error: {mse}")
+
+        # Parse WORKING_MEMORY commands in agent response
+        agent_name = state.get('agent', '')
+        wm_add_pattern = re.compile(r'WORKING_MEMORY_ADD:\s*(\{.*?\})', re.DOTALL)
+        for wm_m in wm_add_pattern.finditer(text):
+            try:
+                wm_spec = json.loads(wm_m.group(1))
+                wm_manifest = working_memory_add(
+                    agent_name, wm_spec['filename'], wm_spec['content'],
+                    priority=wm_spec.get('priority', 5),
+                    description=wm_spec.get('description', ''),
+                )
+                marker = f'\n[Working Memory: {wm_spec["filename"]} gespeichert]\n'
+                text = text.replace(wm_m.group(0), marker)
+            except Exception as wme:
+                print(f"WORKING_MEMORY_ADD error: {wme}")
+
+        wm_rm_pattern = re.compile(r'WORKING_MEMORY_REMOVE:\s*(\{.*?\})', re.DOTALL)
+        for wm_m in wm_rm_pattern.finditer(text):
+            try:
+                wm_spec = json.loads(wm_m.group(1))
+                working_memory_remove(agent_name, wm_spec['filename'])
+                marker = f'\n[Working Memory: {wm_spec["filename"]} entfernt]\n'
+                text = text.replace(wm_m.group(0), marker)
+            except Exception as wme:
+                print(f"WORKING_MEMORY_REMOVE error: {wme}")
+
+        wm_list_pattern = re.compile(r'WORKING_MEMORY_LIST:\s*\{[^}]*\}')
+        wm_list_match = wm_list_pattern.search(text)
+        if wm_list_match:
+            try:
+                wm_info = working_memory_list(agent_name)
+                wm_files = wm_info.get('files', [])
+                if wm_files:
+                    listing = '\n[Working Memory Inhalt:'
+                    for wf in wm_files:
+                        listing += f'\n  - {wf["filename"]} (Prio: {wf.get("priority", 5)}, {wf.get("added", "?")}) — {wf.get("description", "")}'
+                    listing += f'\n  Token-Limit: {wm_info.get("max_tokens", 8000)}]\n'
+                else:
+                    listing = '\n[Working Memory ist leer]\n'
+                text = text.replace(wm_list_match.group(0), listing)
+            except Exception as wme:
+                print(f"WORKING_MEMORY_LIST error: {wme}")
 
         created_files = []
         created_emails = []
@@ -6858,14 +8142,18 @@ def process_single_message(msg, kontext_override=None, state=None, **kwargs):
             vid_prompt = m.group(1).strip().rstrip(']')
             _vid_task_id = task_create('video', _task_session_id, estimated_total=180)
             try:
-                fname, fpath = generate_video(
+                fname, fpath, _vid_aspect = generate_video(
                     vid_prompt, state['agent'] or 'standard',
                     state.get('provider', 'anthropic'),
                     task_id=_vid_task_id,
                 )
+                # Detect portrait: API aspect OR prompt keywords
+                _portrait_kws = ['9:16', 'portrait', 'hochformat', 'vertical', 'senkrecht', 'vertikal', 'tiktok', 'reels', 'shorts']
+                _is_portrait = (_vid_aspect == '9:16') or any(kw in vid_prompt.lower() for kw in _portrait_kws)
                 created_videos.append({
                     'filename': fname, 'path': fpath,
                     'prompt': vid_prompt[:100], 'task_id': _vid_task_id,
+                    'is_portrait': _is_portrait,
                 })
                 text = text[:m.start()] + f'\n\n*Video erfolgreich generiert: {fname}. Das Video wird unten angezeigt.*' + text[m.end():]
             except Exception as ve:
@@ -6998,6 +8286,8 @@ def subagent_confirm():
 
 @app.route('/chat', methods=['POST'])
 def chat():
+    if _shutdown_event.is_set():
+        return jsonify({'error': 'Server faehrt herunter — bitte warten'}), 503
     session_id = request.json.get('session_id', 'default')
     state = get_session(session_id)
     if not state['agent']:
@@ -7006,7 +8296,6 @@ def chat():
 
     with queue_lock:
         if state['processing']:
-            # System busy — queue the message
             item = {
                 'id': str(uuid.uuid4()),
                 'message': msg,
@@ -7023,7 +8312,9 @@ def chat():
         state['processing'] = True
         state['current_prompt'] = msg[:50]
 
-    # System idle — process synchronously
+    with _active_requests_lock:
+        global _active_requests
+        _active_requests += 1
     try:
         result = process_single_message(msg, state=state, _session_id=session_id)
     except Exception as e:
@@ -7031,8 +8322,10 @@ def chat():
             state['processing'] = False
             state['current_prompt'] = ''
         return jsonify({'error': str(e)})
+    finally:
+        with _active_requests_lock:
+            _active_requests -= 1
 
-    # Check if queue has items (added while we were processing)
     with queue_lock:
         has_queue = len(state['queue']) > 0
     if has_queue:
@@ -7255,6 +8548,35 @@ def deep_memory_search(memory_dir, query, date_from=None, date_to=None, directio
         'candidates_after_filter': len(candidates),
         'results': scored[:max_results],
     }
+
+
+@app.route('/api/working-memory/<agent>', methods=['POST'])
+def api_working_memory(agent):
+    """Manage agent working memory: add, remove, list."""
+    data = request.get_json(force=True)
+    action = data.get('action', 'list')
+    try:
+        if action == 'add':
+            manifest = working_memory_add(
+                agent, data['filename'], data['content'],
+                priority=data.get('priority', 5),
+                description=data.get('description', ''),
+            )
+            return jsonify({'ok': True, 'action': 'add', 'filename': data['filename'], 'manifest': manifest})
+        elif action == 'remove':
+            manifest = working_memory_remove(agent, data['filename'])
+            if manifest is None:
+                return jsonify({'ok': False, 'error': 'Manifest nicht gefunden'}), 404
+            return jsonify({'ok': True, 'action': 'remove', 'filename': data['filename'], 'manifest': manifest})
+        elif action == 'list':
+            manifest = working_memory_list(agent)
+            return jsonify({'ok': True, 'action': 'list', 'manifest': manifest})
+        else:
+            return jsonify({'ok': False, 'error': f'Unbekannte Aktion: {action}'}), 400
+    except KeyError as ke:
+        return jsonify({'ok': False, 'error': f'Fehlendes Feld: {ke}'}), 400
+    except Exception as e:
+        return jsonify({'ok': False, 'error': str(e)}), 500
 
 
 @app.route('/api/memory-files-search', methods=['GET'])
@@ -7663,7 +8985,11 @@ def search_preview():
                 'is_notification': is_notif,
             })
         # Sort: from_person first, then highest score, then newest date
-        items.sort(key=lambda x: (not x.get('from_person'), -x['score'], x.get('date','') or '0'), reverse=False)
+        if search_type == 'email':
+            # For email searches: sort by date desc (newest first)
+            items.sort(key=lambda x: x.get('date','') or '', reverse=True)
+        else:
+            items.sort(key=lambda x: (not x.get('from_person'), -x['score'], x.get('date','') or '0'), reverse=False)
         return jsonify({
             'ok': True,
             'results': items,
@@ -7826,6 +9152,742 @@ def remove_all_ctx():
     state['kontext_items'] = []
     return jsonify({'ok':True})
 
+
+# ── ADMIN-BEREICH (added 2026-04-15) ───────────────────────────────────────
+import html as _html_lib
+
+_ADMIN_BASE = os.path.expanduser("~/AssistantDev")
+_ADMIN_DOCS_DIR = os.path.join(_ADMIN_BASE, "docs")
+_ADMIN_DATALAKE = os.path.expanduser(
+    "~/Library/Mobile Documents/com~apple~CloudDocs/Downloads shared/claude_datalake"
+)
+
+
+def _admin_render_md(text):
+    """Minimal markdown -> HTML: ## h2, ### h3, **bold**, lists, paragraphs.
+    Escapes HTML first to prevent XSS from changelog content."""
+    text = _html_lib.escape(text)
+    out_lines = []
+    in_list = False
+    in_code = False
+    code_buf = []
+    for raw in text.split("\n"):
+        line = raw.rstrip()
+
+        # Fenced code blocks (```)
+        if line.strip().startswith("```"):
+            if in_code:
+                out_lines.append('<pre><code>' + _html_lib.escape("\n".join(code_buf)) + '</code></pre>')
+                code_buf = []
+                in_code = False
+            else:
+                if in_list:
+                    out_lines.append("</ul>")
+                    in_list = False
+                in_code = True
+            continue
+        if in_code:
+            code_buf.append(line)
+            continue
+
+        # Headings
+        if line.startswith("### "):
+            if in_list:
+                out_lines.append("</ul>")
+                in_list = False
+            out_lines.append(f"<h3>{line[4:].strip()}</h3>")
+            continue
+        if line.startswith("## "):
+            if in_list:
+                out_lines.append("</ul>")
+                in_list = False
+            out_lines.append(f"<h2>{line[3:].strip()}</h2>")
+            continue
+        if line.startswith("# "):
+            if in_list:
+                out_lines.append("</ul>")
+                in_list = False
+            out_lines.append(f"<h1>{line[2:].strip()}</h1>")
+            continue
+
+        # List items
+        m_list = None
+        stripped = line.lstrip()
+        if stripped.startswith("- ") or stripped.startswith("* "):
+            m_list = stripped[2:]
+        if m_list is not None:
+            if not in_list:
+                out_lines.append("<ul>")
+                in_list = True
+            # bold + inline code
+            item = re.sub(r"\*\*(.+?)\*\*", r"<strong>\1</strong>", m_list)
+            item = re.sub(r"`([^`]+)`", r"<code>\1</code>", item)
+            out_lines.append(f"<li>{item}</li>")
+            continue
+
+        if in_list:
+            out_lines.append("</ul>")
+            in_list = False
+
+        # Horizontal rule
+        if line.strip() == "---":
+            out_lines.append("<hr>")
+            continue
+
+        # Empty -> paragraph break
+        if not line.strip():
+            out_lines.append("")
+            continue
+
+        # Bold + inline code in normal paragraph
+        para = re.sub(r"\*\*(.+?)\*\*", r"<strong>\1</strong>", line)
+        para = re.sub(r"`([^`]+)`", r"<code>\1</code>", para)
+        out_lines.append(f"<p>{para}</p>")
+
+    if in_list:
+        out_lines.append("</ul>")
+    if in_code:
+        out_lines.append('<pre><code>' + _html_lib.escape("\n".join(code_buf)) + '</code></pre>')
+    return "\n".join(out_lines)
+
+
+_ADMIN_CSS = """
+* { box-sizing: border-box; }
+body { background:#1a1a2e; color:#e0e0e0; font-family:-apple-system,Inter,sans-serif; margin:0; padding:30px; line-height:1.55; }
+.container { max-width:1000px; margin:0 auto; }
+h1 { color:#f0c060; font-size:26px; margin:0 0 6px; }
+h2 { color:#9ec5fe; font-size:20px; margin:24px 0 8px; border-bottom:1px solid #334; padding-bottom:4px; }
+h3 { color:#cbb; font-size:16px; margin:16px 0 6px; }
+p { margin:6px 0; color:#d0d0d0; }
+ul { margin:6px 0 12px 22px; padding:0; }
+li { margin:3px 0; color:#d0d0d0; }
+code { background:#111; padding:1px 5px; border-radius:3px; font-family:ui-monospace,Menlo,monospace; font-size:12px; color:#9ec5fe; }
+pre { background:#111; padding:12px; border-radius:6px; overflow-x:auto; border:1px solid #334; }
+pre code { background:none; padding:0; color:#cbb; }
+hr { border:none; border-top:1px solid #334; margin:18px 0; }
+a { color:#4a8aca; text-decoration:none; }
+a:hover { text-decoration:underline; }
+.subtitle { color:#888; font-size:13px; margin-bottom:24px; }
+.back { color:#4a8aca; font-size:13px; }
+.card-grid { display:grid; grid-template-columns:repeat(auto-fit,minmax(220px,1fr)); gap:14px; margin-top:18px; }
+.card { background:#22224a; border:1px solid #334; border-radius:10px; padding:18px; text-decoration:none; color:#e0e0e0; transition:border-color .15s, transform .1s; }
+.card:hover { border-color:#4a8aca; transform:translateY(-2px); text-decoration:none; }
+.card .title { font-size:15px; font-weight:600; color:#f0c060; margin-bottom:4px; }
+.card .desc { font-size:12px; color:#999; }
+table { width:100%; border-collapse:collapse; margin:14px 0; background:#22224a; border-radius:8px; overflow:hidden; }
+th { background:#2c2c5a; color:#9ec5fe; padding:10px 12px; text-align:left; font-size:13px; font-weight:600; }
+td { padding:8px 12px; border-top:1px solid #2c2c4a; font-size:13px; color:#d0d0d0; vertical-align:top; }
+.tag { display:inline-block; background:#1f4a1f; color:#a0d090; padding:1px 8px; border-radius:10px; font-size:11px; margin-right:4px; }
+.tag-sub { background:#4a3a1f; color:#d0b090; }
+.tag-orphan { background:#4a1f1f; color:#d09090; }
+.status-ok { color:#7ec07e; }
+.status-bad { color:#d07070; }
+.metric { display:inline-block; margin-right:18px; color:#999; font-size:12px; }
+.metric strong { color:#f0c060; font-size:14px; }
+"""
+
+
+def _admin_layout(title, body_html):
+    return ("<!DOCTYPE html><html lang='de'><head><meta charset='UTF-8'>"
+            f"<title>{_html_lib.escape(title)} — Admin</title>"
+            f"<style>{_ADMIN_CSS}</style></head>"
+            "<body><div class='container'>"
+            f"{body_html}"
+            "</div></body></html>")
+
+
+def _admin_status_check():
+    """Quick status: web (8080) + clipper (8081) + watcher process."""
+    import socket
+    def port_alive(p):
+        try:
+            with socket.create_connection(("127.0.0.1", p), timeout=0.4):
+                return True
+        except Exception:
+            return False
+    web_ok = port_alive(8080)
+    clip_ok = port_alive(8081)
+    # Email watcher: presence of process matching email_watcher.py
+    import subprocess as _sp
+    try:
+        out = _sp.run(["pgrep", "-f", "email_watcher.py"], capture_output=True, text=True, timeout=2)
+        watcher_ok = bool(out.stdout.strip())
+    except Exception:
+        watcher_ok = False
+    return {"web_8080": web_ok, "clipper_8081": clip_ok, "email_watcher": watcher_ok}
+
+
+@app.route('/admin', methods=['GET'])
+def admin_root():
+    st = _admin_status_check()
+    def _badge(ok, label):
+        cls = "status-ok" if ok else "status-bad"
+        sign = "● online" if ok else "○ offline"
+        return f"<span class='metric'><strong>{_html_lib.escape(label)}</strong> <span class='{cls}'>{sign}</span></span>"
+    cards = [
+        ("/admin/changelog", "📋 Changelog", "Alle Aenderungen am System"),
+        ("/admin/docs", "📖 Technische Docs", "API Reference, Architektur, Workflows"),
+        ("/admin/permissions", "🔐 Memory-Berechtigungen", "Wer hat Zugriff auf welches Memory"),
+        ("/admin/access-control", "⚙ Access Control", "Cross-Agent Reads, Shared Memory"),
+    ]
+    cards_html = "".join(
+        f"<a class='card' href='{href}'><div class='title'>{_html_lib.escape(t)}</div>"
+        f"<div class='desc'>{_html_lib.escape(d)}</div></a>"
+        for href, t, d in cards
+    )
+    body = (
+        "<a href='/' class='back'>← Zurueck zum Chat</a>"
+        "<h1>⚙ Admin-Bereich</h1>"
+        "<div class='subtitle'>System-Verwaltung, Doku und Berechtigungen</div>"
+        "<h2>System-Status</h2>"
+        f"<div>{_badge(st['web_8080'], 'Web Server :8080')}{_badge(st['clipper_8081'], 'Web Clipper :8081')}{_badge(st['email_watcher'], 'Email Watcher')}</div>"
+        "<h2>Bereiche</h2>"
+        f"<div class='card-grid'>{cards_html}</div>"
+    )
+    return _admin_layout("Admin", body)
+
+
+@app.route('/admin/changelog', methods=['GET'])
+def admin_changelog():
+    path = os.path.join(_ADMIN_BASE, "changelog.md")
+    if not os.path.exists(path):
+        return _admin_layout("Changelog", "<a href='/admin' class='back'>← Admin</a><h1>Changelog</h1><p>Datei nicht gefunden.</p>"), 404
+    try:
+        st = os.stat(path)
+        with open(path, 'r', encoding='utf-8', errors='replace') as f:
+            md = f.read()
+    except Exception as e:
+        return _admin_layout("Changelog", f"<p>Fehler: {_html_lib.escape(str(e))}</p>"), 500
+    mtime = datetime.datetime.fromtimestamp(st.st_mtime).strftime("%Y-%m-%d %H:%M:%S")
+    size_kb = st.st_size / 1024.0
+    body = (
+        "<a href='/admin' class='back'>← Admin</a>"
+        "<h1>📋 Changelog</h1>"
+        f"<div class='subtitle'>{path} — {size_kb:.1f} KB — zuletzt geaendert {mtime}</div>"
+        f"{_admin_render_md(md)}"
+    )
+    return _admin_layout("Changelog", body)
+
+
+@app.route('/admin/docs', methods=['GET'])
+def admin_docs_list():
+    if not os.path.isdir(_ADMIN_DOCS_DIR):
+        return _admin_layout("Docs", "<a href='/admin' class='back'>← Admin</a><h1>Docs</h1><p>docs/ nicht gefunden.</p>"), 404
+    items = []
+    for f in sorted(os.listdir(_ADMIN_DOCS_DIR)):
+        fp = os.path.join(_ADMIN_DOCS_DIR, f)
+        if not os.path.isfile(fp):
+            continue
+        try:
+            st = os.stat(fp)
+            mtime = datetime.datetime.fromtimestamp(st.st_mtime).strftime("%Y-%m-%d")
+            size_kb = st.st_size / 1024.0
+        except Exception:
+            mtime, size_kb = "?", 0.0
+        items.append(
+            f"<tr><td><a href='/admin/docs/{_html_lib.escape(f)}'>{_html_lib.escape(f)}</a></td>"
+            f"<td>{size_kb:.1f} KB</td><td>{mtime}</td></tr>"
+        )
+    table = "<table><tr><th>Datei</th><th>Groesse</th><th>Geaendert</th></tr>" + "".join(items) + "</table>"
+    body = (
+        "<a href='/admin' class='back'>← Admin</a>"
+        "<h1>📖 Technische Docs</h1>"
+        f"<div class='subtitle'>{_ADMIN_DOCS_DIR}</div>"
+        f"{table}"
+    )
+    return _admin_layout("Docs", body)
+
+
+@app.route('/admin/docs/<path:filename>', methods=['GET'])
+def admin_doc_view(filename):
+    # Path traversal guard
+    target = os.path.realpath(os.path.join(_ADMIN_DOCS_DIR, filename))
+    docs_real = os.path.realpath(_ADMIN_DOCS_DIR)
+    if not target.startswith(docs_real + os.sep) or not os.path.isfile(target):
+        return _admin_layout("Docs", "<a href='/admin/docs' class='back'>← Docs</a><h1>Nicht gefunden</h1>"), 404
+    try:
+        st = os.stat(target)
+        with open(target, 'r', encoding='utf-8', errors='replace') as f:
+            md = f.read()
+    except Exception as e:
+        return _admin_layout("Docs", f"<p>Fehler: {_html_lib.escape(str(e))}</p>"), 500
+    mtime = datetime.datetime.fromtimestamp(st.st_mtime).strftime("%Y-%m-%d %H:%M:%S")
+    size_kb = st.st_size / 1024.0
+    # Render markdown for .md, raw <pre> for .yaml/.yml/.txt
+    ext = os.path.splitext(filename)[1].lower()
+    if ext == ".md":
+        rendered = _admin_render_md(md)
+    else:
+        rendered = "<pre><code>" + _html_lib.escape(md) + "</code></pre>"
+    body = (
+        "<a href='/admin/docs' class='back'>← Docs</a>"
+        f"<h1>{_html_lib.escape(filename)}</h1>"
+        f"<div class='subtitle'>{size_kb:.1f} KB — zuletzt geaendert {mtime}</div>"
+        f"{rendered}"
+    )
+    return _admin_layout(filename, body)
+
+
+def _admin_collect_permissions():
+    """Build agent-permission overview.
+    Returns: list of dicts with keys: name, kind, memory_dir, file_count,
+    parent, sub_agents, has_own_memory.
+    Plus: list of orphan memory dirs (no agent definition)."""
+    agents_dir = os.path.join(_ADMIN_DATALAKE, "config", "agents")
+    if not os.path.isdir(agents_dir):
+        return [], []
+
+    # All agent definition files
+    agent_files = sorted([f for f in os.listdir(agents_dir)
+                          if f.endswith(".txt") and not f.startswith(".")])
+    agent_names = [f[:-4] for f in agent_files]
+
+    # Parent vs sub: parent has no underscore OR underscore-name where prefix is also an agent
+    parents = set()
+    subs_by_parent = {}
+    for n in agent_names:
+        if "_" in n:
+            prefix = n.split("_", 1)[0]
+            if prefix in agent_names:
+                subs_by_parent.setdefault(prefix, []).append(n)
+                continue
+        parents.add(n)
+    # Anything not in a parent's sub-list and not in `parents` is also a parent
+    for n in agent_names:
+        if n not in parents and n not in {s for subs in subs_by_parent.values() for s in subs}:
+            parents.add(n)
+
+    # Existing memory dirs in datalake root
+    existing_memory_dirs = set()
+    for entry in os.listdir(_ADMIN_DATALAKE):
+        full = os.path.join(_ADMIN_DATALAKE, entry, "memory")
+        if os.path.isdir(full):
+            existing_memory_dirs.add(entry)
+
+    rows = []
+    for n in sorted(agent_names):
+        is_parent = n in parents
+        mem_dir = os.path.join(_ADMIN_DATALAKE, n, "memory") if is_parent else None
+        file_count = 0
+        has_own = False
+        if mem_dir and os.path.isdir(mem_dir):
+            try:
+                file_count = sum(1 for f in os.listdir(mem_dir)
+                                 if os.path.isfile(os.path.join(mem_dir, f)))
+                has_own = True
+            except Exception:
+                pass
+        # Sub agent: parent prefix and inherited memory
+        parent = None
+        if not is_parent and "_" in n:
+            prefix = n.split("_", 1)[0]
+            if prefix in agent_names:
+                parent = prefix
+        rows.append({
+            "name": n,
+            "kind": "Parent" if is_parent else "Sub-Agent",
+            "has_own_memory": has_own,
+            "memory_dir": mem_dir if has_own else None,
+            "file_count": file_count,
+            "parent": parent,
+            "sub_agents": subs_by_parent.get(n, []),
+        })
+
+    # Orphan memory dirs: have memory/ but no agent .txt
+    orphans = sorted(d for d in existing_memory_dirs if d not in agent_names)
+    # Filter out non-agent system dirs
+    system_dirs = {"config", "email_inbox", "claude_outputs", "global", "system_ward"}
+    orphans = [d for d in orphans if d not in system_dirs]
+    return rows, orphans
+
+
+@app.route('/admin/permissions', methods=['GET'])
+def admin_permissions():
+    rows, orphans = _admin_collect_permissions()
+    if not rows:
+        return _admin_layout("Permissions",
+            "<a href='/admin' class='back'>← Admin</a><h1>Memory-Berechtigungen</h1>"
+            "<p>Keine Agent-Definitionen gefunden.</p>")
+    tr = []
+    for r in rows:
+        if r["kind"] == "Parent":
+            kind_html = "<span class='tag'>Parent</span>"
+            if r["has_own_memory"]:
+                mem_html = f"<code>{_html_lib.escape(r['name'])}/memory/</code> ({r['file_count']} Dateien)"
+            else:
+                mem_html = "<span class='status-bad'>(kein memory/)</span>"
+            access_html = "—"
+            subs_html = ", ".join(_html_lib.escape(s) for s in r["sub_agents"]) if r["sub_agents"] else "—"
+        else:
+            kind_html = "<span class='tag tag-sub'>Sub-Agent</span>"
+            mem_html = "—"
+            access_html = (f"<code>{_html_lib.escape(r['parent'])}/memory/</code>"
+                           if r["parent"] else "(kein Parent)")
+            subs_html = "—"
+        tr.append(
+            f"<tr><td><strong>{_html_lib.escape(r['name'])}</strong></td>"
+            f"<td>{kind_html}</td>"
+            f"<td>{mem_html}</td>"
+            f"<td>{access_html}</td>"
+            f"<td>{subs_html}</td></tr>"
+        )
+    table = ("<table><tr><th>Agent</th><th>Typ</th><th>Eigenes Memory</th>"
+             "<th>Zugriff auf Parent-Memory</th><th>Sub-Agents</th></tr>"
+             + "".join(tr) + "</table>")
+
+    if orphans:
+        orph_rows = "".join(f"<tr><td><code>{_html_lib.escape(d)}/memory/</code></td></tr>" for d in orphans)
+        orph_html = ("<h2>Verwaiste Memory-Ordner</h2>"
+                     "<p>Memory-Ordner ohne zugehoerige Agent-Definition (Datei in <code>config/agents/</code>):</p>"
+                     "<table><tr><th>Pfad</th></tr>" + orph_rows + "</table>")
+    else:
+        orph_html = "<h2>Verwaiste Memory-Ordner</h2><p>Keine — alle Memory-Ordner haben einen Agent.</p>"
+
+    n_parents = sum(1 for r in rows if r["kind"] == "Parent")
+    n_subs = sum(1 for r in rows if r["kind"] == "Sub-Agent")
+    body = (
+        "<a href='/admin' class='back'>← Admin</a>"
+        "<h1>🔐 Memory-Berechtigungen</h1>"
+        "<div class='subtitle'>Wer hat Zugriff auf welches Memory? Datenbasis: "
+        f"<code>{_ADMIN_DATALAKE}/config/agents/</code></div>"
+        f"<div><span class='metric'><strong>{len(rows)}</strong> Agents</span>"
+        f"<span class='metric'><strong>{n_parents}</strong> Parents</span>"
+        f"<span class='metric'><strong>{n_subs}</strong> Sub-Agents</span>"
+        f"<span class='metric'><strong>{len(orphans)}</strong> verwaist</span></div>"
+        "<h2>Agents</h2>"
+        f"{table}"
+        f"{orph_html}"
+    )
+    return _admin_layout("Permissions", body)
+
+
+@app.route('/api/docs', methods=['GET'])
+def api_docs():
+    """Auto-generated API documentation page."""
+    import re as _re_docs
+    import inspect
+
+    # Parse latest date from changelog
+    changelog_path = os.path.join(os.path.expanduser("~"), "AssistantDev", "changelog.md")
+    last_update = "unbekannt"
+    try:
+        with open(changelog_path, "r") as cf:
+            for line in cf:
+                m = _re_docs.search(r'\d{4}-\d{2}-\d{2}', line)
+                if m:
+                    last_update = m.group(0)
+                    break
+    except Exception:
+        pass
+
+    # Collect all routes
+    rows = []
+    for rule in sorted(app.url_map.iter_rules(), key=lambda r: r.rule):
+        if rule.endpoint == "static":
+            continue
+        methods = ", ".join(sorted(rule.methods - {"OPTIONS", "HEAD"}))
+        desc = ""
+        view_fn = app.view_functions.get(rule.endpoint)
+        if view_fn and view_fn.__doc__:
+            desc = _html_lib.escape(view_fn.__doc__.strip().split("\n")[0])
+        rows.append(
+            f"<tr><td><code>{methods}</code></td>"
+            f"<td><code>{_html_lib.escape(rule.rule)}</code></td>"
+            f"<td>{desc}</td></tr>"
+        )
+
+    table = (
+        "<table><tr><th>Method</th><th>Pfad</th><th>Beschreibung</th></tr>"
+        + "\n".join(rows) + "</table>"
+    )
+    body = (
+        '<a href="/" class="back">\u2190 Dashboard</a>'
+        "<h1>AssistantDev API Documentation</h1>"
+        f'<div class="subtitle">Letztes Update: {last_update} \u2014 '
+        f"{len(rows)} Routen registriert</div>"
+        f"{table}"
+        '<hr><p style="color:#666;font-size:11px">AssistantDev \u2014 auto-generated</p>'
+    )
+    return _admin_layout("API Docs", body)
+
+# ── ENDE ADMIN-BEREICH ────────────────────────────────────────────────────────
+
+
+# ── MEMORY MANAGEMENT UI ─────────────────────────────────────────────────────
+
+@app.route('/api/memory/list/<agent>', methods=['GET'])
+def api_memory_list(agent):
+    """List all memory files for an agent with metadata."""
+    speicher = get_agent_speicher(agent)
+    if not speicher:
+        return jsonify([])
+    memory_dir = os.path.join(speicher, 'memory')
+    if not os.path.isdir(memory_dir):
+        return jsonify([])
+    result = []
+    for fname in sorted(os.listdir(memory_dir)):
+        fpath = os.path.join(memory_dir, fname)
+        if not os.path.isfile(fpath):
+            continue
+        try:
+            stat = os.stat(fpath)
+            preview = ''
+            try:
+                with open(fpath, 'r', encoding='utf-8', errors='replace') as f:
+                    preview = f.read(200)
+            except Exception:
+                pass
+            result.append({
+                'file': fname,
+                'size': stat.st_size,
+                'mtime': datetime.fromtimestamp(stat.st_mtime).strftime('%Y-%m-%d %H:%M'),
+                'preview': preview,
+            })
+        except Exception:
+            continue
+    return jsonify(result)
+
+
+@app.route('/memory')
+def memory_page():
+    """Dedicated Memory Management UI."""
+    return _admin_layout("Memory Management", _MEMORY_PAGE_HTML)
+
+
+_MEMORY_PAGE_HTML = """
+<a href="/" class="back">&larr; Dashboard</a>
+<h1>Memory Management</h1>
+<p class="subtitle">Working Memory und Memory-Files durchsuchen und verwalten</p>
+
+<div style="margin-bottom:20px">
+  <label style="color:#9ec5fe;font-size:13px;font-weight:600">Agent waehlen:</label>
+  <select id="mm-agent-select" onchange="mmLoadAgent()" style="background:#22224a;color:#e0e0e0;border:1px solid #334;border-radius:6px;padding:6px 12px;font-size:14px;margin-left:8px;min-width:200px">
+    <option value="">-- Agent waehlen --</option>
+  </select>
+</div>
+
+<div id="mm-hint" style="color:#888;font-size:14px;margin:40px 0;text-align:center">Bitte zuerst einen Agenten waehlen.</div>
+
+<div id="mm-content" style="display:none">
+  <!-- Search bar -->
+  <div style="margin-bottom:18px;display:flex;gap:10px">
+    <input id="mm-search" type="text" placeholder="Dateisuche (min 2 Zeichen)..." oninput="mmFileSearch()" style="flex:1;background:#111;color:#e0e0e0;border:1px solid #334;border-radius:6px;padding:8px 12px;font-size:13px" />
+    <button onclick="mmDeepSearch()" style="background:#4a8aca;color:#fff;border:none;border-radius:6px;padding:8px 16px;font-size:13px;cursor:pointer">Volltextsuche</button>
+  </div>
+  <div id="mm-search-results" style="margin-bottom:14px"></div>
+
+  <!-- Working Memory -->
+  <h2>Working Memory</h2>
+  <div id="mm-working" style="margin-bottom:24px"><em style="color:#666">Lade...</em></div>
+
+  <!-- All Memory Files -->
+  <h2>Alle Memory-Files</h2>
+  <div id="mm-files"><em style="color:#666">Lade...</em></div>
+</div>
+
+<!-- Deep search modal -->
+<div id="mm-deep-modal" style="display:none;position:fixed;top:0;left:0;width:100%;height:100%;background:rgba(0,0,0,.7);z-index:999;justify-content:center;align-items:center">
+  <div style="background:#1a1a2e;border:1px solid #334;border-radius:12px;padding:24px;width:90%;max-width:700px;max-height:80vh;overflow-y:auto">
+    <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:14px">
+      <h2 style="margin:0;color:#f0c060">Volltextsuche</h2>
+      <button onclick="mmCloseDeep()" style="background:none;border:none;color:#888;font-size:20px;cursor:pointer">&times;</button>
+    </div>
+    <input id="mm-deep-query" type="text" placeholder="Suchbegriff..." style="width:100%;background:#111;color:#e0e0e0;border:1px solid #334;border-radius:6px;padding:8px 12px;font-size:14px;margin-bottom:10px" />
+    <button onclick="mmRunDeep()" style="background:#4a8aca;color:#fff;border:none;border-radius:6px;padding:8px 16px;font-size:13px;cursor:pointer;margin-bottom:14px">Suchen</button>
+    <div id="mm-deep-results"></div>
+  </div>
+</div>
+
+<!-- File preview modal -->
+<div id="mm-preview-modal" style="display:none;position:fixed;top:0;left:0;width:100%;height:100%;background:rgba(0,0,0,.7);z-index:999;justify-content:center;align-items:center">
+  <div style="background:#1a1a2e;border:1px solid #334;border-radius:12px;padding:24px;width:90%;max-width:700px;max-height:80vh;overflow-y:auto">
+    <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:14px">
+      <h2 id="mm-preview-title" style="margin:0;color:#f0c060"></h2>
+      <button onclick="mmClosePreview()" style="background:none;border:none;color:#888;font-size:20px;cursor:pointer">&times;</button>
+    </div>
+    <pre id="mm-preview-content" style="white-space:pre-wrap;word-break:break-word;max-height:60vh;overflow-y:auto"></pre>
+  </div>
+</div>
+
+<script>
+var mmAgent = '';
+
+function mmLoadAgents() {
+  fetch('/agents').then(function(r){return r.json()}).then(function(agents) {
+    var sel = document.getElementById('mm-agent-select');
+    agents.forEach(function(a) {
+      var opt = document.createElement('option');
+      opt.value = a.name;
+      opt.textContent = a.label;
+      sel.appendChild(opt);
+      if (a.subagents) {
+        a.subagents.forEach(function(s) {
+          var sopt = document.createElement('option');
+          sopt.value = s.name;
+          sopt.textContent = '  \\u2514 ' + s.label;
+          sel.appendChild(sopt);
+        });
+      }
+    });
+    var params = new URLSearchParams(window.location.search);
+    if (params.get('agent')) {
+      sel.value = params.get('agent');
+      mmLoadAgent();
+    }
+  });
+}
+
+function mmLoadAgent() {
+  var sel = document.getElementById('mm-agent-select');
+  mmAgent = sel.value;
+  if (!mmAgent) {
+    document.getElementById('mm-hint').style.display = 'block';
+    document.getElementById('mm-content').style.display = 'none';
+    return;
+  }
+  document.getElementById('mm-hint').style.display = 'none';
+  document.getElementById('mm-content').style.display = 'block';
+  mmLoadWorking();
+  mmLoadFiles();
+}
+
+function mmLoadWorking() {
+  document.getElementById('mm-working').innerHTML = '<em style="color:#666">Lade...</em>';
+  fetch('/api/working-memory/' + encodeURIComponent(mmAgent), {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({action: 'list'})
+  }).then(function(r){return r.json()}).then(function(data) {
+    var files = (data.manifest && data.manifest.files) || [];
+    if (files.length === 0) {
+      document.getElementById('mm-working').innerHTML = '<em style="color:#666">Keine Working-Memory-Dateien geladen.</em>';
+      return;
+    }
+    var html = '<table><tr><th>Datei</th><th>Prioritaet</th><th>Beschreibung</th><th>Hinzugefuegt</th><th>Aktion</th></tr>';
+    files.forEach(function(f) {
+      html += '<tr><td><code>' + mmEsc(f.filename) + '</code></td>';
+      html += '<td>' + (f.priority || '-') + '</td>';
+      html += '<td>' + mmEsc(f.description || '-') + '</td>';
+      html += '<td>' + mmEsc(f.added || '-') + '</td>';
+      html += '<td><button onclick="mmRemoveWM(\\'' + mmEsc(f.filename).replace(/'/g, "\\\\'") + '\\')" style="background:#d07070;color:#fff;border:none;border-radius:4px;padding:3px 10px;cursor:pointer;font-size:12px">Entfernen</button></td></tr>';
+    });
+    html += '</table>';
+    document.getElementById('mm-working').innerHTML = html;
+  }).catch(function() {
+    document.getElementById('mm-working').innerHTML = '<em style="color:#d07070">Fehler beim Laden.</em>';
+  });
+}
+
+function mmRemoveWM(filename) {
+  fetch('/api/working-memory/' + encodeURIComponent(mmAgent), {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({action: 'remove', filename: filename})
+  }).then(function(){mmLoadWorking()});
+}
+
+function mmLoadFiles() {
+  document.getElementById('mm-files').innerHTML = '<em style="color:#666">Lade...</em>';
+  fetch('/api/memory/list/' + encodeURIComponent(mmAgent)).then(function(r){return r.json()}).then(function(files) {
+    if (files.length === 0) {
+      document.getElementById('mm-files').innerHTML = '<em style="color:#666">Keine Memory-Files gefunden.</em>';
+      return;
+    }
+    var html = '<table><tr><th>Datei</th><th>Groesse</th><th>Geaendert</th><th>Vorschau</th></tr>';
+    files.forEach(function(f) {
+      html += '<tr><td><code>' + mmEsc(f.file) + '</code></td>';
+      html += '<td>' + mmFormatSize(f.size) + '</td>';
+      html += '<td>' + mmEsc(f.mtime) + '</td>';
+      html += '<td><button onclick="mmShowPreview(\\'' + mmEsc(f.file).replace(/'/g, "\\\\'") + '\\')" style="background:#4a8aca;color:#fff;border:none;border-radius:4px;padding:3px 10px;cursor:pointer;font-size:12px">Anzeigen</button></td></tr>';
+    });
+    html += '</table>';
+    html += '<p class="subtitle">' + files.length + ' Dateien</p>';
+    document.getElementById('mm-files').innerHTML = html;
+  }).catch(function() {
+    document.getElementById('mm-files').innerHTML = '<em style="color:#d07070">Fehler beim Laden.</em>';
+  });
+}
+
+function mmShowPreview(filename) {
+  document.getElementById('mm-preview-title').textContent = filename;
+  document.getElementById('mm-preview-content').textContent = 'Lade...';
+  document.getElementById('mm-preview-modal').style.display = 'flex';
+  fetch('/api/memory/list/' + encodeURIComponent(mmAgent)).then(function(r){return r.json()}).then(function(files) {
+    var found = files.find(function(f){return f.file === filename});
+    document.getElementById('mm-preview-content').textContent = found ? found.preview : 'Datei nicht gefunden.';
+  });
+}
+function mmClosePreview() { document.getElementById('mm-preview-modal').style.display = 'none'; }
+
+function mmFileSearch() {
+  var q = document.getElementById('mm-search').value.trim();
+  var el = document.getElementById('mm-search-results');
+  if (q.length < 2) { el.innerHTML = ''; return; }
+  fetch('/api/memory-files-search?agent=' + encodeURIComponent(mmAgent) + '&q=' + encodeURIComponent(q))
+    .then(function(r){return r.json()}).then(function(results) {
+      if (results.length === 0) { el.innerHTML = '<p style="color:#888;font-size:12px">Keine Treffer.</p>'; return; }
+      var html = '<div style="background:#22224a;border:1px solid #334;border-radius:6px;padding:8px">';
+      results.forEach(function(r) {
+        html += '<div style="padding:4px 0;border-bottom:1px solid #2c2c4a"><code style="color:#9ec5fe">' + mmEsc(r.filename) + '</code> <span style="color:#888;font-size:11px">' + mmEsc(r.snippet) + '</span></div>';
+      });
+      html += '</div>';
+      el.innerHTML = html;
+    });
+}
+
+function mmDeepSearch() {
+  document.getElementById('mm-deep-query').value = '';
+  document.getElementById('mm-deep-results').innerHTML = '';
+  document.getElementById('mm-deep-modal').style.display = 'flex';
+  document.getElementById('mm-deep-query').focus();
+}
+function mmCloseDeep() { document.getElementById('mm-deep-modal').style.display = 'none'; }
+
+function mmRunDeep() {
+  var q = document.getElementById('mm-deep-query').value.trim();
+  if (!q) return;
+  var el = document.getElementById('mm-deep-results');
+  el.innerHTML = '<em style="color:#666">Suche...</em>';
+  fetch('/api/memory/search', {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({agent: mmAgent, query: q, max_results: 20})
+  }).then(function(r){return r.json()}).then(function(data) {
+    var results = data.results || [];
+    if (results.length === 0) { el.innerHTML = '<p style="color:#888">Keine Ergebnisse.</p>'; return; }
+    var html = '';
+    results.forEach(function(r) {
+      html += '<div style="background:#22224a;border:1px solid #334;border-radius:6px;padding:10px;margin-bottom:8px">';
+      html += '<div style="font-weight:600;color:#9ec5fe;margin-bottom:4px">' + mmEsc(r.name || r.filename || 'Unbekannt') + '</div>';
+      html += '<div style="color:#d0d0d0;font-size:12px;white-space:pre-wrap">' + mmEsc(r.preview || r.snippet || '') + '</div>';
+      html += '</div>';
+    });
+    el.innerHTML = html;
+  }).catch(function() {
+    el.innerHTML = '<em style="color:#d07070">Fehler bei der Suche.</em>';
+  });
+}
+
+function mmEsc(s) {
+  if (!s) return '';
+  var d = document.createElement('div');
+  d.appendChild(document.createTextNode(s));
+  return d.innerHTML;
+}
+
+function mmFormatSize(bytes) {
+  if (bytes < 1024) return bytes + ' B';
+  if (bytes < 1048576) return (bytes / 1024).toFixed(1) + ' KB';
+  return (bytes / 1048576).toFixed(1) + ' MB';
+}
+
+mmLoadAgents();
+</script>
+"""
+
+# ── ENDE MEMORY MANAGEMENT UI ────────────────────────────────────────────────
+
+
 if __name__ == '__main__':
     def open_browser():
         import time; time.sleep(1)
@@ -7839,8 +9901,8 @@ if __name__ == '__main__':
             cleanup_old_sessions()
     threading.Thread(target=session_cleanup_loop, daemon=True).start()
 
-    # Save all sessions on shutdown (pkill, Ctrl+C, restart)
-    import atexit, signal
+    # Graceful Shutdown: SIGTERM abfangen, laufende Requests abwarten, dann sauber beenden
+    import atexit
     def _save_all_sessions_on_exit():
         print('[AUTO-SAVE] Shutdown erkannt — sichere alle Sessions...')
         for sid in list(sessions.keys()):
@@ -7849,8 +9911,30 @@ if __name__ == '__main__':
                 print(f'[AUTO-SAVE] Session {sid[:12]} gesichert')
             except Exception as e:
                 print(f'[AUTO-SAVE] Fehler bei {sid[:12]}: {e}')
+
+    def _graceful_shutdown(sig, frame):
+        print(f'[SHUTDOWN] Signal {sig} empfangen — starte Graceful Shutdown...')
+        _shutdown_event.set()
+        import time as _shutdown_time
+        for i in range(30):
+            with _active_requests_lock:
+                active = _active_requests
+            if active == 0:
+                print(f'[SHUTDOWN] Alle Requests abgeschlossen nach {i}s')
+                break
+            print(f'[SHUTDOWN] Warte auf {active} aktive(n) Request(s)... ({i+1}/30s)')
+            _shutdown_time.sleep(1)
+        else:
+            with _active_requests_lock:
+                active = _active_requests
+            if active > 0:
+                print(f'[SHUTDOWN] Timeout — {active} Request(s) noch aktiv, beende trotzdem')
+        _save_all_sessions_on_exit()
+        print('[SHUTDOWN] Sauber beendet.')
+        sys.exit(0)
+
     atexit.register(_save_all_sessions_on_exit)
-    signal.signal(signal.SIGTERM, lambda sig, frame: (_save_all_sessions_on_exit(), exit(0)))
+    signal.signal(signal.SIGTERM, _graceful_shutdown)
     # Build global search index in background at startup
     if build_global_index_async:
         build_global_index_async()

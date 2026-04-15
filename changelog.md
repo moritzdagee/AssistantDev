@@ -4,6 +4,383 @@ Format: [Datum] Änderung | Datei | Grund
 
 ---
 
+## 2026-04-15
+
+### Fix: Email Watcher Inbox-Bloat + Auto-Reconcile
+- **Problem:** `email_inbox/` enthielt 21.130 `.eml`-Dateien — `process_eml` hat Mails nie aus dem Inbox-Root entfernt. Am 06.04. wurde Memory neu aufgebaut, aber `~/.emailwatcher_processed.json` nicht zurueckgesetzt. Folge: Mails die zwar als "processed" galten, aber im aktiven Memory fehlten, konnten nicht wiederhergestellt werden (Beispiel: `2026-04-01_17-05-12_New_booking_Sebastian_Schroeder_for_Seba.eml`).
+- **Root-Cause:** `process_eml` endete nach `save_processed()` ohne die `.eml`-Quelle zu verschieben. Kein Auto-Reconcile wenn Mail physisch im Inbox lag aber im processed-Set war.
+- **Fix:**
+  - `src/email_watcher.py` `process_eml()`: nach erfolgreichem Write verschiebt die `.eml` nach `email_inbox/processed/`. Bei Namenskollision wird Timestamp angehaengt.
+  - `src/email_watcher.py` `_migrate_processed_emls()` (neu): Einmal-Migration beim Startup — alle bereits-processed `.eml` aus Inbox-Root nach `email_inbox/processed/` verschieben.
+  - `src/email_watcher.py` `main()` Loop: Reconcile — findet der Watcher eine `.eml` im Inbox-Root die auch im processed-Set ist, wird der Eintrag verworfen und die Mail neu verarbeitet (Safety-Net fuer Crashes zwischen `save_processed` und Move).
+  - Verwaiste iCloud-Konflikt-Dateien `email_watcher_processed.json` + `email_watcher_processed 2.json` im datalake-Root nach `backups/orphan_tracker_files_2026-04-15_08-12-xx/` archiviert (aktiver Mirror ist `config/email_processed_log.json`).
+- **Backups:** `backups/2026-04-15_08-09-59/src/email_watcher.py`, `backups/orphan_tracker_files_2026-04-15_08-12-xx/`
+- **Operatives:** Betroffene Schroeder-Mail (2026-04-01) manuell aus `~/.emailwatcher_processed.json` entfernt und re-processed → neue Datei in `signicat/memory/` generiert. LaunchAgent `com.moritz.emailwatcher` hat keine iCloud-TCC-Permission und wurde unloaded; Watcher laeuft bis auf Weiteres manuell aus Terminal-Shell-Kontext.
+
+### Fix: Contacts-Pollution an der Wurzel — Source-side Prevention + macOS Auto-Population aus
+- **Problem:** Email Watcher und Contact-Extractor uebernahmen From-Header-Namen ungeprueft als Kontakt-Name; macOS contactsd/suggestd injizierte zusaetzlich Mail-Sender als Vorschlag in alle Account-Sources (iCloud/Exchange/Google/CardDAV). Folge: fremde Namen ("Sebastian Schroeder", "Maivika") landeten auf bestehenden Kontakten und sogar der My Card.
+- **Root-Cause:** Name aus `From:` wurde uebernommen, auch wenn die E-Mail-Adresse einem anderen Kontakt gehoerte. macOS-Auto-Population schrieb zusaetzlich eigene Vorschlaege upstream.
+- **Fix-Teil 1 (Code, Source-side):**
+  - `scripts/extract_contacts.py`: `OWN_EMAILS`-Filter in `stage1_scan()` — Mails von eigenen Adressen werden uebersprungen (verhindert My-Card-Pollution beim vCard-Import). Neue Helper `_name_tokens`, `name_matches_email`, `is_strict_name_extension`. From-Namen die nicht zur Mailadresse passen werden verworfen; existierende Namen werden NUR durch echte Erweiterungen ersetzt. Auch Haiku-extrahierte Namen (Stage 2) werden gegen die Mailadresse validiert.
+  - `src/email_watcher.py`: Identische Validierung in `update_contacts_json()` — From-Name wird verworfen wenn Tokens nicht im Local-Part vorkommen; Replacement nur bei strikter Erweiterung.
+- **Fix-Teil 2 (Settings, Upstream):**
+  - `scripts/disable_macos_contacts_autopop.sh` (neu): setzt `com.apple.suggestd` und `com.apple.AddressBook` defaults, oeffnet relevante Settings-Panes (Contacts → "Show Contacts found in Mail" abschalten; Apple Intelligence & Siri → Suggestions fuer Mail/Contacts abschalten), startet `suggestd`/`contactsd` neu.
+- **Backups:** `backups/2026-04-15_07-44-19/` (email_watcher.py, extract_contacts.py)
+- **Verifikation:** `python3 ~/AssistantDev/scripts/contact_watchdog.py` taeglich — sollte ab jetzt keine neuen Pollution-Faelle melden.
+
+### Feature: Dedizierte Memory Management UI
+- **Neue Route `GET /memory`** in `src/web_server.py`: Eigenstaendige Seite zum Durchsuchen und Verwalten von Agent-Memories
+  - Agent-Selector (Dropdown) mit allen bekannten Agenten inkl. Sub-Agenten
+  - Sektion "Working Memory": Liste geladener Files (Name, Prioritaet, Beschreibung, Hinzugefuegt-Datum, Entfernen-Button)
+  - Sektion "Alle Memory-Files": Tabelle aller Dateien im Memory-Verzeichnis (Name, Groesse, Mtime, Vorschau-Button)
+  - Dateisuche mit Autocomplete (nutzt `/api/memory-files-search`)
+  - Volltextsuche-Modal (nutzt `/api/memory/search`)
+  - Dunkles Theme passend zum Admin-Bereich, Vanilla JS, kein Styling-Konflikt
+- **Neue Route `GET /api/memory/list/<agent>`**: JSON-API fuer alle Memory-Files eines Agenten (Dateiname, Groesse, Mtime, Preview)
+- **Tray-Link aktualisiert** (`src/tray_app.py`): `_open_memory` zeigt jetzt auf `/memory` statt `/`
+- **11 neue Tests** in `tests/run_tests.py` (Sektion "Memory UI 2026-04-15"): HTTP 200, Content-Type, Titel, keine Agent-Modal, JS-Funktionen, Selector, Suche
+- **Backups:** `backups/2026-04-15_07-37-56/`
+- **Tests:** 237/238 bestanden (1 vorbestehender Fehler: `/find` im HTML). Alle neuen Tests gruen.
+
+### Fix: /select_agent Race Condition + Recovery-Load + Draft-Persistence
+- **Problem:** Agent-Wechsel via `/select_agent` zerstoerte laufende Sessions — `state['verlauf']=[]` bei jedem Klick, neue `konversation_*.txt` angelegt, auch bei Re-Klick desselben Agents. Bei Agent-Wechsel waehrend laufendem LLM-Call: Race Condition, alte Datei bleibt mit Pending-Marker stehen.
+- **Fix 1 — Processing Guard (`src/web_server.py`):** `/select_agent` prueft `state.get('processing')` und gibt Fehler-JSON zurueck wenn ein LLM-Call laeuft. Kein Agent-Wechsel moeglich waehrend Antwort generiert wird.
+- **Fix 2 — Re-Klick Guard:** Wenn derselbe Agent nochmal gewaehlt wird (`name == state.get('agent')`): kein Reset, kein neuer Dateiname, kein leerer Verlauf — nur System-Prompt-Update und aktuelle Daten zurueckgeben.
+- **Fix 3 — Session-Save vor Wechsel:** `auto_save_session(session_id)` wird defensiv aufgerufen bevor der State auf den neuen Agent umgebaut wird.
+- **Fix 4 — Recovery-Load (`find_latest_konversation`):** Statt immer leeren Verlauf: sucht die juengste `konversation_*.txt` vom heutigen Tag im Speicher-Verzeichnis des neuen Agents. Falls gefunden: parsed sie via `parse_konversation_file()` und laed den Verlauf in den State. Frontend rendert `recovered_messages` aus der Response.
+- **Fix 5 — Draft-Persistence (Frontend):** `localStorage.setItem('draft_' + agentName, text)` bei jedem Input-Event. Beim Agent-Load: Draft aus localStorage zurueckholen. Nach erfolgreichem Send: Draft loeschen.
+- **Neue Helper:** `parse_konversation_file(pfad)` und `find_latest_konversation(speicher, name)` als wiederverwendbare Funktionen extrahiert.
+- **Tests:** 8 neue Tests in Sektion "Agent-Switch Session Protection 2026-04-15" (226/227 gruen, 1 pre-existing fail).
+- **Backups:** `backups/2026-04-15_07-32-03/src/web_server.py`
+
+### Fix: Graceful Shutdown + Write-Through fuer Konversationen
+- **Problem:** Bei `pkill -f web_server.py` gingen Teile aktiver Konversationen verloren — der Auto-Save schrieb erst NACH der vollstaendigen LLM-Antwort. Wurde der Prozess waehrend eines laufenden LLM-Calls beendet, fehlten die letzte Nutzer-Nachricht und die Antwort.
+- **Write-Through mit Pending-Marker (`src/web_server.py`):** Sobald eine Nutzer-Nachricht eingeht, wird sie zusammen mit einem Pending-Marker (`[ANTWORT AUSSTEHEND - Server-Neustart hat diese Antwort unterbrochen]`) sofort in die `konversation_*.txt` geschrieben — BEVOR der LLM-Call startet. Nach Abschluss des LLM-Calls wird der Marker durch die echte Antwort ersetzt. Im schlimmsten Fall (SIGKILL) bleibt die Nutzer-Nachricht erhalten, nur die Antwort fehlt.
+- **Graceful Shutdown Handler:** `signal.SIGTERM` wird abgefangen. Neue Requests werden sofort mit HTTP 503 abgelehnt. Laufende Requests werden bis zu 30 Sekunden abgewartet. Danach werden alle Sessions gesichert und der Prozess sauber beendet. Globaler `_shutdown_event` (threading.Event) + `_active_requests`-Zaehler mit Lock.
+- **Recovery beim Neustart:** Beim Start scannt `_recover_pending_markers()` alle `konversation_*.txt` in allen Agent-Verzeichnissen. Pending-Marker werden durch `[Antwort verloren - Server wurde neu gestartet]` ersetzt, damit der Nutzer sieht was passiert ist.
+- **Neues Script `scripts/deploy.sh`:** Graceful-Deployment-Script. Kopiert Source-Dateien → sendet SIGTERM → wartet bis zu 35s auf sauberes Ende (Fallback: SIGKILL) → startet App neu → Healthcheck via curl.
+- **Backups:** `backups/2026-04-15_07-15-11/src/web_server.py`
+- **Tests:** 218/219 bestanden (1 vorbestehender Fehler: `/find` im HTML — nicht durch diese Aenderung verursacht). Syntax-Check OK. Hauptroute HTTP 200, Server erreichbar.
+
+### Feature: AssistantDev System Tray App — Status-Dashboard, Services, Docs, API-Docs Route
+- **Neue Datei `src/tray_app.py`**: Vollstaendige System Tray App mit pystray/Pillow
+  - Programmatische Icon-Generierung (normal/warn/error) je nach Service-Status
+  - Hintergrund-Status-Checks alle 30s (Web Server, Web Clipper, Email Watcher)
+  - Menue: Dashboard, Services (mit Restart/Toggle), Dokumentation, Komponenten & Pfade
+  - Service-Aktionen: Web Server/Clipper neu starten, Email Watcher starten/stoppen
+- **Neue Route `/api/docs`** in `src/web_server.py`: Auto-generierte API-Dokumentation
+  - Listet alle registrierten Flask-Routen mit Methoden und Docstrings
+  - Dunkles Theme passend zum Admin-Bereich, letztes Update aus changelog.md
+- **LaunchAgent `com.assistantdev.tray.plist`**: Auto-Start bei Login, KeepAlive
+- Backup: backups/2026-04-15_07-26-10/
+
+### Feature: Working Memory System — persistentes Agent-Gedaechtnis
+- **Neue Funktion `load_working_memory(agent_name)`** in `src/web_server.py`:
+  - Liest `[agent]/working_memory/_manifest.json` und laedt alle gelisteten Markdown-Dateien
+  - Token-Zaehlung (len/4), Auto-Cleanup bei Ueberschreitung (niedrige Prioritaet zuerst raus)
+  - Formatierter Block `--- WORKING MEMORY ---` wird zwischen Base-Prompt und GEDAECHTNIS eingefuegt
+- **Neue Verwaltungsfunktionen:** `working_memory_add()`, `working_memory_remove()`, `working_memory_list()`
+- **Agent-seitige Commands** (geparst in `process_single_message()`):
+  - `WORKING_MEMORY_ADD: {"filename": "...", "content": "...", "priority": 1-10, "description": "..."}`
+  - `WORKING_MEMORY_REMOVE: {"filename": "..."}`
+  - `WORKING_MEMORY_LIST: {}`
+- **REST API:** `POST /api/working-memory/<agent>` mit actions: add, remove, list
+- **System Prompt Ergaenzung:** `## WORKING MEMORY` Abschnitt an alle 9 Agent-Definitionen in `config/agents/*.txt` angehaengt
+- **Dateipfad:** `claude_datalake/[agent]/working_memory/` mit `_manifest.json` fuer Metadaten
+- **Tests bestanden:** System Prompt Integration, API add/remove/list, Auto-Cleanup, Command-Parsing, Server Health
+
+### Admin-Bereich + Menu Bar System-Submenu
+- **4 neue Routen in `src/web_server.py`** (eingefuegt vor `if __name__ == '__main__':` via `/tmp/insert_admin_routes.py`, kein Edit-Tool — wegen duplizierter Bloecke):
+  - `GET /admin` — Dashboard mit System-Status (Web 8080 / Clipper 8081 / Email-Watcher Live-Check via socket+pgrep) und Karten-Navigation zu allen vier Unterbereichen plus dem bestehenden `/admin/access-control`.
+  - `GET /admin/changelog` — Rendert `~/AssistantDev/changelog.md` per Mini-Markdown-Renderer (h1/h2/h3, **bold**, `code`, Listen, Code-Fences, hr). HTML-Escape vor Render gegen XSS aus Changelog-Inhalt. Header zeigt Pfad + Groesse + mtime.
+  - `GET /admin/docs` — Tabelle aller Dateien aus `~/AssistantDev/docs/` (5 Eintraege: API_REFERENCE.md, GIT_WORKFLOW.md, TECHNICAL_DOCUMENTATION.md, openapi.yaml, salesforce_clipper_install.md).
+  - `GET /admin/docs/<filename>` — Rendert .md als HTML, .yaml/.yml/.txt als `<pre>`. **Path-traversal-Schutz**: `os.path.realpath` + Praefix-Check, getestet (`/admin/docs/../../etc/hosts` → 404).
+  - `GET /admin/permissions` — Tabelle aller Agents aus `claude_datalake/config/agents/*.txt`. Klassifiziert in **Parent** (eigener `memory/`-Ordner mit Datei-Count) vs **Sub-Agent** (erbt von Parent via Underscore-Praefix). Zusaetzlich: Liste verwaister Memory-Ordner ohne zugehoerige Agent-Definition (system_dirs wie `config`, `email_inbox`, `claude_outputs` werden gefiltert).
+  - Gemeinsames Dark-Theme via `_admin_layout()` + `_ADMIN_CSS` (gold Headlines, blau Links, Karten-Hover, responsive).
+- **`src/app.py` Menu Bar Erweiterung:** neues Submenu `⚙ System & Docs` zwischen "Open Web Interface" und "Restart All Services" mit 4 Items: `📋 Changelog`, `📖 Technische Docs`, `🔐 Memory-Berechtigungen`, `⚡ System-Status`. Callbacks oeffnen jeweils `http://localhost:8080/admin*` via `subprocess.Popen(["open", url])`.
+- **Backups (Pre-Change):** `src/web_server.py.backup_20260415_065442` (392 KB) und `src/app.py.backup_20260415_065442` (12 KB).
+- **Deployment:** beide Dateien nach `/Applications/Assistant.app/Contents/Resources/` kopiert, Web Server via `pkill -f web_server.py` + `open /Applications/Assistant.app` neu gestartet, Menu Bar via `kill 64316` + `open` neu gestartet (neue PID 68727).
+- **Tests (alle gruen):**
+  - Syntax: `python3 -m py_compile` auf web_server.py + app.py + search_engine.py — OK.
+  - HTTP: `/admin` 200, `/admin/changelog` 200, `/admin/docs` 200, `/admin/docs/API_REFERENCE.md` 200, `/admin/permissions` 200.
+  - Regression: `/` 200, `/agents` 200.
+  - Security: `/admin/docs/../../etc/hosts` → 404, `/admin/docs/nonexistent.md` → 404.
+  - Content-Sanity: Permissions-Seite enthaelt `Parent`, `Sub-Agent`, alle 4 Hauptagents (signicat, privat, trustedcarrier, standard), `verwaist`-Sektion. Changelog-Seite rendert heutige `2026-04-15`-Eintraege.
+
+### macOS Prozessnamen via setproctitle
+- `setproctitle` installiert und in allen vier Hauptprozessen eingebaut
+- `web_server.py` → "AssistantDev WebServer"
+- `web_clipper_server.py` → "AssistantDev WebClipper"
+- `email_watcher.py` → "AssistantDev EmailWatcher"
+- `app.py` → "AssistantDev MenuBar"
+- Prozesse sind jetzt in Activity Monitor und `ps aux` unter ihrem Klarnamen sichtbar statt als generisches "python3"
+
+### Email Watcher Backlog gefixt + LaunchAgent-Permission-Bug entdeckt
+- **Symptom:** Email Watcher Prozess lief seit 1 Tag (PID 45788, 17h Uptime), aber `~/.emailwatcher_processed.json` wurde seit Apr 14 13:02 nicht mehr aktualisiert. 9 .eml Dateien (darunter `2026-04-15_00-31-59_AW_Preisindikation_Signicat.eml`, `2026-04-14_19-35-04_Money_received_from_kyb_group_BV.eml`, 4x Daily digest) waren im Inbox aufgelaufen.
+- **Root Cause:** macOS TCC-Permission-Verlust am LaunchAgent. `~/Library/Logs/emailwatcher.log` enthielt **66.447** Eintraege `Fehler: [Errno 1] Operation not permitted: '.../email_inbox'`. Der LaunchAgent (`com.moritz.emailwatcher.plist`, `/usr/bin/python3 src/email_watcher.py`) hat seit dem letzten Restart keinen iCloud-Drive-Zugriff mehr; der Stub `/usr/bin/python3` (resolved auf Xcode-Python) ist nicht in System Settings → Privacy & Security → Files & Folders → iCloud Drive freigeschaltet. Terminal-Python hingegen erbt Full Disk Access von Terminal selbst → listdir auf email_inbox liefert dort die 21126 Dateien problemlos.
+- **Fix (sofort):**
+  - Backup `~/.emailwatcher_processed.backup_20260415_062238.json` (1.3 MB, 21117 Eintraege).
+  - 9 Backlog-Mails ueber das gleiche `process_eml()` aus `email_watcher.py` aus diesem Terminal-Kontext nachverarbeitet (alle 9 ok, 0 Fehler). Routing korrekt: 5x signicat (Daily digests + AW_Preisindikation), 4x standard.
+  - LaunchAgent gestoppt: `launchctl unload ~/Library/LaunchAgents/com.moritz.emailwatcher.plist`.
+  - Frischer Watcher aus Terminal-Kontext gestartet: `nohup python3 src/email_watcher.py > ~/Library/Logs/emailwatcher_terminal.log 2>&1 &` (PID 67461, 14 MB RSS — gesund vs. dem 3 MB festgefahrenen Vorgaenger).
+  - Verifikation: inbox=21126, processed=21126, missing=0. Search-Index `signicat/.search_index.json` enthaelt jetzt die neuen Eintraege (`Daily_digest_updates_from_Alexis_Bischof-Plunkett`, `Report_results_Global_Solutions_Page_MQLs`).
+- **Fix (langfristig — User-Action erforderlich):**
+  - In **System Settings → Privacy & Security → Files & Folders → iCloud Drive** muss `/usr/bin/python3` (bzw. `/Applications/Xcode.app/Contents/Developer/Library/Frameworks/Python3.framework/Versions/3.9/Resources/Python.app/Contents/MacOS/Python`) freigeschaltet werden, damit der LaunchAgent wieder selbststaendig laeuft. Alternativ: Full Disk Access fuer denselben Binary.
+  - Solange das nicht passiert ist, lebt der Watcher als nohup-Prozess aus dieser Terminal-Session — der ueberlebt das Logout bzw. Reboot **nicht**. Beim naechsten Reboot muss der Watcher manuell aus Terminal neu gestartet werden, oder die Permission ist gefixt und der LaunchAgent wieder aktiviert (`launchctl load ~/Library/LaunchAgents/com.moritz.emailwatcher.plist`).
+- **Verbesserungs-Empfehlung:** Watcher sollte nach z.B. 100 aufeinanderfolgenden `Operation not permitted`-Errors mit lautem Exit (osascript notification) sterben, statt 66k Mal still im KeepAlive-Loop weiterzuwursteln. Zusaetzlich ein Watchdog der `inbox_count - processed_count > N` periodisch prueft.
+- **Sebastian Schroeder Mail vom 15.04.2026:** existiert in keinem Apple-Mail-Export. Weder im Inbox noch in irgendeinem Memory-Ordner ist eine .eml von `sebastian*` mit Datum `2026-04-15` zu finden. Konsistent mit dem Befund vom 14.04.: gesuchte Mail ist nie in der Datenbasis angekommen — entweder hat die Apple-Mail-Regel sie nicht exportiert oder die Mail wurde nie empfangen.
+
+## 2026-04-14
+
+### Semantic RAG Upgrade (Embeddings + Query Expansion + RRF + Contextual Compression)
+- Neue Sektion "TEIL 4 — SEMANTIC RAG" in `src/search_engine.py` (rein additiv, bestehende Pfade unveraendert).
+- Komponenten:
+  - `EmbeddingIndex` pro Agent: `.embedding_index.json` mit chunk-weisen OpenAI `text-embedding-3-small` Vektoren (1536 dim). Index wird **lazy** aufgebaut — neue Dokumente bekommen sofort ein Embedding via async Hook in `SearchIndex.add_file`, bestehende bleiben unveraendert (Migration via `reindex_embeddings()`).
+  - `_chunk_text`: Paragraph-basiertes Chunking ~500 Tokens mit 50-Token Overlap, kurze Dokumente (<1500 chars) als ein einziger Chunk.
+  - `expand_query(query, speicher, n=2)`: LLM erzeugt 2 alternative Formulierungen ueber das fuer den Agenten konfigurierte Modell (Fallback: Anthropic Haiku aus `config/models.json`). Rueckgabe: `[original, variant1, variant2]`.
+  - `rrf_fuse(lists, k=60, top_n=20)`: Reciprocal Rank Fusion fuer beliebig viele Ergebnis-Listen.
+  - `compress_chunk(chunk, query, speicher)`: LLM extrahiert nur die relevanten Saetze — reduziert Kontext-Noise fuer den Agenten.
+  - `hybrid_rag_search(query, speicher, max_results=5)`: orchestriert expand → parallel Keyword (bestehender `HybridSearch`) + Semantic → RRF → Top-5 Kontext-Kompression. Gibt `{'queries', 'semantic', 'results', 'fallback'}` zurueck.
+- **Backward Compatibility garantiert:** `.search_index.json` und `.global_search_index.json` werden **nicht** veraendert. Alle bestehenden Routen/APIs funktionieren unveraendert. Keine neuen Abhaengigkeiten — nur stdlib (`urllib`, `math`, `json`) plus optional `numpy`.
+- **Graceful Fallback** (wichtig: OpenAI-Key hat `QUOTA_EXCEEDED`-Status):
+  - Embedding-Aufruf bei HTTP 429 / fehlendem Key / Netzwerkfehler → `None`, Pipeline degradiert automatisch auf Keyword-only; `hybrid_rag_search` meldet das via `fallback='embedding_unavailable'` bzw. `'no_embedding_index'`.
+  - Query Expansion bei LLM-Fehler → `[original]`, Retrieval laeuft normal weiter.
+  - Contextual Compression bei LLM-Fehler → gibt den Original-Chunk (auf 1200 chars getrimmt) zurueck.
+- **Tests (alle gruen, 17/17)** in `/tmp/test_rag.py`:
+  1. Chunking: short-text → 1 Chunk, long-text → mehrere Chunks, non-empty.
+  2. RRF: formel-genau verifiziert (`1/61 + 1/62 = 0.032522`), korrekte Reihenfolge.
+  3. Query Expansion: live Anthropic-Call lieferte 3 Queries (`['Finde die Mail von Simonas...', 'Mail Simonas Projekt', 'Nachricht Simona Projektbesprechung']`).
+  4. Config-Loading: `models.json` korrekt gelesen, Keys vorhanden.
+  5. Embedding: OpenAI HTTP 429 → graceful fallback verifiziert (keine Exception, `None` zurueck).
+  6. EmbeddingIndex empty-state: lade/such-Pfade crashen nicht.
+  7. Integration: `hybrid_rag_search` auf leerem Pfad liefert `{semantic:False, results:[], ...}`.
+- **Regression-Test (curl, alle 200):** `/`, `/agents`, `/search_preview` nach Deployment.
+- Geaenderte Dateien: `src/search_engine.py` (2213 → 2862 Zeilen). `web_server.py` wurde **nicht** angefasst — der optionale Reindex-Endpoint wurde bewusst uebersprungen, Reindex ist aber als Python-API via `from search_engine import reindex_embeddings; reindex_embeddings(speicher_path)` verfuegbar.
+- Backup: `backups/2026-04-14_13-56-57/src/search_engine.py` (Pre-Change) sowie `/Applications/Assistant.app/Contents/Resources/search_engine.py.backup_*`.
+- Deployment: `search_engine.py` in App-Bundle kopiert, Server neugestartet (App auto-relaunch via `open /Applications/Assistant.app`).
+
+### Global Search Index aufgebaut
+- `GlobalSearchIndex` via `search_engine.py` CLI ausgefuehrt
+- **110.555 Dateien indexiert** in 1480s (~24.7 min), 116 MB Datei
+- Location: `~/Library/Mobile Documents/com~apple~CloudDocs/Downloads shared/.global_search_index.json` (auf Downloads-shared-Ebene, NICHT in claude_datalake/ — so im Code definiert)
+- Verteilung: global=46.288, email_inbox=21.117, privat=29.655, signicat=10.926, trustedcarrier=2.569
+- Unblocked: globale Suche ueber alle Agenten via `/global_search_preview` Route
+
+### Debug-Investigation: E-Mail Reply-Suche "sebastian + Follow" liefert []
+- **Gemeldetes Symptom:** UI findet keine E-Mail fuer Von=sebastian, Betreff=Follow.
+  Erwartet wurde "RE: Follow-up: Neue SOW-Version fuer Ikano" von sebastian.schroeder@ikano.de.
+- **Root Cause:** Kein Bug. Die gesuchte E-Mail existiert nicht im Memory.
+  - Alle 35+ Dateien mit `sebastian_schroeder@ikano.de` im signicat/memory-Ordner tragen
+    einheitlich den Betreff `RE: Signicat - Question regarding IDV for recovery process`.
+  - Volltext-grep ueber signicat/memory nach `SOW-Version` liefert 0 Treffer in .txt/.eml
+    (nur Referenzen in `conversations.json` / `memories.json`).
+  - Eine E-Mail mit Betreff `Follow*` von einem `sebastian*` Absender existiert in keinem Agenten.
+- **Such-Logik (web_server.py `/api/email-search`) bereits korrekt:**
+  - Sub-Agent-Routing: `get_agent_speicher()` mappt `signicat_outbound` → `signicat/memory` (OK)
+  - Content-Matching: `_parse_txt_email` liest Von:/Betreff:/Datum:/An: aus Datei-Inhalt (OK)
+  - Case-insensitive via `.lower()`, partial match via `in` (OK)
+  - Response enthaelt Von, Betreff, Datum, Message-ID, Dateiname (OK)
+- **Verifikation live:**
+  - `?agent=signicat&from=sebastian` → 8 Treffer (alle mit Subject "Re: Signicat - Question...")
+  - `?agent=signicat&subject=Ikano` → 8 Treffer (Laura Moisi / Simonas Vyšniūnas "Re: New Ikano Bank SOW")
+  - `?agent=signicat&from=sebastian&subject=Follow` → `[]` (korrekt, existiert nicht)
+- **Keine Code-Aenderung**, kein Deploy, kein Backup noetig.
+- `docs/API_REFERENCE.md`: Menschenlesbare Dokumentation aller 12 `/api/*` Routes (Parameter, Response-Format, Konventionen)
+- `docs/openapi.yaml`: Maschinenlesbare OpenAPI 3.0 Spec fuer Tooling-Integration (Swagger UI, Postman, Codegen)
+- `docs/GIT_WORKFLOW.md`: Branch-Strategie definiert
+  * main = stable, develop = Arbeits-Basis, Working Tree permanent auf develop
+  * Releases: develop → main via `--no-ff` Merge + Tag
+  * Hotfixes: hotfix/* → main → Cherry-Pick in develop (nie Reverse-Merge)
+  * Deploy-Flow dokumentiert (web_server via App-Bundle, watcher via LaunchAgent)
+- Globaler Search-Index wird aufgebaut (`.global_search_index.json`, im Hintergrund)
+
+### Fix: Rogue email_watcher/kchat_watcher Respawn eliminiert
+- **Root Cause gefunden:** `src/app.py` (Menu-Bar-App) registrierte email_watcher und kchat_watcher als Services, die vom Watchdog alle 15s respawnt wurden
+- Gleichzeitige LaunchAgents (com.moritz.emailwatcher, com.assistantdev.kchat_watcher) starteten dieselben Skripte → doppelte Prozesse mit Race-Conditions
+- **Fix:** Email Watcher + kChat Watcher aus der `self.services` Liste in `app.py` entfernt (LaunchAgents sind authoritativ)
+- Assistant.app neu gestartet mit neuem Code, orphaned watcher-Prozesse gekillt
+- Finaler Zustand: **je genau 1 Prozess pro Watcher** (beide aus ~/AssistantDev/src/ via LaunchAgent)
+- Dateien: `src/app.py`, deployed zu `/Applications/Assistant.app/Contents/Resources/app.py`
+
+### Contact Name-Mismatch Fix (macOS AddressBook)
+- **Problem:** 97 Kontakte mit Namen, die zu keiner ihrer E-Mail-Adressen passen (z.B. `Gotberg Paul (Innovalue) ← verena.hinrichs@me.com`, `Arne Hassel (Barclays) ← sean.walsh@marketsgroup.org`). Ursache unklar — vermutl. Apple Mail Auto-Save mit vertauschten Headers.
+- **Scanner:** NFD-normalisierter Fuzzy-Match pro Kontakt (Name-Tokens vs. E-Mail-Local-Part + Org-vs-Domain). De-dup ueber 5 Source-DBs.
+  - Report: `claude_outputs/contact_namemismatch_20260414_v2.json` + `contact_namemismatch_review_20260414.md`
+- **Fix-Regel (User-Entscheidung):** Bei allen KRITISCH-Faellen wird `ZFIRSTNAME=""`, `ZLASTNAME=<email>`, `ZORGANIZATION=<domain>` gesetzt — macht Kontakt self-consistent, keine Loeschung.
+- **Angewendet:**
+  - 97 Kontakte umbenannt (61 in A42FFC88, 36 in EF91BA64)
+  - 14 E-Mail-Eintraege aus PARTIELL-Kontakten entfernt (nur NO-E-Mails, OK-Adressen + Kontakte bleiben)
+  - `ZMODIFICATIONDATE` aktualisiert → iCloud-Sync triggert automatisch
+- **Backups:**
+  - `Sources/A42FFC88.../AddressBook-v22.abcddb.backup_20260414_135523`
+  - `Sources/EF91BA64.../AddressBook-v22.abcddb.backup_20260414_135523`
+- **Details-Log:** `claude_outputs/contact_fix_applied_20260414.md`
+- **User-Action noetig:** Contacts.app und Mail.app einmal neu starten, damit UI-Cache aktualisiert und iCloud-Sync durchlaeuft.
+
+### Contact Mismatch Praeventiv-Check (Zukunftssicherung)
+- **Analyse:** User-Aufgabe beschrieb "hunderte E-Mails pro Kontakt" — trifft auf aktuelles Datenmodell nicht zu.
+  - Agent-contacts.json (privat/signicat/standard/trustedcarrier, 133 Kontakte total) sind 1:1 Name→Email; keine Listen, keine eigenen E-Mails bei fremden Kontakten, 0 kritische Mismatches.
+  - macOS AddressBook (3947 Kontakte, 2382 E-Mails) ist nach `fix_contacts_pollution.py` (2026-04-09) sauber: Sebastian Schroeder Z_PK=238 hat 1 E-Mail (vorher 64). Kein "Bernhard Heinrich" Kontakt existiert.
+  - Fazit: keine Bereinigung noetig, `email_watcher.py` ruft `update_contacts_json` bereits nur fuer `not is_own(contact)` auf — Blacklist besteht.
+- **Hardening:**
+  - `src/email_watcher.py`: Fallback-Liste in `get_own_addresses()` erweitert um 5 fehlende Adressen (moritz@brandshare.me, cremer.moritz@gmx.de, family.cremer@gmail.com, moritz.cremer@trustedcarrier.de, naiaraebertz@gmail.com).
+  - `~/.emailwatcher_own_addresses.json` um dieselben Adressen ergaenzt (backup .backup_*).
+- **Neu: `scripts/contact_watchdog.py`** — taegliche Pruefung beider Quellen, read-only.
+  - macOS AddressBook: warnt bei Kontakten mit ≥5 E-Mails aus ≥3 Domains.
+  - Agent contacts.json: warnt bei eigenen E-Mails unter fremdem Namen.
+  - Schreibt Warnung nach `claude_outputs/contact_watchdog_warning_YYYYMMDD.txt` NUR bei Fund.
+  - Erstrun 2026-04-14: 4 Warnungen (Bitbond/Yalwa-Mitarbeiter mit Mehrfachadressen, eigener Moritz-Cremer-Eintrag) — alles plausibel, keine Action noetig.
+- **LaunchAgent `com.assistantdev.contactwatchdog`** — 09:00 daily, Log `logs/contact_watchdog.log`, geladen und aktiv.
+- Backups: `src/email_watcher.py` in `backups/2026-04-14_12-59-14/`
+- Dateien: `src/email_watcher.py`, `scripts/contact_watchdog.py` (neu), `~/Library/LaunchAgents/com.assistantdev.contactwatchdog.plist` (neu)
+
+### Architektur-Audit Phase 2 — Access Control UI, Watcher-Konsolidierung, setup.sh, Recovery-Test
+- **Aufgabe 1: Access Control Web UI**
+  - `BASE/config/access_control.json` angelegt mit 9 Agenten (privat, signicat, signicat_lamp, signicat_meddpicc, signicat_outbound, signicat_powerpoint, system ward, trustedcarrier, trustedcarrier_instagramm)
+  - 3 neue Routes in `web_server.py`: `GET /admin/access-control` (HTML), `GET /api/access-control` (JSON), `POST /api/access-control` (Speichern + Validierung)
+  - Admin-Button (Zahnrad) im Header neben Agent-Button — oeffnet Admin-UI in neuem Tab
+  - Dunkles Theme (#1a1a2e) passend zum Haupt-UI, Checkboxen fuer own_memory/shared_memory, Text-Input fuer cross_agent_read
+- **Aufgabe 2: email_watcher Konsolidierung**
+  - Diagnose: 3 parallele Prozesse (PIDs 5905, 86235 aus /Applications/, PID 57665 aus src/ aber alte Version)
+  - Zombies 5905 und 86235 gekillt
+  - LaunchAgent neu geladen → neuer Prozess nutzt aktuelle Dual-Write-Version
+  - LaunchAgent plist korrekt: zeigt auf `~/AssistantDev/src/email_watcher.py` (kein Fix noetig)
+  - Finaler Zustand: **3 Prozesse → 1 Prozess** (nur LaunchAgent)
+- **Aufgabe 3: setup.sh Disaster Recovery Skript**
+  - Neues `~/AssistantDev/setup.sh` (ausfuehrbar)
+  - 5 Stufen: Systemvoraussetzungen → Verzeichnisstruktur → LaunchAgents → App-Deployment → models.json Template
+  - Python-Paket-Check mit automatischer Nachinstallation (12 Packages)
+  - Legt `BASE/config/models.json.template` an als Referenz fuer API-Keys
+- **Aufgabe 4: Dual-Write Recovery-Test**
+  - Mirror `BASE/config/email_processed_log.json` angelegt (21.117 Eintraege)
+  - Test-Szenario: lokale Datei geloescht → watcher recovered aus iCloud → 21.117 Eintraege wieder da
+  - Log-Output: `[WATCHER] Recovered processed log from iCloud mirror (21117 entries)`
+  - **Recovery: BESTANDEN**
+- Dateien: `src/web_server.py`, `setup.sh`, `scripts/add_access_control_ui.py`, `BASE/config/access_control.json`, `BASE/config/email_processed_log.json`, `BASE/config/models.json.template`
+
+### Architektur-Audit Phase 1 — Abschluss (Git + Docs)
+- **git commit + push:** `src/email_watcher.py` Dual-Write Aenderung auf `develop` gepusht
+  - Commit `b65bdaa`: "fix: email_watcher dual-write iCloud mirror fuer disaster recovery"
+  - Kein Deployment nach /Applications/ noetig — LaunchAgent zeigt auf `~/AssistantDev/src/`
+  - ACHTUNG: Laufende email_watcher-Prozesse nutzen noch alte Version; manuelle Neustarts ausstehend
+- **TECHNICAL_DOCUMENTATION.md aktualisiert:** 4 neue Abschnitte
+  - §13 Services: vollstaendige Tabelle mit Ports, LaunchAgents, Status
+  - §14 Bekannte Probleme: email_watcher Mehrfach-Instanz, Global Index fehlt, Access Control fehlt
+  - §15 Datalake Struktur: aktuelle Zahlen pro Agent nach Cleanup
+  - §16 Disaster Recovery: Dual-Write-Mechanismus dokumentiert
+- Dateien: `docs/TECHNICAL_DOCUMENTATION.md`
+
+### Architektur-Audit Phase 1 + Datalake Cleanup
+- **Ist-Analyse:** 9 Python-Services in src/, 3 LaunchAgents aktiv (emailwatcher, kchat_watcher, calendar-export)
+  - WARNUNG: 3 parallel laufende email_watcher.py Prozesse (PIDs 5905, 86235, 57665) — mischen aus App-Bundle + Dev-Pfad
+  - `.global_search_index.json` existiert NICHT (nur pro-Agent Indizes)
+  - `config/access_control.json` existiert NICHT — muss fuer Phase 2 angelegt werden
+- **contacts.json Deduplizierung:** Alle 4 Agenten gecheckt, 0 Duplikate nach E-Mail gefunden (waren bereits sauber)
+  - Backups: `contacts.json.backup_20260414_115713`
+- **Attachments-Unterordner angelegt:** `memory/attachments/` in allen 4 Agenten
+  - privat: 287 Dateien verschoben (PDFs, CSVs, Bilder)
+  - signicat: 1367 Dateien verschoben (UUIDs, RTFs, PPTX, Bilder)
+  - standard: 54 Dateien verschoben
+  - trustedcarrier: 73 Dateien verschoben
+  - Regel: `.eml`/`.txt`/`.json` bleiben, alles andere → attachments/
+  - Gesamt: 1781 Dateien verschoben, 0 Fehler
+- **email_watcher.py Dual-Write:** Processed-Log wird jetzt zusaetzlich nach `BASE/config/email_processed_log.json` gespiegelt
+  - `load_processed()` faellt auf iCloud-Mirror zurueck wenn lokal leer/nicht vorhanden
+  - `save_processed()` schreibt nach lokalem Pfad UND iCloud-Mirror (best-effort)
+  - Backup: `src/email_watcher.py` in `backups/2026-04-14_11-58-08/`
+- Dateien: `src/email_watcher.py`, `scripts/dedupe_contacts.py`, `scripts/create_attachments_folder.py`, `scripts/patch_email_watcher_dualwrite.py`
+
+### Feature: Kalender-Integration — Data Lake Export + Memory fuer alle Agenten
+- Neues Skript `scripts/export_calendar.py`: Exportiert alle macOS Kalender (Apple Calendar + Fantastical-Accounts) in den AssistantDev Data Lake
+- **Erfolgreiche Methode:** EventKit via PyObjC (icalBuddy nicht installiert — Fallback AppleScript vorhanden)
+- **Exportiert:** 1338 Events aus 11 Kalendern (Privat, Calendar, Moritz Cremer, londoncityfox@gmail.com, moritz@demoscapital.co, Übertragen von moritz@cassiopeia-consulting.io, Birthdays, Feiertage in Deutschland, Feiertage in Großbritannien, Feriados, United Kingdom holidays)
+- **Zeitraum:** 30 Tage rueckwaerts bis 180 Tage voraus (parametrisierbar via `--days-back`, `--days-forward`, `--calendars`, `--output-dir`)
+- **Output (Data Lake):** `claude_datalake/calendar/calendar_events.json` (maschinenlesbar) + `calendar_summary.txt` (human-readable, gruppiert nach Monat + KW)
+- **Memory-Integration:** Symlinks fuer alle 5 Agenten (`signicat`, `privat`, `trustedcarrier`, `standard`, `system ward`) — `memory/calendar_events.txt` zeigt auf die zentrale summary-Datei, so dass alle Agenten immer die aktuelle Version sehen
+- **Automatisches Update:** launchd Job `com.assistantdev.calendar-export` unter `~/Library/LaunchAgents/` — laeuft taeglich um 06:00 Uhr, Log nach `logs/calendar_export.log`, aktiv geladen
+- Search-Index: kein separates Rebuild-Skript vorhanden, Index wird in-process (`src/search_engine.py`) aufgebaut und findet die neuen Symlinks automatisch beim naechsten Build
+
+### Fix: E-Mail Suche — Modal-Diskrepanz, Datumssortierung, Reply-Modal Content
+- **Problem 1 (Modal fand nichts):** Root Cause: Modal-Suche filterte nur `.eml` Dateien.
+  Signicat hat aber 3178 `.txt` Emails (deutsches Format: Von/An/Betreff/Datum).
+  Deshalb fand das Modal "sebastian" nicht, obwohl /find-email 8 Treffer lieferte.
+- **Fix:** `_build_email_cache` unterstuetzt jetzt `.eml` UND `.txt`
+  - Neuer `_parse_txt_email()` Helper fuer deutsches Header-Format
+  - Neuer `_parse_filename_timestamp()` Fallback: extrahiert Datum aus Dateiname (`YYYY-MM-DD_HH-MM-SS_...`)
+  - Sortierung: Datum absteigend (neueste zuerst) — `Datum:` Header, dann Dateiname, dann mtime
+  - Deduplikation: nicht nur ueber Message-ID, auch ueber (from_email, subject, date_ts) — entfernt iCloud-Duplikate (`_2`, `_2 2`, etc.)
+  - From-Email Cleaning: entfernt `<mailto:...>` Wrapper aus .txt Emails
+- **Problem 2 (keine Datumssortierung):** `/search_preview` sortierte Emails nach from_person/score
+  - **Fix:** Fuer `search_type == 'email'` explizit nach `date` DESC sortieren
+- **Problem 3 (Reply-Modal laedt Inhalt nicht):** `/api/email-content` parste nur `.eml`
+  - **Fix:** Auch `.txt` Dateien lesen, deutsches Format parsen, Message-ID aus Header extrahieren
+- **Performance:** Erster Cache-Aufbau fuer signicat (4788 Dateien): ~80s einmalig, danach jede Suche <20ms
+- Alle 453 Tests bestanden
+- Dateien: `src/web_server.py`, `scripts/patch_email_search_unify.py`, `scripts/patch_email_search_refine.py`
+
+## 2026-04-13
+
+### Performance Fix: E-Mail Suche + Apple Mail Draft-Erstellung
+- **Fix 1: E-Mail Suche** — In-Memory Header Cache statt Filesystem-Scan
+  - Root Cause: Bei jeder Suchanfrage wurden 21.000+ .eml Dateien vom Disk gelesen und komplett MIME-geparst (~11s pro Suche)
+  - Fix: In-Memory Cache (`_email_header_cache`): liest nur die ersten 40 Zeilen (Header) jeder .eml via `os.scandir()`, cached fuer 5 Minuten
+  - Ergebnis: **11.465ms → 17ms** (677x schneller). Erster Aufruf 4.4s (einmaliger Cache-Aufbau), danach <25ms
+  - Namens-Normalisierung: Kommas im Von-Feld werden fuer die Suche zu Leerzeichen normalisiert ("Nachname, Vorname" → Token-Match)
+  - Frontend-Debounce von 300ms auf 250ms reduziert
+- **Fix 2: Apple Mail Draft** — Asynchrone AppleScript-Ausfuehrung
+  - Root Cause: `subprocess.run()` blockierte synchron (timeout=10s/30s), besonders langsam bei `send_email_reply` (iteriert alle Mailboxen)
+  - Fix: `subprocess.Popen()` (fire-and-forget) — HTTP-Response wird sofort zurueckgegeben
+  - Betrifft: `send_email_draft()` (2 Bloecke) + `send_email_reply()` — alle 3 auf async umgestellt
+- Alle 453 Tests bestanden
+- Dateien: `src/web_server.py`, `scripts/patch_email_perf_v2.py`
+
+### Fix: Portrait-Video (9:16) korrekt im Chat anzeigen
+- `generate_video()` gibt jetzt den tatsaechlich verwendeten `aspect` Wert als dritten Return-Wert zurueck
+- Portrait-Erkennung: API aspect == "9:16" ODER Prompt-Keywords (portrait, hochformat, vertical, tiktok, reels, shorts, 9:16)
+- `addVideoPreview()` im Frontend: Portrait-Videos bekommen max-width 280px, aspect-ratio 9/16, zentriert
+- Landscape-Videos bleiben unveraendert (max-width 600px)
+- `created_videos` Dict bekommt `is_portrait` Flag das an Frontend durchgereicht wird
+- Alle 453 Tests bestanden
+- Dateien: `src/web_server.py`, `scripts/patch_portrait_video.py`
+
+### Fix: E-Mail Reply Feature — Such-Modal mit Filtern + Routing-Fix
+- **Bug 1 Fix:** E-Mail-Such-Modal mit kategorierten Filtern (Von, Betreff, An/CC, Freitext)
+  - Neues Modal (`#email-search-modal`) mit 4 Filterfeldern und Debounce-Suche (300ms)
+  - `/create-email-reply` und `/reply` oeffnen jetzt das Such-Modal statt Inline-Chat-Suche
+  - Backend `/api/email-search` erweitert: unterstuetzt jetzt `from`, `subject`, `to`, `body` Parameter einzeln
+  - Klick auf Suchergebnis laedt E-Mail als Card direkt in den Chat (mit Antworten-Button)
+- **Bug 2 Fix:** Sub-Agent-Routing wird bei E-Mail-Reply-Kontext uebersprungen
+  - Nachrichten mit `[E-MAIL KONTEXT:...]` Prefix umgehen `detect_delegation()` komplett
+  - Verhindert falsches Routing (z.B. signicat_meddpicc statt signicat_outbound) waehrend Reply
+- Alle 453 Tests bestanden
+- Dateien: `src/web_server.py`, `scripts/patch_email_reply_fixes.py`, `scripts/patch_email_search_filter_fix.py`
+
+### UX-Ueberarbeitung: Chat-nativer E-Mail Reply Flow
+- **ERSETZT:** Altes E-Mail Reply Modal komplett entfernt (Formular-Popup mit Von/Betreff/CC/Body Feldern)
+- **NEU:** Chat-nativer Flow:
+  1. `/reply [suchbegriff]` zeigt E-Mail-Suchergebnisse als klickbare Cards im Chat
+  2. Klick auf Card laedt vollstaendige E-Mail als formatierte Email-Card (Von, An, CC, Betreff, Datum, Body mit max-height 400px scrollbar)
+  3. "Antworten"-Button setzt E-Mail-Kontext (Message-ID, From, Subject, CC)
+  4. Naechste User-Nachricht wird automatisch mit E-Mail-Kontext an den Agent gesendet (einmalig)
+- **NEU:** Backend-Route `GET /api/email-content` — laedt vollstaendigen E-Mail-Body aus .eml Dateien (text/plain mit HTML-Fallback, max 5000 Zeichen)
+- **NEU:** `/reply` Slash-Command als Kurzbefehl fuer E-Mail-Suche im Chat
+- `/create-email-reply` leitet jetzt auf `/reply` weiter statt Modal zu oeffnen
+- Alle 453 Tests bestanden
+- Dateien: `src/web_server.py`, `scripts/patch_email_chat_flow_v3.py`
+
+### Live-Suche im Email Reply Modal (ersetzt durch Chat-Flow oben)
+- **NEU:** Email Reply Modal mit Live-Suche statt einfachem Template-Text
+  - `/create-email-reply` oeffnet jetzt ein Modal mit Suchfeld, To, Subject, CC, Body
+  - Live-Suche ab 2 Zeichen (300ms Debounce) durchsucht .eml Dateien in Agent-Memory und email_inbox
+  - Max. 8 Treffer, neueste zuerst, mit Absender, Betreff, Datum
+  - Klick auf Treffer befuellt alle Felder automatisch (To, Subject, CC, Message-ID)
+  - CC filtert automatisch eigene Adressen heraus (moritz.cremer@me.com, londoncityfox@gmail.com, moritz.cremer@signicat.com)
+  - Pfeiltasten-Navigation und Escape im Dropdown
+  - Submit baut Prompt und sendet an Agent
+- **NEU:** Backend-Route `GET /api/email-search?agent=X&q=Y` — parst .eml Header (From, Subject, Date, Message-ID, To, Cc)
+- Alle 453 Tests bestanden
+- Dateien: `src/web_server.py`, `scripts/patch_email_reply_search.py`
+
 ## 2026-04-13
 
 ### LLM-Modell Audit, API-Tests & models.json Update

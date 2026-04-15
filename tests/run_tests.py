@@ -1100,6 +1100,36 @@ _func_names = [n.name for n in _ast.walk(_tree) if isinstance(n, _ast.FunctionDe
 test("send_whatsapp_draft korrekt als Funktion definiert (AST)", "send_whatsapp_draft" in _func_names)
 test("send_slack_draft korrekt als Funktion definiert (AST)", "send_slack_draft" in _func_names)
 
+# Agent-Switch Race Condition Fix (2026-04-15)
+section("Agent-Switch Session Protection 2026-04-15")
+test("Processing-Guard in select_agent", "Agent-Wechsel nicht moeglich waehrend eine Antwort generiert wird" in _ws_src)
+test("parse_konversation_file Helper vorhanden", "def parse_konversation_file" in _ws_src)
+test("find_latest_konversation Helper vorhanden", "def find_latest_konversation" in _ws_src)
+test("Draft localStorage key im HTML", "draft_" in html and "localStorage.setItem" in html)
+test("Draft clear nach Send", "localStorage.removeItem" in html and "draft_" in html)
+test("Recovered messages in select_agent Response", "recovered_messages" in _ws_src)
+test("Re-click same agent guard", "name == state.get" in _ws_src and "Re-click same agent" in _ws_src)
+test("auto_save_session vor Agent-Wechsel", "Save current session before switching" in _ws_src)
+
+# Memory Management UI (2026-04-15)
+section("Memory UI 2026-04-15")
+try:
+    _mem_r = requests.get(f"{BASE_URL}/memory", timeout=5)
+    _mem_html = _mem_r.text
+    test("GET /memory -> 200", _mem_r.status_code == 200)
+    test("Content-Type text/html", "text/html" in _mem_r.headers.get("Content-Type", ""))
+    test("Memory Management Titel im HTML", "Memory Management" in _mem_html)
+    test("Kein showAgentModal on page-load", "showAgentModal()" not in _mem_html)
+    test("mmLoadWorking JS-Funktion vorhanden", "mmLoadWorking" in _mem_html)
+    test("mmLoadFiles JS-Funktion vorhanden", "mmLoadFiles" in _mem_html)
+    test("mmLoadAgents JS-Funktion vorhanden", "mmLoadAgents" in _mem_html)
+    test("Agent-Selector vorhanden", "mm-agent-select" in _mem_html)
+    test("Volltextsuche-Button vorhanden", "mmDeepSearch" in _mem_html)
+except Exception as e:
+    test("GET /memory erreichbar", False, str(e))
+test("/api/memory/list Route in web_server.py", "def api_memory_list" in _ws_src)
+test("memory_page Route in web_server.py", "def memory_page" in _ws_src)
+
 # ============================================================
 section("Features 2026-04-09")
 # ============================================================

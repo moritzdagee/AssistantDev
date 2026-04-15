@@ -7,3 +7,10 @@ memory/**/*.json
 .DS_Store
 *.log
 claude_outputs/
+backups/
+build/
+reports/
+$DB
+/app.py
+/web_server.py
+/email_watcher.py
