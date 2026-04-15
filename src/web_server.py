@@ -8,9 +8,11 @@ import webbrowser
 import re
 import signal
 import sys
-import setproctitle
-
-setproctitle.setproctitle("AssistantDev WebServer")
+try:
+    import setproctitle
+    setproctitle.setproctitle("AssistantDev WebServer")
+except ImportError:
+    pass
 
 PENDING_MARKER = '[ANTWORT AUSSTEHEND - Server-Neustart hat diese Antwort unterbrochen]'
 RECOVERY_MARKER = '[Antwort verloren - Server wurde neu gestartet]'

@@ -16,9 +16,11 @@ import datetime
 import re
 import subprocess
 from email.header import decode_header
-import setproctitle
-
-setproctitle.setproctitle("AssistantDev EmailWatcher")
+try:
+    import setproctitle
+    setproctitle.setproctitle("AssistantDev EmailWatcher")
+except ImportError:
+    pass
 
 # Search index integration
 try:
