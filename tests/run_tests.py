@@ -1784,6 +1784,36 @@ except Exception as e:
     test("/send_email_reply Route antwortet", False, str(e))
 
 
+section("Status Check Bundle-Name Detection 2026-04-15")
+
+# _admin_status_check in web_server.py must match both .py and app-bundle names
+test("_admin_status_check matched bundle-Namen fuer email_watcher",
+     "AssistantDev EmailWatcher" in _ws_src and "email_watcher.py" in _ws_src)
+
+test("_admin_status_check nutzt proc_alive Helper mit mehreren Pattern",
+     "def proc_alive" in _ws_src and 'proc_alive("email_watcher.py"' in _ws_src)
+
+# scripts/status.sh must accept optional bundle-name and check it
+_status_sh_path = os.path.expanduser("~/AssistantDev/scripts/status.sh")
+try:
+    with open(_status_sh_path, "r", encoding="utf-8") as _f:
+        _status_sh = _f.read()
+except Exception:
+    _status_sh = ""
+
+test("status.sh check_proc akzeptiert bundle_name als 2. Argument",
+     "local bundle_name=" in _status_sh)
+
+test("status.sh prueft AssistantDev WebServer",
+     "AssistantDev WebServer" in _status_sh)
+
+test("status.sh prueft AssistantDev EmailWatcher",
+     "AssistantDev EmailWatcher" in _status_sh)
+
+test("status.sh prueft kchat_watcher.py",
+     "kchat_watcher.py" in _status_sh)
+
+
 # ============================================================
 # ERGEBNIS
 # ============================================================

@@ -6,6 +6,15 @@ Format: [Datum] Änderung | Datei | Grund
 
 ## 2026-04-15
 
+### Fix: Status-Check erkennt App-Bundle-Prozesse ("Agents offline"-Fehlalarm)
+- **Problem:** Nach Commit 508796a laufen `web_server` und `email_watcher` als kompilierte App-Bundle-Binaries (`AssistantDev WebServer`, `AssistantDev EmailWatcher`) statt als `python *.py`. Die Status-Checks prueften weiterhin via `pgrep -f web_server.py` / `email_watcher.py` und meldeten "offline", obwohl die Services einwandfrei liefen (Port 8080 antwortet HTTP 200). Zusaetzlich verursachte dies Crashloop-Log-Spam, weil parallele MenuBar-Instanzen ihre eigenen Python-Prozesse spawnen wollten und jedes Mal an "Address already in use" scheiterten.
+- **Fix (`scripts/status.sh`):** `check_proc` akzeptiert optional ein zweites Argument (Bundle-Name) und prueft zusaetzlich via `pgrep -f "AssistantDev WebServer"` etc. kchat_watcher wird jetzt auch ausgewiesen.
+- **Fix (`src/web_server.py` `_admin_status_check`):** neuer interner Helper `proc_alive(*patterns)` prueft mehrere Prozess-Muster in einem Call — gematched werden `email_watcher.py` UND `AssistantDev EmailWatcher`.
+- **Tests:** neue Sektion "Status Check Bundle-Name Detection 2026-04-15" in `tests/run_tests.py` (6 neue Tests). Suite: 483/483 gruen.
+- **Hinweis:** `_admin_status_check`-Fix greift erst nach einem Web-Server-Neustart (Bundle-Kopie wurde deployed, Restart bewusst unterlassen, um die aktuell laufende Instanz nicht zu stoeren). status.sh-Fix greift sofort.
+- **Nicht gefixt (bewusst):** 4 parallele `AssistantDev MenuBar`-Instanzen (PIDs 80206, 83857, 87765, 89287) laufen gleichzeitig und konkurrieren um Port 8080 → Crashloop-Log-Eintraege im `assistant.log`. Nur der aelteste haelt den funktionierenden `AssistantDev WebServer` (PID 89285). Deduplizierung erfordert User-Entscheidung (Quit + Neustart der App).
+- **Backups:** `backups/2026-04-15_11-33-16/`
+
 ### Fix: EmailWatcher persistent via echtes App-Bundle + FDA-Grant
 - **Problem:** LaunchAgent `com.moritz.emailwatcher` lief zwar, scheiterte aber mit `Operation not permitted` beim Lesen des iCloud-Ordners `email_inbox/`. Ursache: Das Bundle `~/Applications/EmailWatcher.app/Contents/MacOS/EmailWatcher` war nur ein Bash-Wrapper (`exec /usr/bin/python3 ...`), wodurch der effektive Prozess `python3` wurde — macOS TCC prueft gegen den laufenden Prozess, der FDA-Grant fuer das Bundle blieb wirkungslos.
 - **Fix:** Python-Skript via PyInstaller (`--onefile --hidden-import setproctitle --hidden-import search_engine --paths src`) zu einem standalone arm64 Mach-O Binary (~19 MB) kompiliert. Binary ersetzt den Bash-Wrapper unter `~/Applications/EmailWatcher.app/Contents/MacOS/EmailWatcher`. Bundle ad-hoc signiert (`codesign --force --deep --sign -`). LaunchAgent unload/reload.

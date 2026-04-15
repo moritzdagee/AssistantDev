@@ -14,8 +14,15 @@ check_port() {
 }
 
 check_proc() {
+    # Matches either a Python script path OR the compiled app-bundle binary name.
+    # After commit 508796a, services run as "AssistantDev <Name>" binaries rather
+    # than `python *.py`, so pgrep -f on the .py name misses them.
     local name="$1"
+    local bundle_name="$2"  # optional, e.g. "AssistantDev WebServer"
     if pgrep -f "$name" >/dev/null 2>&1; then
+        return 0
+    fi
+    if [ -n "$bundle_name" ] && pgrep -f "$bundle_name" >/dev/null 2>&1; then
         return 0
     fi
     return 1
@@ -25,10 +32,11 @@ print_service() {
     local label="$1"
     local port="$2"
     local proc="$3"
+    local bundle="$4"  # optional app-bundle process name
     local port_ok=1
     local proc_ok=1
     check_port "$port" && port_ok=0
-    check_proc "$proc" && proc_ok=0
+    check_proc "$proc" "$bundle" && proc_ok=0
 
     if [ $port_ok -eq 0 ] && [ $proc_ok -eq 0 ]; then
         echo "  ✅ $label  (Port $port: offen, Prozess: läuft)"
@@ -46,13 +54,19 @@ echo "║         AssistantDev — System Status               ║"
 echo "╚════════════════════════════════════════════════════╝"
 echo ""
 echo "🔌 Services:"
-print_service "web_server.py       " "8080" "web_server.py"
-print_service "web_clipper_server  " "8081" "web_clipper_server.py"
+print_service "web_server.py       " "8080" "web_server.py"         "AssistantDev WebServer"
+print_service "web_clipper_server  " "8081" "web_clipper_server.py" "AssistantDev WebClipper"
 
-if check_proc "email_watcher.py"; then
+if check_proc "email_watcher.py" "AssistantDev EmailWatcher"; then
     echo "  ✅ email_watcher.py   (Prozess: läuft)"
 else
     echo "  ❌ email_watcher.py   (Prozess: nicht gefunden)"
+fi
+
+if check_proc "kchat_watcher.py" "AssistantDev kChatWatcher"; then
+    echo "  ✅ kchat_watcher.py   (Prozess: läuft)"
+else
+    echo "  ❌ kchat_watcher.py   (Prozess: nicht gefunden)"
 fi
 
 echo ""
