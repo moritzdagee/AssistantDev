@@ -1130,6 +1130,30 @@ except Exception as e:
 test("/api/memory/list Route in web_server.py", "def api_memory_list" in _ws_src)
 test("memory_page Route in web_server.py", "def memory_page" in _ws_src)
 
+# Working Memory Isolation fuer Sub-Agents (2026-04-15)
+section("Working Memory Isolation 2026-04-15")
+test("_get_wm_dir Helper existiert", "def _get_wm_dir" in _ws_src)
+test("Sub-Agent nutzt _<subname> Unterordner", "'_' + subname" in _ws_src or '"_" + subname' in _ws_src)
+test("load_working_memory nutzt _get_wm_dir", "def load_working_memory" in _ws_src and _ws_src.split("def load_working_memory")[1].split("def ")[0].find("_get_wm_dir") >= 0)
+test("working_memory_add nutzt _get_wm_dir", "def working_memory_add" in _ws_src and _ws_src.split("def working_memory_add")[1].split("def ")[0].find("_get_wm_dir") >= 0)
+try:
+    import urllib.parse as _up
+    # Parent signicat und Sub signicat_lamp muessen unterschiedliche file listings haben
+    _parent_list = requests.post(
+        f"{BASE_URL}/api/working-memory/signicat",
+        json={"action": "list"}, timeout=5,
+    ).json().get("manifest", {}).get("files", [])
+    _sub_list = requests.post(
+        f"{BASE_URL}/api/working-memory/signicat_lamp",
+        json={"action": "list"}, timeout=5,
+    ).json().get("manifest", {}).get("files", [])
+    _parent_names = sorted(f.get("filename") for f in _parent_list)
+    _sub_names = sorted(f.get("filename") for f in _sub_list)
+    test("signicat Parent-WM != signicat_lamp Sub-WM (Isolation)",
+         _parent_names != _sub_names or (_parent_list and _sub_list and _parent_list[0] is not _sub_list[0]))
+except Exception as e:
+    test("Working Memory Isolation Runtime-Check", False, str(e))
+
 # ============================================================
 section("Features 2026-04-09")
 # ============================================================
