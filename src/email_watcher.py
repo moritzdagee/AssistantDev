@@ -16,6 +16,9 @@ import datetime
 import re
 import subprocess
 from email.header import decode_header
+import setproctitle
+
+setproctitle.setproctitle("AssistantDev EmailWatcher")
 
 # Search index integration
 try:
@@ -94,7 +97,9 @@ def get_own_addresses():
     fallback = ["moritz.cremer@me.com", "moritz.cremer@icloud.com",
                 "moritz.cremer@signicat.com", "londoncityfox@gmail.com",
                 "moritz@demoscapital.co", "moritz@vegatechnology.com.br",
-                "moritz.cremer@trustedcarrier.net"]
+                "moritz.cremer@trustedcarrier.net", "moritz@brandshare.me",
+                "cremer.moritz@gmx.de", "family.cremer@gmail.com",
+                "moritz.cremer@trustedcarrier.de", "naiaraebertz@gmail.com"]
     with open(OWN_ADDRS_CACHE, 'w') as f:
         json.dump(fallback, f)
     return fallback
@@ -302,9 +307,54 @@ def _extract_name_from_raw(raw_header):
     return None
 
 
+# ── Name-vs-Email Sanity (gegen Contacts-Pollution) ──────────────────────────
+
+def _name_tokens(name):
+    """Lowercase, umlaut-normalisierte Alpha-Tokens (>=2 Zeichen) eines Namens."""
+    if not name:
+        return set()
+    s = name.lower()
+    for a, b in [('ä', 'ae'), ('ö', 'oe'), ('ü', 'ue'), ('ß', 'ss')]:
+        s = s.replace(a, b)
+    return {t for t in re.findall(r'[a-z]+', s) if len(t) >= 2}
+
+
+def _name_matches_email(name, email_addr):
+    """True wenn mind. ein >=3 Zeichen Token aus dem Namen im Local-Part vorkommt.
+    Wenn der Name keine qualifizierten Tokens enthaelt, akzeptieren (Initialen, kurze Tags).
+    """
+    if not name or not email_addr or '@' not in email_addr:
+        return True
+    local = email_addr.split('@')[0].lower()
+    local_clean = re.sub(r'[._\-+]', ' ', local)
+    qual = [t for t in _name_tokens(name) if len(t) >= 3]
+    if not qual:
+        return True
+    return any(t in local_clean for t in qual)
+
+
+def _is_strict_name_extension(old_name, new_name):
+    """True wenn new_name den old_name strikt erweitert (alle alten Tokens enthalten)."""
+    if not old_name:
+        return True
+    old_t = _name_tokens(old_name)
+    new_t = _name_tokens(new_name)
+    return bool(old_t) and old_t.issubset(new_t)
+
+
 def update_contacts_json(memory_dir, contact_addr, contact_name, direction, body):
-    """Aktualisiert contacts.json im Agent-Memory mit neuen Kontaktdaten."""
+    """Aktualisiert contacts.json im Agent-Memory mit neuen Kontaktdaten.
+
+    Schutz vor Contacts-Pollution: ein Name aus dem From:-Header wird nur akzeptiert,
+    wenn er entweder zur E-Mail-Adresse passt (Token im Local-Part) ODER der Name
+    keine qualifizierten Tokens hat. Vorhandene Namen werden NUR ueberschrieben,
+    wenn der neue Name eine echte Erweiterung des alten ist.
+    """
     contacts_path = os.path.join(memory_dir, "contacts.json")
+
+    # Sanity: mismatched From-Names komplett verwerfen
+    if contact_name and not _name_matches_email(contact_name, contact_addr):
+        contact_name = None
 
     # Bestehende Datei laden oder neu erstellen
     data = {'generated': '', 'period_months': 0, 'agent': '', 'total_contacts': 0, 'contacts': []}
@@ -332,9 +382,14 @@ def update_contacts_json(memory_dir, contact_addr, contact_name, direction, body
         else:
             existing['received'] = existing.get('received', 0) + 1
         existing['last_contact'] = today
-        # Name updaten wenn besser
-        if contact_name and (not existing.get('name') or len(contact_name) > len(existing.get('name', ''))):
-            existing['name'] = contact_name
+        # Name updaten nur wenn neuer Name echte Erweiterung des alten ist
+        if contact_name:
+            existing_name = existing.get('name') or ''
+            if not existing_name:
+                existing['name'] = contact_name
+            elif (len(contact_name) > len(existing_name)
+                    and _is_strict_name_extension(existing_name, contact_name)):
+                existing['name'] = contact_name
         # Titel/Telefon nur setzen wenn noch leer
         if direction == 'IN' and body:
             title, phone = _extract_signature_info(body)

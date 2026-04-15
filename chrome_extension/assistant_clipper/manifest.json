@@ -1,0 +1,23 @@
+{
+  "manifest_version": 3,
+  "name": "Assistant Memory Clipper",
+  "version": "2.0",
+  "description": "Speichert beliebige Webseiten in Agent Memory (JSON + Screenshot)",
+  "permissions": ["activeTab", "scripting", "debugger"],
+  "host_permissions": [
+    "http://localhost:8081/*",
+    "http://127.0.0.1:8081/*",
+    "<all_urls>"
+  ],
+  "background": {
+    "service_worker": "background.js"
+  },
+  "content_scripts": [{
+    "matches": ["<all_urls>"],
+    "js": ["content_script.js"],
+    "run_at": "document_idle"
+  }],
+  "action": {
+    "default_title": "Assistant Memory Clipper"
+  }
+}
