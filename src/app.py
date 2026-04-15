@@ -21,9 +21,13 @@ import logging
 from datetime import datetime
 
 import rumps
-import setproctitle
 
-setproctitle.setproctitle("AssistantDev MenuBar")
+try:
+    import setproctitle
+    setproctitle.setproctitle("AssistantDev MenuBar")
+except ImportError:
+    # setproctitle ist in der Bundle-Python nicht installiert; harmlos weglassen.
+    pass
 
 # ── Pfade ────────────────────────────────────────────────────────────────────
 

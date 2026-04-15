@@ -6,6 +6,12 @@ Format: [Datum] Änderung | Datei | Grund
 
 ## 2026-04-15
 
+### Fix: deploy.sh End-to-End + setproctitle Import hart optional
+- **Problem 1 (deploy.sh):** `pgrep -f web_server.py` fand den laufenden Prozess nicht, weil das Bundle ihn via `setproctitle` in "AssistantDev WebServer" umbenannt hat. Folge: SIGTERM wurde nie gesendet, der alte Prozess lief mit alten Files weiter. Healthcheck pollte `/api/agents` — die Route heisst aber `/agents` → immer HTTP 404/000. Neustart via `open /Applications/Assistant.app` scheiterte, weil das Bundle-Python `setproctitle` nicht installiert hat (`ModuleNotFoundError` im py2app-Launcher, wiederholte "Launch error"-Dialoge von macOS).
+- **Fix `scripts/deploy.sh`:** PID-Lookup via `lsof -tiTCP:8080` (Fallback: `pgrep -f web_server.py`). Healthcheck jetzt auf `/agents` mit 15s Retry-Schleife statt starren 3s sleep. Neustart via `/usr/bin/python3 src/app.py` (hat `setproctitle` installiert) statt `open Assistant.app`.
+- **Fix `src/app.py`, `src/web_server.py`, `src/email_watcher.py`, `src/web_clipper_server.py`:** `import setproctitle` + Aufruf in `try/except ImportError` gewrappt. Falls jemand versehentlich die Bundle-App startet (z.B. Doppelklick auf Assistant.app), crasht der Launcher nicht mehr — der Proc-Name bleibt nur als Default (`python3` statt `AssistantDev …`).
+- **Verifikation:** Deploy end-to-end gruen (SIGTERM drain in 11s dank write-through, Healthcheck 200, 4 Agents erreichbar).
+
 ### Fix: Email Watcher Inbox-Bloat + Auto-Reconcile
 - **Problem:** `email_inbox/` enthielt 21.130 `.eml`-Dateien — `process_eml` hat Mails nie aus dem Inbox-Root entfernt. Am 06.04. wurde Memory neu aufgebaut, aber `~/.emailwatcher_processed.json` nicht zurueckgesetzt. Folge: Mails die zwar als "processed" galten, aber im aktiven Memory fehlten, konnten nicht wiederhergestellt werden (Beispiel: `2026-04-01_17-05-12_New_booking_Sebastian_Schroeder_for_Seba.eml`).
 - **Root-Cause:** `process_eml` endete nach `save_processed()` ohne die `.eml`-Quelle zu verschieben. Kein Auto-Reconcile wenn Mail physisch im Inbox lag aber im processed-Set war.
@@ -16,6 +22,12 @@ Format: [Datum] Änderung | Datei | Grund
   - Verwaiste iCloud-Konflikt-Dateien `email_watcher_processed.json` + `email_watcher_processed 2.json` im datalake-Root nach `backups/orphan_tracker_files_2026-04-15_08-12-xx/` archiviert (aktiver Mirror ist `config/email_processed_log.json`).
 - **Backups:** `backups/2026-04-15_08-09-59/src/email_watcher.py`, `backups/orphan_tracker_files_2026-04-15_08-12-xx/`
 - **Operatives:** Betroffene Schroeder-Mail (2026-04-01) manuell aus `~/.emailwatcher_processed.json` entfernt und re-processed → neue Datei in `signicat/memory/` generiert. LaunchAgent `com.moritz.emailwatcher` hat keine iCloud-TCC-Permission und wurde unloaded; Watcher laeuft bis auf Weiteres manuell aus Terminal-Shell-Kontext.
+
+### Fix: Contacts-Bereinigung + Watchdog-False-Positives
+- **Watchdog (`scripts/contact_watchdog.py`):** flagt Kontakte nur noch wenn mind. eine E-Mail weder zum Namen passt noch eine eigene Adresse auf der My Card ist. Entfernt False-Positives fuer Benedikt Girz (5 legitime Benedikt-Adressen) und Moritz Cremer / My Card (6 eigene Adressen).
+- **Cleanup-Skript (`scripts/cleanup_all_contacts.py`, neu):** klassifiziert jede E-Mail auf jedem Kontakt ueber ALLE AddressBook-Sources als KEEP / DELETE / REVIEW. Regeln: Name-Token im Local-Part oder Domain-Kern → KEEP (schuetzt `email@alexandermahr.de` etc.); Domain=Org → KEEP; eigene Mail auf fremdem Kontakt → DELETE (ausser My Card); Role-/Hash-Local auf benamtem Kontakt → DELETE. Nie die letzte E-Mail loeschen.
+- **Cleanup-Lauf 2026-04-15:** 4617 KEEP, 20 AUTO-DELETE angewendet (12 in A42FFC88, 8 in EF91BA64), 673 REVIEW zur manuellen Entscheidung im Report `claude_outputs/contacts_cleanup_20260415.md`.
+- **Backups:** `~/AssistantDev/backups/addressbook_20260415_081418/` (pre-cleanup, alle 5 DBs) + `addressbook_cleanup_20260415_082028/` (unmittelbar vor --fix).
 
 ### Fix: Contacts-Pollution an der Wurzel — Source-side Prevention + macOS Auto-Population aus
 - **Problem:** Email Watcher und Contact-Extractor uebernahmen From-Header-Namen ungeprueft als Kontakt-Name; macOS contactsd/suggestd injizierte zusaetzlich Mail-Sender als Vorschlag in alle Account-Sources (iCloud/Exchange/Google/CardDAV). Folge: fremde Namen ("Sebastian Schroeder", "Maivika") landeten auf bestehenden Kontakten und sogar der My Card.
