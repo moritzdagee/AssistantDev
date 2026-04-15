@@ -6,6 +6,13 @@ Format: [Datum] Änderung | Datei | Grund
 
 ## 2026-04-15
 
+### Feat: Infrastructure Hardening — Watchdog, Rollback, Status, Workflow-Regeln
+- **`scripts/watchdog.sh` (neu):** prueft `web_server.py` (Port 8080 + Prozess) und startet automatisch neu bei Ausfall. Loggt jeden Restart nach `logs/watchdog.log`. Wird alle 60s via LaunchAgent `com.assistantdev.watchdog` aufgerufen (neue Plist unter `~/Library/LaunchAgents/`).
+- **`scripts/status.sh` (neu):** Ein-Blick-Uebersicht — Services (web_server, web_clipper, email_watcher), Git-Branch + letzter Commit + uncommitted-Count, letzte 20 Zeilen Assistant-Log, vorhandene Backups mit Datum. Fuer Moritz-Selbsthilfe ohne Claude.
+- **`scripts/rollback.sh` (neu):** interaktives Rollback von `web_server.py` / `search_engine.py` auf ein Backup. Listet Backups nummeriert, fragt Auswahl, legt Sicherheits-Backup an, py_compile-Check, deployt ins Bundle, restart, Healthcheck auf Port 8080.
+- **`CLAUDE.md` erweitert:** Neue Sektion "Entwicklungs-Workflow (PFLICHT)" verbietet `patch_*.py`-Skripte in `scripts/` und Text-Replacement-Scripting. Aenderungen an `web_server.py` / `search_engine.py` passieren jetzt direkt via Edit-Tool im Feature-Branch. Ausnahme: duplizierte Bloecke in web_server.py per strukturiertem Parsen, nie per Text-Ersetzung.
+- **`logs/.gitkeep` + `.gitignore`:** `logs/*.log` explizit ausgeschlossen, `.gitkeep` sorgt fuer Ordnerexistenz im Repo.
+
 ### Fix: deploy.sh End-to-End + setproctitle Import hart optional
 - **Problem 1 (deploy.sh):** `pgrep -f web_server.py` fand den laufenden Prozess nicht, weil das Bundle ihn via `setproctitle` in "AssistantDev WebServer" umbenannt hat. Folge: SIGTERM wurde nie gesendet, der alte Prozess lief mit alten Files weiter. Healthcheck pollte `/api/agents` — die Route heisst aber `/agents` → immer HTTP 404/000. Neustart via `open /Applications/Assistant.app` scheiterte, weil das Bundle-Python `setproctitle` nicht installiert hat (`ModuleNotFoundError` im py2app-Launcher, wiederholte "Launch error"-Dialoge von macOS).
 - **Fix `scripts/deploy.sh`:** PID-Lookup via `lsof -tiTCP:8080` (Fallback: `pgrep -f web_server.py`). Healthcheck jetzt auf `/agents` mit 15s Retry-Schleife statt starren 3s sleep. Neustart via `/usr/bin/python3 src/app.py` (hat `setproctitle` installiert) statt `open Assistant.app`.

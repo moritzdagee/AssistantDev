@@ -6,6 +6,8 @@ config/agents/
 memory/**/*.json
 .DS_Store
 *.log
+logs/*.log
+!logs/.gitkeep
 claude_outputs/
 backups/
 build/
