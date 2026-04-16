@@ -2215,6 +2215,29 @@ test("Nav-Menu: kein openNewWindow('/admin') mehr",
      "openNewWindow('/admin')" not in _ui_html)
 
 
+section("Permissions Working Memory + Shared Data 2026-04-15")
+
+_perm2 = requests.get(BASE_URL + "/admin/permissions").text
+
+test("Permissions: Working Memory Spalte vorhanden",
+     "Working Memory" in _perm2)
+
+test("Permissions: working_memory Pfade angezeigt",
+     "working_memory" in _perm2)
+
+test("Permissions: Shared Data Sources Sektion vorhanden",
+     "Shared Data Sources" in _perm2)
+
+test("Permissions: E-Mail Inbox in Shared Sources",
+     "E-Mail Inbox" in _perm2)
+
+test("Permissions: Webclips in Shared Sources",
+     "Webclips" in _perm2)
+
+test("Permissions: Kalender in Shared Sources",
+     "Kalender" in _perm2)
+
+
 # ============================================================
 # ERGEBNIS
 # ============================================================

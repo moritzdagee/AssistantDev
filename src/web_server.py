@@ -10029,10 +10029,25 @@ def admin_permissions():
             "<p>Keine Agent-Definitionen gefunden.</p>")
     tr = []
     for r in rows:
+        name = r['name']
+        esc_name = _html_lib.escape(name)
+        # Working Memory path
+        parent = r.get('parent', '')
+        if r["kind"] == "Parent":
+            wm_path = f"{esc_name}/working_memory/"
+            wm_dir = os.path.join(BASE, name, 'working_memory')
+        else:
+            sub = name.split('_', 1)[1] if '_' in name else name
+            wm_path = f"{_html_lib.escape(parent)}/working_memory/_{_html_lib.escape(sub)}/"
+            wm_dir = os.path.join(BASE, parent, 'working_memory', '_' + sub)
+        wm_exists = os.path.isdir(wm_dir)
+        wm_count = len([f for f in os.listdir(wm_dir) if not f.startswith('_')]) if wm_exists else 0
+        wm_html = f"<code>{wm_path}</code> ({wm_count} Dateien)" if wm_exists else f"<code>{wm_path}</code> <span style='color:#666;'>(leer)</span>"
+
         if r["kind"] == "Parent":
             kind_html = "<span class='tag'>Parent</span>"
             if r["has_own_memory"]:
-                mem_html = f"<code>{_html_lib.escape(r['name'])}/memory/</code> ({r['file_count']} Dateien)"
+                mem_html = f"<code>{esc_name}/memory/</code> ({r['file_count']} Dateien)"
             else:
                 mem_html = "<span class='status-bad'>(kein memory/)</span>"
             access_html = "—"
@@ -10040,17 +10055,19 @@ def admin_permissions():
         else:
             kind_html = "<span class='tag tag-sub'>Sub-Agent</span>"
             mem_html = "—"
-            access_html = (f"<code>{_html_lib.escape(r['parent'])}/memory/</code>"
-                           if r["parent"] else "(kein Parent)")
+            access_html = (f"<code>{_html_lib.escape(parent)}/memory/</code>"
+                           if parent else "(kein Parent)")
             subs_html = "—"
         tr.append(
-            f"<tr><td><strong>{_html_lib.escape(r['name'])}</strong></td>"
+            f"<tr><td><strong>{esc_name}</strong></td>"
             f"<td>{kind_html}</td>"
             f"<td>{mem_html}</td>"
+            f"<td>{wm_html}</td>"
             f"<td>{access_html}</td>"
             f"<td>{subs_html}</td></tr>"
         )
     table = ("<table><tr><th>Agent</th><th>Typ</th><th>Eigenes Memory</th>"
+             "<th>Working Memory</th>"
              "<th>Zugriff auf Parent-Memory</th><th>Sub-Agents</th></tr>"
              + "".join(tr) + "</table>")
 
@@ -10064,8 +10081,20 @@ def admin_permissions():
 
     n_parents = sum(1 for r in rows if r["kind"] == "Parent")
     n_subs = sum(1 for r in rows if r["kind"] == "Sub-Agent")
+    # Shared Data Sources
+    shared_sources = [
+        ("email_inbox", "E-Mail Inbox", os.path.join(BASE, "email_inbox")),
+        ("webclips", "Webclips", os.path.join(BASE, "webclips")),
+        ("calendar", "Kalender", os.path.join(BASE, "calendar")),
+    ]
+    shared_html = "<h2>Shared Data Sources</h2><table><tr><th>Quelle</th><th>Pfad</th><th>Status</th></tr>"
+    for sid, slabel, spath in shared_sources:
+        exists = os.path.isdir(spath)
+        fcount = len(os.listdir(spath)) if exists else 0
+        status = f"<span class='status-ok'>● {fcount} Dateien</span>" if exists else "<span class='status-bad'>○ nicht gefunden</span>"
+        shared_html += f"<tr><td><strong>{_html_lib.escape(slabel)}</strong></td><td><code>{_html_lib.escape(sid)}/</code></td><td>{status}</td></tr>"
+    shared_html += "</table>"
     body = (
-        "<a href='/admin' class='back'>← Admin</a>"
         "<h1>🔐 Memory-Berechtigungen</h1>"
         "<div class='subtitle'>Wer hat Zugriff auf welches Memory? Datenbasis: "
         f"<code>{_ADMIN_DATALAKE}/config/agents/</code></div>"
@@ -10075,6 +10104,7 @@ def admin_permissions():
         f"<span class='metric'><strong>{len(orphans)}</strong> verwaist</span></div>"
         "<h2>Agents</h2>"
         f"{table}"
+        f"{shared_html}"
         f"{orph_html}"
     )
     return _admin_layout("Permissions", body)

@@ -6,6 +6,12 @@ Format: [Datum] Änderung | Datei | Grund
 
 ## 2026-04-15
 
+### Feature: Permissions-Seite mit Working Memory + Shared Data Sources + Memory-Files
+- **Working Memory Spalte:** Permissions-Seite zeigt jetzt pro Agent den Working Memory Pfad, ob er existiert und wie viele Dateien drin sind. Sub-Agents bekommen ihren isolierten Pfad (`working_memory/_<subname>/`).
+- **Shared Data Sources Sektion:** Neue Tabelle mit E-Mail Inbox, Webclips und Kalender — zeigt Pfad und Datei-Anzahl.
+- **Claude Code Memory:** Architektur-Status als Memory-Dateien gespeichert (Services, Agenten, Pfade, Arbeitsweise).
+- **Tests:** 6 neue Tests. Suite: 587/587 gruen.
+
 ### Fix: Konversationshistorie-Klick (Event-Delegation), Working Memory in Matrix, Deploy ohne App-Bundle
 - **Konversationshistorie (2. Fix):** Event-Delegation mit `closest()` durch inline `onclick="onHistoryClick(this)"` ersetzt — zuverlässiger in pywebview. `_histSessions` Map als Lookup statt Closure.
 - **Chrome-Tab-Popup gestoppt:** `webbrowser.open('http://localhost:8080')` beim Serverstart entfernt. Kein Chrome-Tab wird mehr automatisch geöffnet.
