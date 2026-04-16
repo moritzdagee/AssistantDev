@@ -6,6 +6,14 @@ Format: [Datum] Änderung | Datei | Grund
 
 ## 2026-04-15
 
+### Fix: CREATE_FILE Fehler "'set' object has no attribute 'get'" behoben
+- **Problem:** `sanitize_llm_json()` nutzt `ast.literal_eval()` als Fallback wenn `json.loads()` scheitert. `ast.literal_eval` interpretiert malformed JSON wie `{"wert1", "wert2"}` als Python `set` statt `dict`. Die `create_*_from_spec()` Handler rufen dann `spec.get('title', ...)` auf, aber `set` hat keine `.get()`-Methode → Fehler.
+- **Root Cause:** `ast.literal_eval` kann Sets, Tuples und Listen erzeugen — nur Dicts sind valide.
+- **Fix 1:** `sanitize_llm_json()` prüft jetzt nach `ast.literal_eval`, ob das Ergebnis ein `dict` ist. Falls nicht, wird zum nächsten Fallback weitergegangen statt ein Set zurückzugeben.
+- **Fix 2:** Safety-Check im CREATE_FILE Parser: `isinstance(spec, dict)` Prüfung vor Handler-Aufruf mit klarer Fehlermeldung.
+- **Betroffen:** Alle Dateitypen (docx, xlsx, pdf, pptx), alle Agents.
+- **Dateien:** `src/web_server.py` (Zeile 121-125 sanitize_llm_json, Zeile 8263 CREATE_FILE Parser)
+
 ### Fix: Agent-Auswahl persistiert nach Neustart (Auto-Restore via localStorage)
 - **Problem:** Nach Server-/Browser-Reload zeigte der Header zwar den zuletzt aktiven Agent-Namen (DOM-Reste), aber System Prompt und Konversationsliste waren leer ("Kein Agent aktiv..."). Ursache: Es gab ueberhaupt keine Persistenz der Agent-Auswahl — `window.onload` rief immer nur `showAgentModal()` auf, und das Server-Session-State ist In-Memory (geht beim Neustart verloren). Sessions halten die Auswahl also nicht ueber Neustarts hinweg.
 - **Fix (`src/web_server.py`):**

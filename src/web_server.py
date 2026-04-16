@@ -121,7 +121,9 @@ def sanitize_llm_json(raw):
     try:
         import ast
         parsed = ast.literal_eval(s)
-        return parsed
+        if isinstance(parsed, dict):
+            return parsed
+        # ast.literal_eval can produce sets/tuples/lists — only dicts are valid here
     except Exception:
         pass
     # Manual fixes: trailing commas before } or ]
@@ -8259,6 +8261,8 @@ def process_single_message(msg, kontext_override=None, state=None, **kwargs):
         for full_block, ftype, json_str in extract_blocks(text, 'CREATE_FILE'):
             try:
                 spec = sanitize_llm_json(json_str)
+                if not isinstance(spec, dict):
+                    raise ValueError('JSON-Spec muss ein Objekt sein, ist aber ' + type(spec).__name__)
                 if ftype == 'docx':
                     fname, fpath = create_docx_from_spec(spec)
                 elif ftype == 'xlsx':
