@@ -211,7 +211,7 @@ test("Nachrichten-Input vorhanden", "msg-input" in html or "textarea" in html.lo
 test("Agent-Modal vorhanden", "agent-modal" in html or "agent" in html.lower())
 test("Kopier-Button CSS vorhanden", "snippet-copy-btn" in html)
 test("History-Sidebar vorhanden", "history-list" in html)
-test("Session-ID Generierung vorhanden", "getSessionId" in html)
+test("Session-ID Generierung vorhanden", "makeSessionId" in html or "getSessionId" in html)
 test("Stop-Button vorhanden", "stop-btn" in html)
 test("Queue-Display vorhanden", "queue-display" in html)
 test("Typing-Indicator vorhanden", "typing-indicator" in html or "typing" in html)
@@ -2265,6 +2265,41 @@ test("WhatsApp Import LaunchAgent plist existiert",
 _ac3 = requests.get(BASE_URL + "/admin/access-control").text
 test("Access Control: WhatsApp Chats in SHARED_SOURCES",
      "whatsapp" in _ac3 and "WhatsApp" in _ac3)
+
+
+section("Chat-Tabs 2026-04-16")
+
+_tab_html = requests.get(BASE_URL + "/").text
+
+test("Chat-Tabs: tab-bar Container vorhanden",
+     'id="tab-bar"' in _tab_html)
+
+test("Chat-Tabs: tab-add Button vorhanden",
+     'id="tab-add"' in _tab_html)
+
+test("Chat-Tabs: addChatTab JS-Funktion vorhanden",
+     "function addChatTab" in _tab_html)
+
+test("Chat-Tabs: switchToTab JS-Funktion vorhanden",
+     "function switchToTab" in _tab_html)
+
+test("Chat-Tabs: closeTab JS-Funktion vorhanden",
+     "function closeTab" in _tab_html)
+
+test("Chat-Tabs: renderTabs JS-Funktion vorhanden",
+     "function renderTabs" in _tab_html)
+
+test("Chat-Tabs: updateActiveTabLabel JS-Funktion vorhanden",
+     "function updateActiveTabLabel" in _tab_html)
+
+test("Chat-Tabs: _tabs Array initialisiert",
+     "var _tabs = []" in _tab_html or "var _tabs=[]" in _tab_html)
+
+test("Chat-Tabs: chat-tab CSS-Klasse vorhanden",
+     ".chat-tab" in _tab_html)
+
+test("Chat-Tabs: updateActiveTabLabel wird in selectAgent aufgerufen",
+     "updateActiveTabLabel(name, displayName)" in _tab_html)
 
 
 # ============================================================

@@ -4,6 +4,15 @@ Format: [Datum] Änderung | Datei | Grund
 
 ---
 
+## 2026-04-16
+
+### Feature: Chat-Tabs — mehrere Agenten parallel in Reitern
+- **Was:** Tab-Leiste zwischen Header und Chat-Bereich. Jeder Tab hat eigene Session-ID, eigenen Agent, eigene Nachrichten und Kontext. "+" Button oeffnet neuen Tab und zeigt Agent-Auswahl. Tabs zeigen Agent-Namen, aktiver Tab ist gold hervorgehoben. Tabs schliessbar (x) wenn >1 Tab offen.
+- **Wie es funktioniert:** Beim Tab-Wechsel wird der aktuelle DOM-State (messages, ctx-items) im JS-Objekt gespeichert und der neue Tab-State wiederhergestellt. Jeder Tab bekommt eine eigene `SESSION_ID` fuer unabhaengige Server-Sessions.
+- **Warum:** In der nativen pywebview-App konnte man bisher nur einen Agenten gleichzeitig nutzen. Jetzt kann man z.B. Signicat und Trusted Carrier parallel in verschiedenen Tabs laufen lassen.
+- **Dateien:** `src/web_server.py`, `tests/run_tests.py`
+- **Tests:** 10 neue Tests. Suite: 603/603 gruen.
+
 ## 2026-04-15
 
 ### Feature: WhatsApp periodischer Import + Service-Dashboard Integration

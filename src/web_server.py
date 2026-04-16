@@ -3296,6 +3296,16 @@ HTML = """<!DOCTYPE html>
   .nav-menu-item .nav-label { flex:1; }
   .nav-menu-item .nav-hint { font-size:10px; color:#666; }
   .nav-menu-divider { height:1px; background:#333; margin:4px 0; }
+  /* Chat Tabs */
+  #tab-bar { display:flex; align-items:center; background:#0d0d0d; border-bottom:1px solid #333; padding:0 8px; flex-shrink:0; overflow-x:auto; gap:2px; min-height:32px; }
+  .chat-tab { display:flex; align-items:center; gap:6px; padding:5px 12px; background:none; border:none; border-bottom:2px solid transparent; color:#888; font-size:11px; font-family:Inter,sans-serif; cursor:pointer; white-space:nowrap; transition:all .15s; max-width:180px; }
+  .chat-tab:hover { color:#ccc; background:#1a1a1a; }
+  .chat-tab.active { color:#f0c060; border-bottom-color:#f0c060; background:#1a1a1a; }
+  .chat-tab .tab-name { overflow:hidden; text-overflow:ellipsis; }
+  .chat-tab .tab-close { font-size:13px; color:#555; padding:0 2px; line-height:1; cursor:pointer; border:none; background:none; }
+  .chat-tab .tab-close:hover { color:#f87171; }
+  #tab-add { background:none; border:1px solid #333; color:#888; font-size:14px; padding:2px 8px; border-radius:4px; cursor:pointer; margin-left:4px; line-height:1; flex-shrink:0; }
+  #tab-add:hover { border-color:#f0c060; color:#f0c060; }
   /* Services status in nav */
   .svc-row { display:flex; align-items:center; gap:8px; padding:6px 14px; font-size:12px; color:#ccc; }
   .svc-dot { width:8px; height:8px; border-radius:50%; flex-shrink:0; }
@@ -3628,6 +3638,10 @@ HTML = """<!DOCTYPE html>
   </div>
 </div>
 
+<div id="tab-bar">
+  <button id="tab-add" onclick="addChatTab()" title="Neuer Chat-Tab">+</button>
+</div>
+
 <div id="main">
   <div id="sidebar">
     <div id="sidebar-header">
@@ -3750,16 +3764,113 @@ HTML = """<!DOCTYPE html>
 </div>
 
 <script>
-// ─── SESSION ID ──────────────────────────────────────────────────────────────
-function getSessionId() {
-  let sid = sessionStorage.getItem('assistant_session_id');
-  if (!sid) {
-    sid = 'sess_' + Date.now() + '_' + Math.random().toString(36).substr(2, 9);
-    sessionStorage.setItem('assistant_session_id', sid);
-  }
-  return sid;
+// ─── SESSION ID + TABS ──────────────────────────────────────────────────────
+function makeSessionId() {
+  return 'sess_' + Date.now() + '_' + Math.random().toString(36).substr(2, 9);
 }
-const SESSION_ID = getSessionId();
+// Tab state
+var _tabs = [];  // [{id, sessionId, agentName, label, messagesHtml, ctxHtml}]
+var _activeTabId = null;
+var SESSION_ID = '';
+
+function addChatTab(agentName) {
+  var tabId = 'tab_' + Date.now();
+  var sessId = makeSessionId();
+  var tab = {id: tabId, sessionId: sessId, agentName: agentName || '', label: agentName || 'Neuer Chat', messagesHtml: '', ctxHtml: ''};
+  _tabs.push(tab);
+  switchToTab(tabId);
+  renderTabs();
+  if (!agentName) showAgentModal();
+  return tabId;
+}
+
+function switchToTab(tabId) {
+  // Save current tab state
+  if (_activeTabId) {
+    var cur = _tabs.find(function(t){ return t.id === _activeTabId; });
+    if (cur) {
+      cur.messagesHtml = document.getElementById('messages').innerHTML;
+      cur.ctxHtml = document.getElementById('ctx-items').innerHTML;
+      cur.agentName = getAgentName();
+      var lbl = document.getElementById('agent-label');
+      cur.label = lbl ? lbl.textContent : cur.agentName;
+    }
+  }
+  // Activate new tab
+  _activeTabId = tabId;
+  var tab = _tabs.find(function(t){ return t.id === tabId; });
+  if (!tab) return;
+  SESSION_ID = tab.sessionId;
+  // Restore DOM
+  document.getElementById('messages').innerHTML = tab.messagesHtml || '';
+  document.getElementById('ctx-items').innerHTML = tab.ctxHtml || '';
+  if (tab.agentName) {
+    var lbl = document.getElementById('agent-label');
+    if (lbl) {
+      lbl.textContent = tab.label || tab.agentName;
+      lbl.dataset.agentName = tab.agentName;
+    }
+    document.getElementById('msg-input').disabled = false;
+    document.getElementById('send-btn').disabled = false;
+    document.getElementById('msg-input').placeholder = 'Nachricht an ' + (tab.label || tab.agentName) + '...';
+    loadHistory(tab.agentName);
+  }
+  renderTabs();
+}
+
+function closeTab(tabId, evt) {
+  if (evt) { evt.stopPropagation(); evt.preventDefault(); }
+  if (_tabs.length <= 1) return; // mindestens 1 Tab
+  var idx = _tabs.findIndex(function(t){ return t.id === tabId; });
+  if (idx < 0) return;
+  _tabs.splice(idx, 1);
+  if (_activeTabId === tabId) {
+    var newIdx = Math.min(idx, _tabs.length - 1);
+    switchToTab(_tabs[newIdx].id);
+  }
+  renderTabs();
+}
+
+function renderTabs() {
+  var bar = document.getElementById('tab-bar');
+  var addBtn = document.getElementById('tab-add');
+  // Remove old tabs (keep + button)
+  var old = bar.querySelectorAll('.chat-tab');
+  old.forEach(function(el){ el.remove(); });
+  // Add tabs before + button
+  _tabs.forEach(function(tab) {
+    var el = document.createElement('button');
+    el.className = 'chat-tab' + (tab.id === _activeTabId ? ' active' : '');
+    el.onclick = function(){ switchToTab(tab.id); };
+    var nameSpan = '<span class="tab-name">' + escHtml(tab.label || 'Neuer Chat') + '</span>';
+    var closeSpan = _tabs.length > 1 ? '<span class="tab-close" onclick="closeTab(\\'' + tab.id + '\\', event)">&times;</span>' : '';
+    el.innerHTML = nameSpan + closeSpan;
+    bar.insertBefore(el, addBtn);
+  });
+}
+
+function updateActiveTabLabel(name, displayName) {
+  var tab = _tabs.find(function(t){ return t.id === _activeTabId; });
+  if (tab) {
+    tab.agentName = name;
+    tab.label = displayName || name;
+    renderTabs();
+  }
+}
+
+// Init first tab
+(function() {
+  var saved = sessionStorage.getItem('assistant_session_id');
+  var sessId = saved || makeSessionId();
+  if (!saved) sessionStorage.setItem('assistant_session_id', sessId);
+  var savedAgent = localStorage.getItem('last_active_agent');
+  var tab = {id: 'tab_init', sessionId: sessId, agentName: savedAgent || '', label: savedAgent || 'Neuer Chat', messagesHtml: '', ctxHtml: ''};
+  _tabs.push(tab);
+  _activeTabId = 'tab_init';
+  SESSION_ID = sessId;
+  renderTabs();
+})();
+
 let sidebarOpen = true;
 let currentModel = {provider:'anthropic', model_id:'claude-sonnet-4-6', model_name:'Claude Sonnet 4.6'};
 let searchVisible = false;
@@ -4043,6 +4154,7 @@ async function selectAgent(name) {
   localStorage.setItem('last_active_agent', name);
   document.getElementById('agent-label').textContent = displayName;
   document.getElementById('agent-label').dataset.agentName = name;
+  updateActiveTabLabel(name, displayName);
   document.getElementById('msg-input').disabled = false;
   document.getElementById('send-btn').disabled = false;
   document.getElementById('msg-input').placeholder = 'Nachricht an ' + displayName + '...';
