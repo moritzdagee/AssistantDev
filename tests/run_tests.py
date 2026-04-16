@@ -2011,6 +2011,59 @@ except Exception:
     test("GET /api/access-control liefert JSON mit version Feld", False)
 
 
+section("Native Nav-Menu 2026-04-15")
+
+_nav_html = requests.get(BASE_URL + "/").text
+
+test("Nav-Menu: nav-wrap Container vorhanden",
+     'id="nav-wrap"' in _nav_html)
+
+test("Nav-Menu: nav-menu Dropdown vorhanden",
+     'id="nav-menu"' in _nav_html)
+
+test("Nav-Menu: nav-btn Hamburger-Button vorhanden",
+     "nav-btn" in _nav_html)
+
+test("Nav-Menu: toggleNavMenu JS-Funktion vorhanden",
+     "function toggleNavMenu" in _nav_html)
+
+test("Nav-Menu: navigateTo JS-Funktion vorhanden",
+     "function navigateTo" in _nav_html)
+
+test("Nav-Menu: closeNavOnClickOutside JS-Funktion vorhanden",
+     "function closeNavOnClickOutside" in _nav_html)
+
+test("Nav-Menu: Link zu /admin vorhanden",
+     "navigateTo('/admin')" in _nav_html)
+
+test("Nav-Menu: Link zu /admin/access-control vorhanden",
+     "navigateTo('/admin/access-control')" in _nav_html)
+
+test("Nav-Menu: Link zu /admin/permissions vorhanden",
+     "navigateTo('/admin/permissions')" in _nav_html)
+
+test("Nav-Menu: Link zu /admin/docs vorhanden",
+     "navigateTo('/admin/docs')" in _nav_html)
+
+test("Nav-Menu: Link zu /admin/changelog vorhanden",
+     "navigateTo('/admin/changelog')" in _nav_html)
+
+test("Nav-Menu: Zurueck zum Chat Link vorhanden",
+     "navigateTo('/')" in _nav_html)
+
+test("Nav-Menu: nav-menu-section CSS-Klasse vorhanden",
+     "nav-menu-section" in _nav_html)
+
+test("Nav-Menu: nav-menu-item CSS-Klasse vorhanden",
+     "nav-menu-item" in _nav_html)
+
+test("Nav-Menu: nav-menu-divider CSS-Klasse vorhanden",
+     "nav-menu-divider" in _nav_html)
+
+test("Nav-Menu: Alter admin-btn mit window.open NICHT mehr vorhanden",
+     "window.open('/admin/access-control'" not in _nav_html)
+
+
 # ============================================================
 # ERGEBNIS
 # ============================================================

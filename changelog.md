@@ -6,6 +6,13 @@ Format: [Datum] Änderung | Datei | Grund
 
 ## 2026-04-15
 
+### Feature: Hamburger-Navigationsmenue in Chat-UI
+- **Was:** Admin-Button (`window.open`) durch Hamburger-Menue (&#9776;) im Header ersetzt. Dropdown mit allen Sektionen: Admin Panel, Access Control, Berechtigungen, Technische Docs, Changelog, zurueck zum Chat. Navigiert mit `window.location.href` statt `window.open` — funktioniert in pywebview (native App) ohne Browser.
+- **Warum:** In der nativen AssistantDev.app konnte `window.open` keine neuen Tabs oeffnen (pywebview ist kein Browser). Admin-Button war damit tot. Hamburger-Menue bietet zentrale Navigation zu allen Komponenten.
+- **Dateien:** `src/web_server.py`, `tests/run_tests.py`
+- **Tests:** 16 neue Tests in Sektion "Native Nav-Menu 2026-04-15". Suite: 546/546 gruen.
+- **Backups:** `backups/2026-04-15_22-54-13/src/web_server.py`
+
 ### Feature: Native macOS Dock-App (AssistantDev.app)
 - **Was:** Neue native macOS App unter `/Applications/AssistantDev.app`. Startbar aus dem Dock, Finder → Programme, oder Spotlight. Oeffnet das Dashboard in einem eigenstaendigen WebKit-Fenster (pywebview), komplett getrennt von Chrome.
 - **Icon:** Eigenes Roboter-Icon (resources/AppIcon.icns), sichtbar im Dock und Finder.

@@ -3284,6 +3284,19 @@ HTML = """<!DOCTYPE html>
   select.hdr-select:hover { border-color:#666; }
   select.hdr-select option { background:#1a1a1a; color:#e0e0e0; padding:4px 8px; }
   select.hdr-select { -webkit-appearance:menulist; appearance:menulist; min-width:120px; }
+  /* Nav Menu */
+  .nav-wrap { position:relative; display:inline-block; }
+  .nav-btn { background:none; border:1px solid #444; color:#ccc; padding:5px 10px; cursor:pointer; font-size:16px; border-radius:6px; font-family:Inter,sans-serif; transition:all 0.15s; line-height:1; }
+  .nav-btn:hover, .nav-btn.active { border-color:#f0c060; color:#f0c060; background:#1a1a10; }
+  .nav-menu { display:none; position:absolute; left:0; top:calc(100% + 6px); background:#1a1a2e; border:1px solid #444; border-radius:10px; min-width:260px; z-index:200; box-shadow:0 8px 24px rgba(0,0,0,0.6); padding:6px 0; }
+  .nav-menu.open { display:block; }
+  .nav-menu-section { padding:6px 14px 4px; font-size:10px; color:#888; font-weight:700; text-transform:uppercase; letter-spacing:1.2px; }
+  .nav-menu-item { display:flex; align-items:center; gap:10px; padding:9px 14px; color:#d0d0e0; font-size:13px; cursor:pointer; text-decoration:none; transition:background 0.12s; }
+  .nav-menu-item:hover { background:#22224a; color:#fff; }
+  .nav-menu-item .nav-icon { font-size:16px; width:22px; text-align:center; flex-shrink:0; }
+  .nav-menu-item .nav-label { flex:1; }
+  .nav-menu-item .nav-hint { font-size:10px; color:#666; }
+  .nav-menu-divider { height:1px; background:#333; margin:4px 0; }
   #main { display:flex; flex:1; overflow:hidden; }
   #sidebar { width:30%; min-width:280px; background:#141414; border-right:1px solid #2a2a2a; display:flex; flex-direction:column; overflow:hidden; transition:width 0.2s,min-width 0.2s; flex-shrink:0; }
   #sidebar-header { padding:12px 16px; border-bottom:1px solid #333; display:flex; align-items:center; justify-content:space-between; flex-shrink:0; }
@@ -3576,7 +3589,22 @@ HTML = """<!DOCTYPE html>
   <div id="header-spacer" style="flex:1;"></div><!-- AGENT_BTN_V1 -->
   <button class="hdr-btn" onclick="newSession()" style="background:#2a3a2a;border-color:#4a6a4a;color:#a0d090;">+ Neu <span class="shortcut-label">[N]</span></button>
   <button id="agent-btn" class="hdr-btn" data-tooltip-kind="agent" onclick="showAgentModal()"><span id="agent-label">Kein Agent</span> <span class="shortcut-label">[A]</span></button>
-  <button id="admin-btn" class="hdr-btn" onclick="window.open('/admin/access-control', '_blank')" title="Access Control">\u2699 Admin</button>
+  <div class="nav-wrap" id="nav-wrap">
+    <button class="nav-btn" onclick="toggleNavMenu()" title="Navigation">&#9776;</button>
+    <div class="nav-menu" id="nav-menu">
+      <div class="nav-menu-section">Administration</div>
+      <a class="nav-menu-item" onclick="navigateTo('/admin')"><span class="nav-icon">&#9881;</span><span class="nav-label">Admin Panel</span><span class="nav-hint">Status &amp; Uebersicht</span></a>
+      <a class="nav-menu-item" onclick="navigateTo('/admin/access-control')"><span class="nav-icon">&#128274;</span><span class="nav-label">Access Control</span><span class="nav-hint">Matrix</span></a>
+      <a class="nav-menu-item" onclick="navigateTo('/admin/permissions')"><span class="nav-icon">&#128272;</span><span class="nav-label">Berechtigungen</span><span class="nav-hint">Memory-Zugriff</span></a>
+      <div class="nav-menu-divider"></div>
+      <div class="nav-menu-section">Dokumentation</div>
+      <a class="nav-menu-item" onclick="navigateTo('/admin/docs')"><span class="nav-icon">&#128214;</span><span class="nav-label">Technische Docs</span><span class="nav-hint">API &amp; Architektur</span></a>
+      <a class="nav-menu-item" onclick="navigateTo('/admin/changelog')"><span class="nav-icon">&#128203;</span><span class="nav-label">Changelog</span><span class="nav-hint">Aenderungshistorie</span></a>
+      <div class="nav-menu-divider"></div>
+      <div class="nav-menu-section">Chat</div>
+      <a class="nav-menu-item" onclick="navigateTo('/')"><span class="nav-icon">&#128172;</span><span class="nav-label">Zurueck zum Chat</span></a>
+    </div>
+  </div>
   <select id="provider-select" class="hdr-select" onchange="onProviderChange()">
     <option>Anthropic</option>
   </select>
@@ -4122,6 +4150,36 @@ async function newSession() {
     if (data.memory_info) addMemoryMsg(data.memory_info);
     loadHistory(name);
   }
+}
+
+// ─── NAV MENU ────────────────────────────────────────────────────────────────────
+function toggleNavMenu() {
+  const menu = document.getElementById('nav-menu');
+  const btn = document.querySelector('.nav-btn');
+  const isOpen = menu.classList.contains('open');
+  menu.classList.toggle('open');
+  btn.classList.toggle('active');
+  if (!isOpen) {
+    setTimeout(function() {
+      document.addEventListener('click', closeNavOnClickOutside, {once: true});
+    }, 10);
+  }
+}
+function closeNavOnClickOutside(e) {
+  const wrap = document.getElementById('nav-wrap');
+  if (!wrap.contains(e.target)) {
+    document.getElementById('nav-menu').classList.remove('open');
+    document.querySelector('.nav-btn').classList.remove('active');
+  } else {
+    setTimeout(function() {
+      document.addEventListener('click', closeNavOnClickOutside, {once: true});
+    }, 10);
+  }
+}
+function navigateTo(path) {
+  document.getElementById('nav-menu').classList.remove('open');
+  document.querySelector('.nav-btn').classList.remove('active');
+  window.location.href = path;
 }
 
 // ─── SIDEBAR ────────────────────────────────────────────────────────────────────
