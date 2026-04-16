@@ -6,6 +6,16 @@ Format: [Datum] Änderung | Datei | Grund
 
 ## 2026-04-15
 
+### Fix: Agent-Auswahl persistiert nach Neustart (Auto-Restore via localStorage)
+- **Problem:** Nach Server-/Browser-Reload zeigte der Header zwar den zuletzt aktiven Agent-Namen (DOM-Reste), aber System Prompt und Konversationsliste waren leer ("Kein Agent aktiv..."). Ursache: Es gab ueberhaupt keine Persistenz der Agent-Auswahl — `window.onload` rief immer nur `showAgentModal()` auf, und das Server-Session-State ist In-Memory (geht beim Neustart verloren). Sessions halten die Auswahl also nicht ueber Neustarts hinweg.
+- **Fix (`src/web_server.py`):**
+  - `selectAgent(name)` schreibt den gewaehlten Agenten nach erfolgreichem Laden in `localStorage['last_active_agent']`.
+  - `selectAgent` prueft jetzt `data.ok === false` und faengt Netzwerk-/Parse-Fehler ab; in beiden Faellen wird der gespeicherte Key geleert und das Modal geoeffnet, statt den UI-State halb zu setzen.
+  - `window.onload` liest den Key beim Start, ruft `selectAgent(savedAgent)` auf und faellt nur ohne gespeicherten Agenten (oder wenn der Agent nicht mehr existiert) auf `showAgentModal()` zurueck.
+- **Zusatz-Fix (Browser-Cache):** Der Bug wurde auch dadurch maskiert, dass Chrome das HTML aus `/` aggressiv cachte und nach einem Code-Update weiterhin den alten JS-Stand ausgelieferte. `index()` setzt jetzt `Cache-Control: no-store, no-cache, must-revalidate, max-age=0` + `Pragma: no-cache` + `Expires: 0`. Kuenftige Server-Updates greifen sofort beim naechsten Reload. `make_response` wurde dem Flask-Import hinzugefuegt.
+- **Tests:** neue Sektion "Agent Auto-Restore nach Neustart 2026-04-15" in `tests/run_tests.py` (7 neue Tests — prueft Set/Remove-Calls, Onload-Flow, Error-Handling, Cache-Control-Header). Suite: 499/499 gruen.
+- **Backups:** `backups/2026-04-15_13-56-20/src/web_server.py`
+
 ### Fix: Oversize-Bilder umgehen Downscaler wegen PIL DecompressionBombError
 - **Problem:** Der bestehende Downscaler hat bei sehr grossen Bildern (> 178 MP Default-Limit von Pillow) eine `DecompressionBombError` geworfen und im `except`-Zweig stillschweigend die Original-Base64-Daten zurueckgegeben. Ergebnis: Anthropic lehnte die Anfrage dennoch mit `messages.22.content.1.image.source.base64.data: At least one of the image dimensions exceed max allowed size: 8000 pixels` ab — der gleiche Fehler wie vorher, nur jetzt bei aelteren Session-Verlaeufen.
 - **Fix (`src/web_server.py`):**

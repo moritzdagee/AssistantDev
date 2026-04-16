@@ -32,7 +32,7 @@ except ImportError:
     detect_global_trigger = None
     update_all_indexes = None
 import requests
-from flask import Flask, request, jsonify, render_template_string
+from flask import Flask, request, jsonify, render_template_string, make_response
 from bs4 import BeautifulSoup
 
 # ─── IMAGE HELPERS ───────────────────────────────────────────────────────────
@@ -3984,8 +3984,24 @@ async function selectAgent(name) {
   // Display name: "signicat > outbound" for sub-agents
   const displayName = name.includes('_') ? name.split('_')[0]+' \u203a '+name.split('_').slice(1).join('_') : name;
   addStatusMsg('Lade Gedaechtnis fuer ' + displayName + '...');
-  const r = await fetch('/select_agent', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({agent:name, session_id:SESSION_ID})});
-  const data = await r.json();
+  let r, data;
+  try {
+    r = await fetch('/select_agent', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({agent:name, session_id:SESSION_ID})});
+    data = await r.json();
+  } catch(e) {
+    localStorage.removeItem('last_active_agent');
+    addStatusMsg('Agent-Laden fehlgeschlagen: ' + e.message);
+    showAgentModal();
+    return;
+  }
+  if (!data || data.ok === false) {
+    localStorage.removeItem('last_active_agent');
+    addStatusMsg('Agent "' + name + '" nicht verfuegbar' + (data && data.error ? ' ('+data.error+')' : ''));
+    showAgentModal();
+    return;
+  }
+  // Persist for auto-restore on next page load (survives server restart)
+  localStorage.setItem('last_active_agent', name);
   document.getElementById('agent-label').textContent = displayName;
   document.getElementById('agent-label').dataset.agentName = name;
   document.getElementById('msg-input').disabled = false;
@@ -6175,7 +6191,15 @@ document.addEventListener('drop', async e => {
   }
 });
 
-window.onload = async () => { try { await loadProviders(); } catch(e) {} showAgentModal(); };
+window.onload = async () => {
+  try { await loadProviders(); } catch(e) {}
+  // Auto-restore last active agent (persists across page reloads and server restarts)
+  const savedAgent = localStorage.getItem('last_active_agent');
+  if (savedAgent) {
+    try { await selectAgent(savedAgent); return; } catch(e) { console.log('Auto-restore failed:', e); }
+  }
+  showAgentModal();
+};
 </script>
 </body>
 </html>
@@ -6183,7 +6207,13 @@ window.onload = async () => { try { await loadProviders(); } catch(e) {} showAge
 
 @app.route("/")
 def index():
-    return render_template_string(HTML)
+    # No-store verhindert dass Browser veraltetes HTML/JS nach einem Code-Update
+    # weiterverwenden (sonst laeuft nach Server-Restart die alte UI-Version weiter).
+    resp = make_response(render_template_string(HTML))
+    resp.headers['Cache-Control'] = 'no-store, no-cache, must-revalidate, max-age=0'
+    resp.headers['Pragma'] = 'no-cache'
+    resp.headers['Expires'] = '0'
+    return resp
 
 @app.route('/models')
 def get_models():

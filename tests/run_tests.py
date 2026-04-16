@@ -1879,6 +1879,36 @@ except Exception as _san_ex:
          False, str(_san_ex))
 
 
+section("Agent Auto-Restore nach Neustart 2026-04-15")
+
+_html_restore = requests.get(BASE_URL + "/").text
+
+test("localStorage Key 'last_active_agent' wird in selectAgent gesetzt",
+     "localStorage.setItem('last_active_agent'" in _html_restore)
+
+test("localStorage 'last_active_agent' wird bei Fehler geleert",
+     _html_restore.count("localStorage.removeItem('last_active_agent')") >= 2)
+
+test("window.onload liest 'last_active_agent' und ruft selectAgent auf",
+     "localStorage.getItem('last_active_agent')" in _html_restore
+     and "await selectAgent(savedAgent)" in _html_restore)
+
+test("selectAgent behandelt data.ok === false und zeigt Modal",
+     "data.ok === false" in _html_restore
+     and "showAgentModal()" in _html_restore)
+
+test("selectAgent faengt Netzwerk-/Parse-Fehler ab (try/catch um fetch)",
+     "Agent-Laden fehlgeschlagen" in _html_restore)
+
+test("window.onload ruft showAgentModal nur als Fallback (nicht immer)",
+     "if (savedAgent)" in _html_restore
+     and _html_restore.count("window.onload") == 1)
+
+_resp_root = requests.get(BASE_URL + "/")
+test("Index-Response setzt Cache-Control: no-store (kein stale-JS nach Update)",
+     "no-store" in _resp_root.headers.get("Cache-Control", ""))
+
+
 # ============================================================
 # ERGEBNIS
 # ============================================================
