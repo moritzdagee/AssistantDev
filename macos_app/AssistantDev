@@ -1,0 +1,34 @@
+#!/bin/bash
+# AssistantDev — Native macOS App Launcher
+# Oeffnet das Dashboard in einem nativen WebKit-Fenster (pywebview)
+
+ASSISTANT_DIR="$HOME/AssistantDev"
+DASHBOARD_SCRIPT="$ASSISTANT_DIR/src/dashboard_window.py"
+PYTHON="/usr/bin/python3"
+LOG="$ASSISTANT_DIR/logs/app_launcher.log"
+
+mkdir -p "$ASSISTANT_DIR/logs"
+
+# Pfad-Argument (z.B. /admin, /admin/docs) — Default: Dashboard
+PATH_ARG="${1:-/}"
+
+echo "$(date '+%Y-%m-%d %H:%M:%S') [LAUNCH] Starting AssistantDev Dashboard (path=$PATH_ARG)" >> "$LOG"
+
+# Pruefen ob Web Server laeuft
+if ! curl -s --max-time 2 http://localhost:8080/health > /dev/null 2>&1; then
+    if ! curl -s --max-time 2 http://localhost:8080/ > /dev/null 2>&1; then
+        echo "$(date '+%Y-%m-%d %H:%M:%S') [WARN] Web Server nicht erreichbar, versuche Start..." >> "$LOG"
+        # Versuche Web Server zu starten
+        cd "$ASSISTANT_DIR/src" && "$PYTHON" web_server.py >> "$ASSISTANT_DIR/logs/web_server.log" 2>&1 &
+        sleep 3
+    fi
+fi
+
+# Dashboard-Fenster oeffnen
+if [ -f "$DASHBOARD_SCRIPT" ]; then
+    exec "$PYTHON" "$DASHBOARD_SCRIPT" "$PATH_ARG" 2>> "$LOG"
+else
+    echo "$(date '+%Y-%m-%d %H:%M:%S') [ERROR] Dashboard script not found: $DASHBOARD_SCRIPT" >> "$LOG"
+    osascript -e "display dialog \"AssistantDev Dashboard-Script nicht gefunden\" buttons {\"OK\"} default button \"OK\" with title \"AssistantDev\""
+    exit 1
+fi

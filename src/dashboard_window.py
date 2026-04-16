@@ -17,8 +17,18 @@ import os
 
 try:
     import setproctitle
-    setproctitle.setproctitle("AssistantDev Dashboard")
+    setproctitle.setproctitle("AssistantDev")
 except ImportError:
+    pass
+
+# ── macOS App-Name korrekt setzen ────────────────────────────────────────────
+try:
+    from Foundation import NSBundle
+    bundle = NSBundle.mainBundle()
+    info = bundle.localizedInfoDictionary() or bundle.infoDictionary()
+    if info is not None:
+        info["CFBundleName"] = "AssistantDev"
+except Exception:
     pass
 
 # ── URL bestimmen ────────────────────────────────────────────────────────────
@@ -32,8 +42,8 @@ url = BASE_URL + path
 # ── Fenstertitel aus Pfad ableiten ───────────────────────────────────────────
 
 TITLE_MAP = {
-    "": "AssistantDev — Dashboard",
-    "/": "AssistantDev — Dashboard",
+    "": "AssistantDev",
+    "/": "AssistantDev",
     "/admin": "AssistantDev — Admin Panel",
     "/admin/docs": "AssistantDev — Technische Dokumentation",
     "/admin/changelog": "AssistantDev — Changelog",

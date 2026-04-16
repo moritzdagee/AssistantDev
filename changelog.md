@@ -6,6 +6,16 @@ Format: [Datum] Änderung | Datei | Grund
 
 ## 2026-04-15
 
+### Feature: Native macOS Dock-App (AssistantDev.app)
+- **Was:** Neue native macOS App unter `/Applications/AssistantDev.app`. Startbar aus dem Dock, Finder → Programme, oder Spotlight. Oeffnet das Dashboard in einem eigenstaendigen WebKit-Fenster (pywebview), komplett getrennt von Chrome.
+- **Icon:** Eigenes Roboter-Icon (resources/AppIcon.icns), sichtbar im Dock und Finder.
+- **Bundle:** Vollstaendiges `.app` Bundle mit Info.plist (CFBundleIdentifier: com.assistantdev.app), Launcher-Script, und Icon.
+- **Launcher:** Prueft ob Web Server laeuft, startet ihn bei Bedarf, oeffnet dann das Dashboard-Fenster.
+- **Tray-App deaktiviert:** Der alte 🤖 Menu-Bar-Roboter (LaunchAgent com.assistantdev.tray) wurde deaktiviert, die Dock-App ersetzt ihn.
+- **Install-Script:** `scripts/install_app.sh` installiert/aktualisiert die App unter /Applications.
+- **Warum:** Benutzer wollte eine echte macOS App im Dock statt eines Menu-Bar-Icons, und alle Inhalte in einem nativen Fenster statt Chrome-Tabs.
+- **Dateien:** `src/dashboard_window.py`, `macos_app/Info.plist` (neu), `macos_app/AssistantDev` (neu), `resources/AppIcon.icns` (neu), `resources/AppIcon.png` (neu), `scripts/install_app.sh` (neu)
+
 ### Feature: Natives Dashboard-Fenster (pywebview) statt Chrome
 - **Was:** Alle "Oeffnen"-Aktionen in der Tray App oeffnen jetzt ein eigenstaendiges macOS-Fenster (WebKit via pywebview) statt den Standard-Browser. Dashboard, Admin Panel, Technische Dokumentation und Changelog erscheinen in einem nativen Fenster mit eigenem Dock-Icon, komplett getrennt von Chrome-Tabs.
 - **Neu:** `src/dashboard_window.py` — eigenstaendiges Script das per Argument verschiedene Pfade oeffnen kann (`/`, `/admin`, `/admin/docs`, `/admin/changelog`).
