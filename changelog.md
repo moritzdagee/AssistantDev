@@ -138,6 +138,26 @@ Format: [Datum] Änderung | Datei | Grund
 
 ## 2026-04-15
 
+### Feat: Agent-System-Prompts — Gemeinsamer Faehigkeiten-Block (4 Luecken geschlossen)
+- **Was:** In 8 Agent-System-Prompts (privat, signicat, signicat_lamp, signicat_meddpicc, signicat_outbound, signicat_powerpoint, trustedcarrier, trustedcarrier_instagramm) neue Faehigkeits-Abschnitte eingefuegt, die die 4 im Audit identifizierten Luecken schliessen: WhatsApp-Trigger, Datei-Extraktion-Autoinfos, Web-Suche, Sub-Agent-Delegation.
+- **Rollengerechte Anpassung:**
+  - privat, signicat, trustedcarrier: vollstaendiger Block inkl. CREATE_WHATSAPP + alle Auto-Features + Delegation-Hinweise.
+  - signicat_outbound: ohne WhatsApp (Outbound-Mails-fokussiert), mit Lead-Recherche-Web-Suche + Vision fuer Salesforce-Screenshots.
+  - signicat_lamp, signicat_meddpicc: Abgrenzungs-Block ("Du schreibst KEINE E-Mails/Slack/WhatsApp, Output = Analysen als Dokumente") + Auto-Features + Sub-Agent-Delegation-Hinweise auf Kommunikations-Sub-Agents.
+  - signicat_powerpoint: Auto-Features + Delegation-Hinweise auf signicat_lamp/meddpicc fuer Vor-Analyse.
+  - trustedcarrier_instagramm: NEU ergaenzt MEMORY_SEARCH (vorher komplett gefehlt!) + Auto-Features fuer Moodboard-/Brand-Guide-Uploads.
+- **Dateien:** Alle 8 Agent-Txt-Files in `~/Library/Mobile Documents/com~apple~CloudDocs/Downloads shared/claude_datalake/config/agents/`. Backups mit Timestamp `20260415_104932` liegen daneben.
+- **Nicht angefasst:** `system ward.txt` (Admin-Agent ohne Endnutzer-Aktionen).
+- **Referenz:** `claude_outputs/system_ward_capabilities_report_2026-04-15.md`
+- **Warum:** Backend-Audit ergab 4 Fähigkeiten die voll funktionsfaehig sind aber in keinem Agent-Prompt erwaehnt wurden — User wuerden sie nie entdecken, Claude wuerde sie nie aktiv vorschlagen.
+
+### Audit: Agent-Capabilities-Inventur
+- **Was:** Vollstaendige Inventur aller Backend-Trigger und Abgleich mit den 9 Agent-System-Prompts (privat, signicat, signicat_lamp, signicat_meddpicc, signicat_outbound, signicat_powerpoint, trustedcarrier, trustedcarrier_instagramm, system ward). Grundlage: `src/web_server.py` (9957 Zeilen) + `config/agents/*.txt`.
+- **Ergebnis — 15 Backend-Handler gefunden:** 7 CREATE_*-Trigger (docx, xlsx, pdf, pptx, email, email_reply, whatsapp, slack, image, video), 4 Memory-Trigger (MEMORY_SEARCH, WORKING_MEMORY_ADD/REMOVE/LIST), 2 User-Slash-Kategorien (/calendar-*, /canva-*), 3 Auto-Features (Datei-Extraktion, Vision, Sub-Agent-Delegation, Web-Suche).
+- **Ergebnis — 4 kritische Luecken in ALLEN Agent-Prompts:** WhatsApp-Trigger, Datei-Extraktion (Upload), Web-Suche (Anthropic Tool-Use), Sub-Agent-Delegation. Diese Backend-Faehigkeiten sind voll funktional, aber kein Agent-Prompt erwaehnt sie.
+- **Ergebnis — 0 falsche Negativ-Behauptungen:** Kein Agent sagt "ich kann keine Bilder/Videos", Fix vom April 2026 wirkt (system ward.txt Z. 231).
+- **Output:** `claude_outputs/system_ward_capabilities_report_2026-04-15.md` (Vollstaendige Handler-Liste, Agent-Matrix, Luecken-Analyse, Empfehlung fuer gemeinsamen Faehigkeiten-Block); `claude_outputs/system_ward_system_prompt_2026-04-15.txt` (unveraenderte Kopie des aktuellen System-Prompts).
+
 ### Feature: WhatsApp periodischer Import + Service-Dashboard Integration
 - **LaunchAgent:** `com.assistantdev.whatsapp-import` — fuehrt `scripts/whatsapp_db_import.py --agent privat` alle 20 Minuten aus. Liest direkt aus der WhatsApp Mac App SQLite-DB (read-only Kopie).
 - **Service-Dashboard:** WhatsApp Import als fuenfter Service im Hamburger-Menue. Zeigt "aktiv/inaktiv (20min)" + Zeitstempel des letzten Laufs. Restart-Button triggert manuellen Import.
