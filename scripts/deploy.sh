@@ -1,21 +1,15 @@
 #!/bin/bash
 # deploy.sh — Graceful Deployment fuer AssistantDev Web Server
+# Server laeuft direkt aus src/ (kein App-Bundle mehr noetig).
 # Sendet SIGTERM und wartet auf sauberes Ende, bevor der neue Prozess startet.
 
 set -e
 
-RESOURCES="/Applications/Assistant.app/Contents/Resources"
 SRC="$HOME/AssistantDev/src"
 
 echo "=== AssistantDev Deploy ==="
 
-# 1. Dateien kopieren
-echo "[DEPLOY] Kopiere Source-Dateien..."
-cp "$SRC/web_server.py" "$RESOURCES/"
-cp "$SRC/search_engine.py" "$RESOURCES/"
-echo "[DEPLOY] Dateien kopiert nach $RESOURCES/"
-
-# 2. Graceful Shutdown: SIGTERM senden und auf Ende warten
+# 1. Graceful Shutdown: SIGTERM senden und auf Ende warten
 # Identify web server PID: either renamed bundle process ("AssistantDev WebServer")
 # or direct invocation of web_server.py. Prefer the listener on :8080.
 PID=$(lsof -tiTCP:8080 -sTCP:LISTEN 2>/dev/null | head -1)
@@ -42,15 +36,16 @@ else
     echo "[DEPLOY] Kein laufender Web-Server gefunden"
 fi
 
-# 3. Neuen Prozess starten — via system python weil das Bundle-Python
-# setproctitle nicht installiert hat (bricht beim Import).
-echo "[DEPLOY] Starte neuen Server..."
-LOG="$HOME/Library/Logs/Assistant/assistant.log"
-nohup /usr/bin/python3 -u "$SRC/app.py" >> "$LOG" 2>&1 &
+# 2. Neuen Prozess starten direkt aus src/
+echo "[DEPLOY] Starte neuen Server aus $SRC..."
+LOG="$HOME/AssistantDev/logs/web_server.log"
+mkdir -p "$(dirname "$LOG")"
+cd "$SRC"
+nohup /usr/bin/python3 -u web_server.py >> "$LOG" 2>&1 &
 disown
 sleep 2
 
-# 4. Healthcheck mit Retry (Server braucht 1-5s bis er Requests annimmt)
+# 3. Healthcheck mit Retry (Server braucht 1-5s bis er Requests annimmt)
 HTTP_STATUS="000"
 for i in $(seq 1 15); do
     HTTP_STATUS=$(curl -s -o /dev/null -w "%{http_code}" http://localhost:8080/agents 2>/dev/null || echo "000")

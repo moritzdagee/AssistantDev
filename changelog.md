@@ -6,6 +6,13 @@ Format: [Datum] Änderung | Datei | Grund
 
 ## 2026-04-15
 
+### Fix: Konversationshistorie-Klick, Working Memory in Matrix, Deploy-Script
+- **Konversationshistorie:** Klick auf Konversationen in der Sidebar funktionierte in pywebview nicht (programmatische `onclick`-Handler). Umgestellt auf Event-Delegation via `document.addEventListener('click')` mit `closest('.history-item')`. Betrifft alle Agenten und Sub-Agenten.
+- **Access Control Matrix:** Working Memory als vierte Shared-Datenquelle hinzugefuegt (neben Webclips, E-Mail, Kalender).
+- **Deploy-Script:** `scripts/deploy.sh` referenziert nicht mehr `/Applications/Assistant.app` (gelöscht). Server wird direkt aus `src/` gestartet.
+- **Branch-Cleanup:** Obsoleter Branch `feature/fix-provider-parsing-bug` gelöscht (alle Commits waren bereits via cherry-pick in develop).
+- **Tests:** 8 neue Tests. Suite: 570/570 gruen.
+
 ### Feature: Services-Dashboard, Multi-Fenster und verbessertes Nav-Menue
 - **Was:**
   - Hamburger-Menue nach rechts oben verschoben (letzes Element im Header)

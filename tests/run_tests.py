@@ -2129,6 +2129,47 @@ test("Nav-Menu: kchat_watcher in _admin_status_check",
      "kchat_watcher" in _ws_src and "kchat_watcher.py" in _ws_src)
 
 
+section("Fixes 2026-04-15 (History, WorkingMemory, Deploy)")
+
+# History: Event-Delegation statt btn.onclick
+_fix_html = requests.get(BASE_URL + "/").text
+
+test("History: Event-Delegation via document.addEventListener click",
+     "document.addEventListener('click'" in _fix_html or 'document.addEventListener("click"' in _fix_html)
+
+test("History: _histSessions Lookup-Map vorhanden",
+     "_histSessions" in _fix_html)
+
+test("History: closest('.history-item') fuer Event-Delegation",
+     "closest('.history-item')" in _fix_html or 'closest(".history-item")' in _fix_html)
+
+test("History: KEIN btn.onclick = () => loadConversation mehr",
+     "btn.onclick = () => loadConversation" not in _fix_html)
+
+# Access Control: Working Memory als Datenquelle
+_ac2 = requests.get(BASE_URL + "/admin/access-control").text
+
+test("Access Control: working_memory in SHARED_SOURCES",
+     "working_memory" in _ac2)
+
+test("Access Control: Working Memory Label vorhanden",
+     "Working Memory" in _ac2)
+
+# Deploy-Script: kein Assistant.app Pfad mehr
+_deploy_path = os.path.expanduser("~/AssistantDev/scripts/deploy.sh")
+try:
+    with open(_deploy_path, "r") as _df:
+        _deploy_src = _df.read()
+except Exception:
+    _deploy_src = ""
+
+test("deploy.sh referenziert NICHT mehr Assistant.app",
+     "Assistant.app" not in _deploy_src)
+
+test("deploy.sh startet Server aus src/",
+     "web_server.py" in _deploy_src and "SRC" in _deploy_src)
+
+
 # ============================================================
 # ERGEBNIS
 # ============================================================

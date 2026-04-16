@@ -4288,27 +4288,37 @@ async function reloadPrompt() {
 }
 
 // ─── HISTORY ────────────────────────────────────────────────────────────────────
+var _histSessions = {};  // file -> session data for delegation
 async function loadHistory(agentName) {
-  const r = await fetch('/get_history?agent=' + encodeURIComponent(agentName) + '&session_id=' + SESSION_ID);
-  const data = await r.json();
-  const list = document.getElementById('history-list');
+  var r = await fetch('/get_history?agent=' + encodeURIComponent(agentName) + '&session_id=' + SESSION_ID);
+  var data = await r.json();
+  var list = document.getElementById('history-list');
   if (!data.sessions || !data.sessions.length) {
     list.innerHTML = '<p style="font-size:11px;color:#555;padding:8px;font-style:italic;">Keine Konversationen</p>';
     return;
   }
-  list.innerHTML = '';
-  data.sessions.forEach((s, i) => {
-    const btn = document.createElement('button');
-    btn.className = 'history-item' + (i===0?' active':'');
-    btn.dataset.file = s.file;
-    btn.innerHTML = '<span class="h-date">' + escHtml(s.date) + '</span><span class="h-summary">' + escHtml(s.title || s.date) + '</span>';
-    btn.onclick = () => loadConversation(s, btn);
-    list.appendChild(btn);
+  _histSessions = {};
+  var h = '';
+  data.sessions.forEach(function(s, i) {
+    _histSessions[s.file] = s;
+    h += '<button class="history-item' + (i===0?' active':'') + '" data-file="' + escHtml(s.file) + '">';
+    h += '<span class="h-date">' + escHtml(s.date) + '</span>';
+    h += '<span class="h-summary">' + escHtml(s.title || s.date) + '</span>';
+    h += '</button>';
   });
+  list.innerHTML = h;
 }
+// Event delegation for history clicks (pywebview-compatible)
+document.addEventListener('click', function(e) {
+  var btn = e.target.closest('.history-item');
+  if (!btn) return;
+  var file = btn.dataset.file;
+  var session = _histSessions[file];
+  if (session) loadConversation(session, btn);
+});
 
 async function loadConversation(session, btn) {
-  document.querySelectorAll('.history-item').forEach(b => b.classList.remove('active'));
+  document.querySelectorAll('.history-item').forEach(function(b) { b.classList.remove('active'); });
   btn.classList.add('active');
   const name = getAgentName();
   const r = await fetch('/load_conversation', {method:'POST', headers:{'Content-Type':'application/json'},
@@ -6802,9 +6812,10 @@ h1 { color:#f0c060; font-size:24px; margin:8px 0 4px; }
 var _acData = null;
 var _agents = [];
 var SHARED_SOURCES = [
-  {key:'webclips',    icon:'&#127760;', label:'Webclips'},
-  {key:'email_inbox', icon:'&#9993;',   label:'E-Mail Inbox'},
-  {key:'calendar',    icon:'&#128197;', label:'Kalender'}
+  {key:'webclips',       icon:'&#127760;', label:'Webclips'},
+  {key:'email_inbox',    icon:'&#9993;',   label:'E-Mail Inbox'},
+  {key:'calendar',       icon:'&#128197;', label:'Kalender'},
+  {key:'working_memory', icon:'&#129504;', label:'Working Memory'}
 ];
 
 function escH(s){ return String(s||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;'); }
