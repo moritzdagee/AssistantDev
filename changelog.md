@@ -6,6 +6,14 @@ Format: [Datum] Änderung | Datei | Grund
 
 ## 2026-04-15
 
+### Feature: Natives Dashboard-Fenster (pywebview) statt Chrome
+- **Was:** Alle "Oeffnen"-Aktionen in der Tray App oeffnen jetzt ein eigenstaendiges macOS-Fenster (WebKit via pywebview) statt den Standard-Browser. Dashboard, Admin Panel, Technische Dokumentation und Changelog erscheinen in einem nativen Fenster mit eigenem Dock-Icon, komplett getrennt von Chrome-Tabs.
+- **Neu:** `src/dashboard_window.py` — eigenstaendiges Script das per Argument verschiedene Pfade oeffnen kann (`/`, `/admin`, `/admin/docs`, `/admin/changelog`).
+- **Fix:** App-Name "Python" → "AssistantDev" via PyObjC `CFBundleName` Override in der `NSBundle.mainBundle()`.
+- **Warum:** Benutzer wollte natives UX statt Browser-Tabs, und der Tray zeigte "Python" statt "AssistantDev".
+- **Abhaengigkeit:** `pywebview` (installiert via pip).
+- **Dateien:** `src/app.py`, `src/dashboard_window.py` (neu), `~/Library/LaunchAgents/com.assistantdev.tray.plist`
+
 ### Fix: Provider-Parsing-Bug — CREATE_DOCX/CREATE_FILE wurde als Provider-Name interpretiert
 - **Problem:** Beim Laden gespeicherter Konversationen iterierte der Provider-Parser ueber ALLE Zeilen und nahm den letzten `[.../...]`-Match. Wenn eine Assistant-Antwort `[CREATE_FILE:docx:{...}]` oder `[KONTEXT_DATEIEN:[{...}]]` enthielt, wurde das als Provider gematcht → Crash: "Unbekannter Anbieter: CREATE_DOCX:{...}".
 - **Fix:** `VALID_PROVIDERS` Konstante eingefuehrt. Provider-Parser validiert gegen Whitelist. `/select_model` und `select_agent` pruefen ebenfalls.

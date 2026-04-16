@@ -27,6 +27,16 @@ try:
 except ImportError:
     pass
 
+# ── macOS App-Name auf "AssistantDev" setzen (statt "Python") ────────────────
+try:
+    from Foundation import NSBundle
+    bundle = NSBundle.mainBundle()
+    info = bundle.localizedInfoDictionary() or bundle.infoDictionary()
+    if info is not None:
+        info["CFBundleName"] = "AssistantDev"
+except Exception:
+    pass
+
 # ── Pfade ────────────────────────────────────────────────────────────────────
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -307,27 +317,28 @@ class AssistantDevApp(rumps.App):
             self._do_status_check()
         threading.Thread(target=do, daemon=True).start()
 
-    # ── Oeffnen-Aktionen ─────────────────────────────────────────────────────
+    # ── Natives Fenster oeffnen (pywebview statt Chrome) ───────────────────────
+
+    def _open_native_window(self, path=""):
+        """Oeffnet ein natives macOS-Fenster via dashboard_window.py."""
+        script = os.path.join(ASSISTANT_DIR, "src", "dashboard_window.py")
+        subprocess.Popen(
+            [sys.executable, script, path],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
 
     def _open_dashboard(self, _):
-        subprocess.Popen(["open", "http://localhost:8080"])
+        self._open_native_window("/")
 
     def _open_admin(self, _):
-        subprocess.Popen(["open", "http://localhost:8080/admin"])
+        self._open_native_window("/admin")
 
     def _open_docs(self, _):
-        docs_path = os.path.join(ASSISTANT_DIR, "docs", "TECHNICAL_DOCUMENTATION.md")
-        if os.path.exists(docs_path):
-            subprocess.Popen(["open", docs_path])
-        else:
-            subprocess.Popen(["open", "http://localhost:8080/admin/docs"])
+        self._open_native_window("/admin/docs")
 
     def _open_changelog(self, _):
-        changelog_path = os.path.join(ASSISTANT_DIR, "changelog.md")
-        if os.path.exists(changelog_path):
-            subprocess.Popen(["open", changelog_path])
-        else:
-            subprocess.Popen(["open", "http://localhost:8080/admin/changelog"])
+        self._open_native_window("/admin/changelog")
 
     # ── Log-Aktionen ─────────────────────────────────────────────────────────
 
