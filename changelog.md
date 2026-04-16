@@ -6,6 +6,19 @@ Format: [Datum] Änderung | Datei | Grund
 
 ## 2026-04-16
 
+### Feature: Neuer Tab = frische Konversation, die beim ersten Prompt gespeichert wird
+- **Was der Nutzer wollte:** Klick auf "+" (neuer Tab) soll nicht nur das Fenster leeren, sondern eine neue Konversation starten, die **ab dem ersten Prompt** als Datei gespeichert wird — so kann der Nutzer spaeter via History-Sidebar zurueck.
+- **Vorher:** `/select_agent` rief `find_latest_konversation(speicher, agent)` auf und resumierte dieselbe heutige Datei. Zwei Tabs mit demselben Agenten schrieben in **dieselbe** Datei → Nachrichten vermischten sich. Ausserdem wurde die Datei upfront bei Agent-Auswahl erzeugt, auch wenn der Nutzer nie einen Prompt sendete — leere Dateien als Rauschen in der History.
+- **Fix:**
+  - `/select_agent` ruft `find_latest_konversation` nicht mehr auf. Fuer jede neue Session bzw. jeden Agent-Wechsel wird `state['dateiname'] = None` gesetzt (kein Resume, keine leere Datei).
+  - `auto_save_session()` hat einen Lazy-Create-Zweig: wenn `dateiname is None` und Agent+Verlauf vorhanden sind, wird erst jetzt (= beim ersten Prompt) eine Datei angelegt. Timestamp mit Sekunden-Genauigkeit (`%Y-%m-%d_%H-%M-%S`), damit zwei Tabs mit demselben Agenten innerhalb einer Minute nicht denselben Dateinamen bekommen.
+  - `get_history` filtert weiterhin Dateien ≤ 50 Byte heraus (leere Header-Only-Dateien). Durch Lazy-Create entstehen diese aber gar nicht erst.
+  - Fuer das Wiederaufnehmen einer alten Konversation klickt der Nutzer wie gewohnt auf einen History-Eintrag → `loadConversation` → `/load_conversation`.
+- **Konsequenz (bewusst):** Seitenneuladen startet ebenfalls eine frische Konversation (neue Session-ID seit 0fc4104). Wer eine aeltere Konversation fortsetzen will, klickt sie in der History an.
+- **Dateien:** `src/web_server.py` (`select_agent` ~6909-6921, `auto_save_session` ~3032-3060), `tests/run_tests.py`
+- **Tests:** 9 neue Tests in "Neue-Tab-Konversation Lazy-Create 2026-04-16". Suite: 699/699 gruen.
+- **Backups:** `backups/2026-04-16_10-18-43/src/web_server.py`
+
 ### Feat: State-of-the-Art RAG + Auto-getriggerte Agentensuche
 - **Was:** Komplette Ueberarbeitung der Memory-Suche. Auto-Search laeuft jetzt ueber den bestehenden, bisher ungenutzten `hybrid_rag_search` (BM25 + semantic embeddings + RRF-Fusion + optional Query-Expansion + optional Contextual Compression) statt nur ueber das keyword-basierte `HybridSearch`. QueryParser triggert deutlich robuster auf Alltagsfragen, ohne dabei ueber Smalltalk zu stolpern. Global-Search wird automatisch aktiviert, wenn der Nutzer "ueberall"/"extended memory"/"global"/... schreibt. Neu: `global_rag_search` fusioniert den globalen Keyword-Index mit der Union der per-Agent-Embedding-Indexe und liefert cross-agent semantische Treffer ohne separaten Global-Embedding-Store.
 - **Trigger-Verbesserungen (`QueryParser.parse`):**

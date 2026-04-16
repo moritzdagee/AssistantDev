@@ -2613,6 +2613,58 @@ if _se_import_ok:
          'global' in _formatted_g)
 
 
+section("Neue-Tab-Konversation Lazy-Create 2026-04-16")
+
+# Struktur-Tests: web_server.py Source direkt lesen
+_ws_path = os.path.expanduser("~/AssistantDev/src/web_server.py")
+with open(_ws_path, encoding="utf-8") as _fp:
+    _ws_src_full = _fp.read()
+
+# select_agent-Funktion extrahieren
+import re as _re_lz
+_sel_match = _re_lz.search(
+    r"@app\.route\('/select_agent'[^\n]*\ndef select_agent\(\):(.+?)(?=\n@app\.route|\ndef [a-z_]+\()",
+    _ws_src_full, _re_lz.DOTALL)
+_sel_src = _sel_match.group(1) if _sel_match else ""
+
+test("Neue-Tab: select_agent ruft find_latest_konversation NICHT mehr auf",
+     "find_latest_konversation" not in _sel_src)
+
+test("Neue-Tab: select_agent setzt dateiname=None bei neuer Session",
+     "dateiname = None" in _sel_src)
+
+test("Neue-Tab: select_agent legt keine leere Konversationsdatei mehr upfront an",
+     "konversation_' + datum" not in _sel_src)
+
+# auto_save_session-Funktion extrahieren
+_as_match = _re_lz.search(
+    r"def auto_save_session\(session_id\):(.+?)\ndef [a-z_]+\(", _ws_src_full, _re_lz.DOTALL)
+_as_src = _as_match.group(1) if _as_match else ""
+
+test("Neue-Tab: auto_save_session hat Lazy-Create-Zweig",
+     "if not st.get('dateiname')" in _as_src)
+
+test("Neue-Tab: Lazy-Create benutzt Sekunden-Genauigkeit im Timestamp",
+     '"%Y-%m-%d_%H-%M-%S"' in _as_src)
+
+test("Neue-Tab: auto_save verlangt NICHT mehr dateiname vor dem Speichern",
+     "or not st.get('dateiname')" not in _as_src)
+
+# Backend-Smoke: get_history filtert weiterhin leere Dateien
+_gh_match = _re_lz.search(
+    r"@app\.route\('/get_history'[^\n]*\ndef get_history\(\):(.+?)(?=\n@app\.route|\ndef [a-z_]+\()",
+    _ws_src_full, _re_lz.DOTALL)
+_gh_src = _gh_match.group(1) if _gh_match else ""
+test("Neue-Tab: get_history filtert leere Konversationsdateien (fsize <= 50)",
+     "fsize <= 50" in _gh_src)
+
+# Integration: frische Session liefert leere History (kein Pseudo-Agent)
+_new_sid = "lazy-test-" + _uuid.uuid4().hex[:8]
+_gh_r = requests.get(BASE_URL + "/get_history?agent=&session_id=" + _new_sid)
+test("Neue-Tab: /get_history ohne Agent liefert leere Liste",
+     _gh_r.status_code == 200 and _gh_r.json().get("sessions") == [])
+
+
 # ============================================================
 # ERGEBNIS
 # ============================================================

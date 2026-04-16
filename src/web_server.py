@@ -3032,13 +3032,35 @@ def tasks_cleanup(max_age=3600):
 def auto_save_session(session_id):
     """Auto-save the full conversation of a session to its konversation file.
     Overwrites the file with the complete conversation (header + all messages).
-    Silent fail — logs errors but never raises."""
+    Silent fail — logs errors but never raises.
+
+    Neu: Wenn die Session noch keine Konversationsdatei hat (dateiname is None),
+    wird sie hier beim ersten Aufruf angelegt — mit Sekunden-Genauigkeit im
+    Zeitstempel, damit zwei Tabs mit demselben Agenten innerhalb einer Minute
+    nicht dieselbe Datei bekommen. So sieht der Nutzer im History-Sidebar genau
+    dann einen neuen Eintrag, wenn er den ersten Prompt gesendet hat."""
     try:
         if session_id not in sessions:
             return
         st = sessions[session_id]
-        if not st.get('agent') or not st.get('verlauf') or not st.get('dateiname'):
+        if not st.get('agent') or not st.get('verlauf'):
             return
+        # Lazy-Create: Konversationsdatei erst beim ersten Prompt anlegen
+        if not st.get('dateiname'):
+            speicher = st.get('speicher')
+            agent_name = st.get('agent')
+            if not speicher or not agent_name:
+                return
+            os.makedirs(speicher, exist_ok=True)
+            datum = datetime.datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+            parent = get_parent_agent(agent_name)
+            if parent:
+                sub_label = agent_name.split('_', 1)[1]
+                dateiname = os.path.join(speicher, 'konversation_' + datum + '_' + sub_label + '.txt')
+            else:
+                dateiname = os.path.join(speicher, 'konversation_' + datum + '.txt')
+            st['dateiname'] = dateiname
+            print(f'[AUTO-SAVE] Neue Konversation angelegt: {os.path.basename(dateiname)}')
         dateiname = st['dateiname']
         agent = st['agent']
         provider_key = st.get('provider', 'anthropic')
@@ -6910,26 +6932,15 @@ def select_agent():
     if state.get('agent') and state.get('verlauf'):
         auto_save_session(session_id)
 
-    # Try to resume today's latest conversation for the new agent
-    latest_path, latest_verlauf = find_latest_konversation(speicher, name)
-    if latest_path and latest_verlauf:
-        dateiname = latest_path
-        new_verlauf = latest_verlauf
-    else:
-        # Create new conversation file
-        datum = datetime.datetime.now().strftime("%Y-%m-%d_%H-%M")
-        parent = get_parent_agent(name)
-        if parent:
-            sub_label = name.split('_', 1)[1]
-            dateiname = os.path.join(speicher, 'konversation_' + datum + '_' + sub_label + '.txt')
-        else:
-            dateiname = os.path.join(speicher, 'konversation_' + datum + '.txt')
-        new_verlauf = []
-    if not latest_path:
-        tmp_path = dateiname + '.tmp'
-        with open(tmp_path, 'w') as f:
-            f.write('Agent: ' + name + '\nDatum: ' + datetime.datetime.now().strftime("%Y-%m-%d_%H-%M") + '\n\n')
-        os.replace(tmp_path, dateiname)
+    # Neuer Tab / neue Session / Agent-Wechsel: IMMER frische Konversation.
+    # Die Datei wird bewusst noch NICHT angelegt — sie entsteht erst, wenn
+    # der Nutzer den ersten Prompt abschickt (siehe auto_save_session). So
+    # werden leere Konversationsdateien vermieden, die nur Rauschen in der
+    # History-Sidebar erzeugen wuerden.
+    # Fuer das Wiederaufnehmen einer alten Konversation benutzt der Nutzer
+    # die History-Sidebar (onHistoryClick → /load_conversation).
+    dateiname = None
+    new_verlauf = []
 
     # Add file creation capability to system prompt
     file_capability = """
