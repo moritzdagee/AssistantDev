@@ -4577,17 +4577,53 @@ function addMessage(role, text, modelName, providerDisplay, modelDisplay) {
   scrollDown();
 }
 
+// Robuste Copy-Funktion mit Fallback auf document.execCommand('copy').
+// Problem vorher: In pywebview (native macOS-App) ist navigator.clipboard
+// unter Umstaenden undefined — dann wirft navigator.clipboard.writeText
+// synchron eine TypeError und das .catch() wurde nicht erreicht, sodass
+// gar kein Feedback und kein Fallback lief. Jetzt erst Feature-Detection,
+// dann try/catch um beide Pfade, und der execCommand-Rueckgabewert wird
+// geprueft, damit "Kopiert" nur bei echtem Erfolg erscheint.
 function copyToClipboard(text, btn, label) {
-  navigator.clipboard.writeText(text).then(function() {
+  var origLabel = (btn && btn.textContent) || label || 'Kopieren';
+  var effectiveLabel = label || origLabel;
+  function showSuccess() {
+    if (!btn) return;
     btn.textContent = 'Kopiert';
     btn.classList.add('copied');
-    setTimeout(function() { btn.textContent = label; btn.classList.remove('copied'); }, 2000);
-  }).catch(function() {
-    var ta = document.createElement('textarea');
-    ta.value = text; document.body.appendChild(ta); ta.select(); document.execCommand('copy'); document.body.removeChild(ta);
-    btn.textContent = 'Kopiert';
-    setTimeout(function() { btn.textContent = label; }, 2000);
-  });
+    setTimeout(function(){ btn.textContent = effectiveLabel; btn.classList.remove('copied'); }, 2000);
+  }
+  function showFail(err) {
+    if (!btn) return;
+    btn.textContent = 'Fehler';
+    setTimeout(function(){ btn.textContent = effectiveLabel; }, 2000);
+    try { if (window.console && err) console.warn('Clipboard-Fehler:', err); } catch(e) {}
+  }
+  function fallback() {
+    try {
+      var ta = document.createElement('textarea');
+      ta.value = text;
+      ta.setAttribute('readonly', '');
+      ta.style.position = 'fixed';
+      ta.style.top = '0';
+      ta.style.left = '-9999px';
+      ta.style.opacity = '0';
+      document.body.appendChild(ta);
+      ta.focus(); ta.select();
+      ta.setSelectionRange(0, text.length);
+      var ok = false;
+      try { ok = document.execCommand('copy'); } catch(e) { ok = false; }
+      document.body.removeChild(ta);
+      if (ok) showSuccess(); else showFail('execCommand returned false');
+    } catch(e) { showFail(e); }
+  }
+  try {
+    if (navigator && navigator.clipboard && window.isSecureContext && typeof navigator.clipboard.writeText === 'function') {
+      navigator.clipboard.writeText(text).then(showSuccess, fallback);
+    } else {
+      fallback();
+    }
+  } catch(e) { fallback(); }
 }
 
 function addCodeCopyButtons(msgEl) {
@@ -5060,11 +5096,34 @@ document.addEventListener('keydown', function(e) {
 
 function copyLastAssistantMessage() {
   var msgs = document.querySelectorAll('.msg.assistant .bubble');
-  if (msgs.length) {
-    var last = msgs[msgs.length-1];
-    navigator.clipboard.writeText(last.innerText).catch(function(){});
-    addStatusMsg('Letzte Antwort kopiert');
+  if (!msgs.length) return;
+  var last = msgs[msgs.length-1];
+  var text = last.innerText || last.textContent || '';
+  function ok()   { addStatusMsg('Letzte Antwort kopiert'); }
+  function fail() { addStatusMsg('Kopieren fehlgeschlagen'); }
+  function fallback() {
+    try {
+      var ta = document.createElement('textarea');
+      ta.value = text;
+      ta.setAttribute('readonly', '');
+      ta.style.position = 'fixed';
+      ta.style.top = '0';
+      ta.style.left = '-9999px';
+      ta.style.opacity = '0';
+      document.body.appendChild(ta);
+      ta.focus(); ta.select();
+      ta.setSelectionRange(0, text.length);
+      var res = false;
+      try { res = document.execCommand('copy'); } catch(e) { res = false; }
+      document.body.removeChild(ta);
+      if (res) ok(); else fail();
+    } catch(e) { fail(); }
   }
+  try {
+    if (navigator && navigator.clipboard && window.isSecureContext && typeof navigator.clipboard.writeText === 'function') {
+      navigator.clipboard.writeText(text).then(ok, fallback);
+    } else { fallback(); }
+  } catch(e) { fallback(); }
 }
 
 function isFindChipsVisible() {

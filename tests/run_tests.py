@@ -2374,6 +2374,64 @@ test("Session-Isolation: unterschiedliche session_ids liefern eigenen Status",
      and _qs2.json().get("queue_length", 0) == 0)
 
 
+section("Copy-Button Robustheit 2026-04-16")
+
+_copy_html = requests.get(BASE_URL + "/").text
+
+test("Copy-Button: copyToClipboard Funktion definiert",
+     "function copyToClipboard(text, btn, label)" in _copy_html)
+
+test("Copy-Button: Feature-Detection fuer navigator.clipboard",
+     "navigator.clipboard" in _copy_html
+     and "window.isSecureContext" in _copy_html
+     and "typeof navigator.clipboard.writeText === 'function'" in _copy_html)
+
+test("Copy-Button: execCommand-Fallback vorhanden",
+     "document.execCommand('copy')" in _copy_html)
+
+test("Copy-Button: execCommand-Erfolg wird geprueft (nicht blind 'Kopiert')",
+     # Jeder Pfad muss den Rueckgabewert von execCommand auswerten
+     "ok = document.execCommand('copy')" in _copy_html
+     or "res = document.execCommand('copy')" in _copy_html)
+
+test("Copy-Button: Fallback-Textarea nutzt off-screen Positionierung",
+     "position = 'fixed'" in _copy_html
+     and "left = '-9999px'" in _copy_html)
+
+test("Copy-Button: showFail() Feedback-Helper vorhanden",
+     "function showFail(" in _copy_html)
+
+test("Copy-Button: synchrone TypeError beim clipboard-Zugriff abgefangen",
+     # Äusseres try/catch muss vorhanden sein (nicht nur .catch() der Promise)
+     "try {\n    if (navigator && navigator.clipboard" in _copy_html
+     or "try {\n    if (navigator && navigator.clipboard && window.isSecureContext" in _copy_html)
+
+test("Copy-Button: copyLastAssistantMessage hat Fallback",
+     "function copyLastAssistantMessage()" in _copy_html
+     and _copy_html.count("function fallback()") >= 2)
+
+test("Copy-Button: copyLastAssistantMessage nutzt innerText (Plain Text)",
+     "last.innerText || last.textContent" in _copy_html)
+
+test("Copy-Button: copyLastAssistantMessage meldet Fehler bei misslungenem Copy",
+     "Kopieren fehlgeschlagen" in _copy_html)
+
+test("Copy-Button: addCodeCopyButtons verwendet copyToClipboard",
+     "addCodeCopyButtons" in _copy_html
+     and "copyToClipboard(code, btn, 'Kopieren')" in _copy_html)
+
+test("Copy-Button: addCopyButton verwendet copyToClipboard fuer Output-Block",
+     "copyToClipboard(outputText, obtn" in _copy_html)
+
+test("Copy-Button: addSectionCopyButtons verwendet copyToClipboard",
+     "copyToClipboard(rt, b, '\u2193 Kopieren')" in _copy_html)
+
+test("Copy-Button: jeder writeText-Aufruf ist durch Feature-Detection geschuetzt",
+     # Zaehle Aufrufe (nicht Type-Checks). Pattern: writeText(  — gefolgt von Variable.
+     _copy_html.count("navigator.clipboard.writeText(text)") == 2
+     and _copy_html.count("typeof navigator.clipboard.writeText === 'function'") == 2)
+
+
 # ============================================================
 # ERGEBNIS
 # ============================================================

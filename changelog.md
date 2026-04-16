@@ -6,6 +6,12 @@ Format: [Datum] Änderung | Datei | Grund
 
 ## 2026-04-16
 
+### Fix: Copy-Button robust gegen fehlende Clipboard-API (pywebview)
+- **Problem:** In der nativen pywebview-App war `navigator.clipboard` unter Umstaenden `undefined`. `navigator.clipboard.writeText(...)` warf dann synchron einen `TypeError`, der vom angehaengten `.catch()` NICHT erfasst wurde — der Fallback auf `document.execCommand('copy')` lief also nie, und der Nutzer bekam kein Feedback. Zusaetzlich setzte der Fallback blind `btn.textContent = 'Kopiert'`, ohne den Rueckgabewert von `execCommand` zu pruefen.
+- **Fix:** Feature-Detection (`navigator.clipboard && window.isSecureContext && typeof navigator.clipboard.writeText === 'function'`) vor dem Aufruf; aeusseres `try/catch` um den gesamten Clipboard-Block (faengt synchrone Throws). Fallback-Textarea wird off-screen platziert, `execCommand('copy')`-Rueckgabewert wird ausgewertet — nur bei echtem Erfolg "Kopiert", sonst "Fehler". Gleicher Fix in `copyLastAssistantMessage()` (Ctrl+C Shortcut), die zusaetzlich `innerText || textContent` nutzt (Plain Text, kein HTML).
+- **Dateien:** `src/web_server.py` (Zeilen ~4580-4635 `copyToClipboard`, ~5061-5092 `copyLastAssistantMessage`), `tests/run_tests.py`
+- **Tests:** 14 neue Tests in "Copy-Button Robustheit 2026-04-16". Suite: 637/637 gruen.
+
 ### Fix: Session-State Isolation — Processing/Stop/Queue jetzt pro Tab
 - **Was:** Processing-State (isProcessing, aktueller Prompt, Stop-Button, Queue-Laenge, Polling, Typing-Indicator) war global im Frontend und leckte zwischen Tabs. Tab 2 sah den "Verarbeite…"-Text von Tab 1 sobald er aktiv wurde; Stop in Tab 1 stoppte ungewollt auch Tab 2; Polling benutzte die globale Variable `SESSION_ID`, die sich beim Tab-Switch ueberschrieb.
 - **Ursache:** `pollInterval`, `typingInterval`, `queuedPlaceholders` waren globale JS-Variablen in `web_server.py`. Alle DOM-Updates (typing-indicator, stop-btn, queue-display) wurden ohne Session-Bindung geschrieben.
