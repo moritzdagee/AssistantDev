@@ -6,6 +6,11 @@ Format: [Datum] Änderung | Datei | Grund
 
 ## 2026-04-15
 
+### Fix: Provider-Parsing-Bug — CREATE_DOCX/CREATE_FILE wurde als Provider-Name interpretiert
+- **Problem:** Beim Laden gespeicherter Konversationen iterierte der Provider-Parser ueber ALLE Zeilen und nahm den letzten `[.../...]`-Match. Wenn eine Assistant-Antwort `[CREATE_FILE:docx:{...}]` oder `[KONTEXT_DATEIEN:[{...}]]` enthielt, wurde das als Provider gematcht → Crash: "Unbekannter Anbieter: CREATE_DOCX:{...}".
+- **Fix:** `VALID_PROVIDERS` Konstante eingefuehrt. Provider-Parser validiert gegen Whitelist. `/select_model` und `select_agent` pruefen ebenfalls.
+- **Dateien:** `src/web_server.py`
+
 ### Feature: Access Control Matrix-UI
 - **Was:** Access Control Seite (`/admin/access-control`) von Checkbox-Karten-Liste zu einer Agenten x Datenquellen Matrix umgebaut. Drei Sektionen: Eigenes Memory, Shared Memory (webclips, email_inbox, calendar), Cross-Agent Read. Jede Zelle ist eine Checkbox. Badges zeigen pro Datenquelle ob Zugriff exklusiv oder geteilt ist. Sticky Header und erste Spalte fuer horizontales/vertikales Scrollen. Agent-Namen 45-Grad-rotiert im Tabellenkopf.
 - **Warum:** Alte UI war unuebersichtlich und zeigte nicht auf einen Blick wer auf welche Daten Zugriff hat. Matrix-Darstellung macht Zugriffsrechte sofort sichtbar.
