@@ -14,6 +14,8 @@ try:
 except ImportError:
     pass
 
+VALID_PROVIDERS = {'anthropic', 'openai', 'mistral', 'gemini', 'perplexity'}
+
 PENDING_MARKER = '[ANTWORT AUSSTEHEND - Server-Neustart hat diese Antwort unterbrochen]'
 RECOVERY_MARKER = '[Antwort verloren - Server wurde neu gestartet]'
 
@@ -6544,7 +6546,7 @@ WICHTIG: Slack-Nachrichten werden NIEMALS automatisch gesendet. Die App wird geo
         'verlauf': new_verlauf, 'dateiname': dateiname, 'kontext_items': [], 'session_files': []
     }
     # Set provider/model from saved preference (if available)
-    if pref_provider:
+    if pref_provider and pref_provider in VALID_PROVIDERS:
         update_dict['provider'] = pref_provider
     if pref_model:
         update_dict['model_id'] = pref_model
@@ -7009,8 +7011,8 @@ def load_conversation():
         conv_model_id = None
         import re as _re
         for line in raw.split('\n'):
-            pm = _re.match(r'\[([^/]+)/([^\]]+)\]', line.strip())
-            if pm:
+            pm = _re.match(r'\[([^/]+)/([^\]]+)\]$', line.strip())
+            if pm and pm.group(1) in VALID_PROVIDERS:
                 conv_provider = pm.group(1)
                 conv_model_id = pm.group(2)
         # Set on session state if resuming
@@ -7559,7 +7561,10 @@ def download_file():
 def select_model():
     session_id = request.json.get('session_id', 'default')
     state = get_session(session_id)
-    state['provider'] = request.json['provider']
+    new_provider = request.json['provider']
+    if new_provider not in VALID_PROVIDERS:
+        return jsonify({'ok': False, 'error': 'Ungueltiger Provider: ' + str(new_provider)})
+    state['provider'] = new_provider
     state['model_id'] = request.json['model_id']
     return jsonify({'ok': True})
 
