@@ -6814,7 +6814,8 @@ var SHARED_SOURCES = [
   {key:'webclips',       icon:'&#127760;', label:'Webclips'},
   {key:'email_inbox',    icon:'&#9993;',   label:'E-Mail Inbox'},
   {key:'calendar',       icon:'&#128197;', label:'Kalender'},
-  {key:'working_memory', icon:'&#129504;', label:'Working Memory'}
+  {key:'working_memory', icon:'&#129504;', label:'Working Memory'},
+  {key:'whatsapp',       icon:'&#128172;', label:'WhatsApp Chats'}
 ];
 
 function escH(s){ return String(s||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;'); }
@@ -10086,6 +10087,7 @@ def admin_permissions():
         ("email_inbox", "E-Mail Inbox", os.path.join(BASE, "email_inbox")),
         ("webclips", "Webclips", os.path.join(BASE, "webclips")),
         ("calendar", "Kalender", os.path.join(BASE, "calendar")),
+        ("whatsapp (privat)", "WhatsApp Chats", os.path.join(BASE, "privat", "memory", "whatsapp")),
     ]
     shared_html = "<h2>Shared Data Sources</h2><table><tr><th>Quelle</th><th>Pfad</th><th>Status</th></tr>"
     for sid, slabel, spath in shared_sources:
