@@ -2238,6 +2238,35 @@ test("Permissions: Kalender in Shared Sources",
      "Kalender" in _perm2)
 
 
+section("WhatsApp periodischer Import 2026-04-15")
+
+_svc3 = requests.get(BASE_URL + "/api/services").json()
+_svc3_ids = [s['id'] for s in _svc3.get('services', [])]
+
+test("/api/services liefert whatsapp_import",
+     "whatsapp_import" in _svc3_ids)
+
+_wa_svc = next((s for s in _svc3.get('services', []) if s['id'] == 'whatsapp_import'), {})
+test("WhatsApp Import hat last_run Feld",
+     "last_run" in _wa_svc)
+
+test("WhatsApp Import hat periodic Feld (20min)",
+     _wa_svc.get("periodic") == "20min")
+
+test("WhatsApp Import ist in web_server.py als Service definiert",
+     "whatsapp_import" in _ws_src)
+
+# LaunchAgent existiert
+_wa_plist = os.path.expanduser("~/Library/LaunchAgents/com.assistantdev.whatsapp-import.plist")
+test("WhatsApp Import LaunchAgent plist existiert",
+     os.path.exists(_wa_plist))
+
+# Access Control: WhatsApp als Shared Source
+_ac3 = requests.get(BASE_URL + "/admin/access-control").text
+test("Access Control: WhatsApp Chats in SHARED_SOURCES",
+     "whatsapp" in _ac3 and "WhatsApp" in _ac3)
+
+
 # ============================================================
 # ERGEBNIS
 # ============================================================

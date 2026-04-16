@@ -4200,11 +4200,15 @@ async function loadServices() {
       var dot = s.online ? 'online' : 'offline';
       var label = s.online ? 'online' : 'offline';
       var port = s.port ? ' :' + s.port : '';
-      h += '<div class="svc-row">';
+      var extra = '';
+      if (s.last_run) extra = '<span style="font-size:9px;color:#666;display:block;">Letzter Lauf: ' + s.last_run + '</span>';
+      if (s.periodic) label = (s.online ? 'aktiv' : 'inaktiv') + ' (' + s.periodic + ')';
+      h += '<div class="svc-row" style="flex-wrap:wrap;">';
       h += '<span class="svc-dot ' + dot + '"></span>';
       h += '<span class="svc-name">' + s.name + port + '</span>';
       h += '<span style="font-size:10px;color:' + (s.online ? '#4ade80' : '#f87171') + ';">' + label + '</span>';
       h += '<button class="svc-restart" onclick="restartService(\\''+s.id+'\\')">&#x21bb;</button>';
+      if (extra) h += extra;
       h += '</div>';
     });
     el.innerHTML = h;
@@ -9763,7 +9767,21 @@ def _admin_status_check():
         return False
     watcher_ok = proc_alive("email_watcher.py", "AssistantDev EmailWatcher")
     kchat_ok = proc_alive("kchat_watcher.py")
-    return {"web_8080": web_ok, "clipper_8081": clip_ok, "email_watcher": watcher_ok, "kchat_watcher": kchat_ok}
+    # WhatsApp Import: check last run from log file mtime
+    wa_log = os.path.join(os.path.expanduser("~"), "AssistantDev", "logs", "whatsapp_import.log")
+    wa_last_run = None
+    wa_ok = False
+    try:
+        if os.path.exists(wa_log) and os.path.getsize(wa_log) > 0:
+            mtime = os.path.getmtime(wa_log)
+            import datetime as _dt
+            wa_last_run = _dt.datetime.fromtimestamp(mtime).strftime('%d.%m.%Y %H:%M')
+            # Consider "ok" if last run was within 25 minutes (interval is 20 min)
+            import time as _tm
+            wa_ok = (_tm.time() - mtime) < 1500
+    except Exception:
+        pass
+    return {"web_8080": web_ok, "clipper_8081": clip_ok, "email_watcher": watcher_ok, "kchat_watcher": kchat_ok, "whatsapp_import": wa_ok, "whatsapp_last_run": wa_last_run}
 
 
 @app.route('/api/services', methods=['GET'])
@@ -9771,10 +9789,11 @@ def api_services_status():
     """Returns status of all services as JSON."""
     st = _admin_status_check()
     services = [
-        {"id": "web_server",     "name": "Web Server",     "port": 8080, "online": st["web_8080"]},
-        {"id": "web_clipper",    "name": "Web Clipper",     "port": 8081, "online": st["clipper_8081"]},
-        {"id": "email_watcher",  "name": "Email Watcher",   "port": None, "online": st["email_watcher"]},
-        {"id": "kchat_watcher",  "name": "kChat Watcher",   "port": None, "online": st["kchat_watcher"]},
+        {"id": "web_server",      "name": "Web Server",      "port": 8080, "online": st["web_8080"]},
+        {"id": "web_clipper",     "name": "Web Clipper",      "port": 8081, "online": st["clipper_8081"]},
+        {"id": "email_watcher",   "name": "Email Watcher",    "port": None, "online": st["email_watcher"]},
+        {"id": "kchat_watcher",   "name": "kChat Watcher",    "port": None, "online": st["kchat_watcher"]},
+        {"id": "whatsapp_import", "name": "WhatsApp Import",  "port": None, "online": st["whatsapp_import"], "last_run": st.get("whatsapp_last_run"), "periodic": "20min"},
     ]
     return jsonify({"services": services})
 
@@ -9785,6 +9804,15 @@ def api_services_restart():
     import subprocess as _sp
     data = request.get_json(silent=True)
     service_id = (data or {}).get('service')
+    # WhatsApp Import: trigger manually (not a daemon — runs once then exits)
+    if service_id == 'whatsapp_import':
+        script = os.path.join(os.path.expanduser("~"), "AssistantDev", "scripts", "whatsapp_db_import.py")
+        log_path = os.path.join(os.path.expanduser("~"), "AssistantDev", "logs", "whatsapp_import.log")
+        os.makedirs(os.path.dirname(log_path), exist_ok=True)
+        lf = open(log_path, "a")
+        _sp.Popen([sys.executable, script, "--agent", "privat", "--min-messages", "3"],
+                   stdout=lf, stderr=_sp.STDOUT, cwd=os.path.join(os.path.expanduser("~"), "AssistantDev"))
+        return jsonify({"ok": True, "restarted": "whatsapp_import", "note": "Import gestartet"})
     RESTART_MAP = {
         "web_server":    ("web_server.py", "AssistantDev WebServer"),
         "web_clipper":   ("web_clipper_server.py",),

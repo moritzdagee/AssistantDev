@@ -6,6 +6,14 @@ Format: [Datum] Änderung | Datei | Grund
 
 ## 2026-04-15
 
+### Feature: WhatsApp periodischer Import + Service-Dashboard Integration
+- **LaunchAgent:** `com.assistantdev.whatsapp-import` — fuehrt `scripts/whatsapp_db_import.py --agent privat` alle 20 Minuten aus. Liest direkt aus der WhatsApp Mac App SQLite-DB (read-only Kopie).
+- **Service-Dashboard:** WhatsApp Import als fuenfter Service im Hamburger-Menue. Zeigt "aktiv/inaktiv (20min)" + Zeitstempel des letzten Laufs. Restart-Button triggert manuellen Import.
+- **Access Control Matrix:** WhatsApp Chats als fuenfte Shared-Datenquelle hinzugefuegt.
+- **Docs-ZIP:** `claude_outputs/AssistantDev_Docs_2026-04-15.zip` mit allen 5 Docs + Changelog + CLAUDE.md (97 KB).
+- **Tests:** 6 neue Tests. Suite: 593/593 gruen.
+- **Pfade:** LaunchAgent: `~/Library/LaunchAgents/com.assistantdev.whatsapp-import.plist`, Log: `logs/whatsapp_import.log`
+
 ### Feature: Permissions-Seite mit Working Memory + Shared Data Sources + Memory-Files
 - **Working Memory Spalte:** Permissions-Seite zeigt jetzt pro Agent den Working Memory Pfad, ob er existiert und wie viele Dateien drin sind. Sub-Agents bekommen ihren isolierten Pfad (`working_memory/_<subname>/`).
 - **Shared Data Sources Sektion:** Neue Tabelle mit E-Mail Inbox, Webclips und Kalender — zeigt Pfad und Datei-Anzahl.
