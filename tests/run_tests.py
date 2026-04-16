@@ -2666,6 +2666,349 @@ test("Neue-Tab: /get_history ohne Agent liefert leere Liste",
 
 
 # ============================================================
+# Recency + Konversationelle Personen-Suche (Bug Fix 2026-04-16)
+# ============================================================
+section("Recency + Konversationelle Personen-Suche 2026-04-16")
+
+try:
+    import search_engine as _rec_se
+    _QP = _rec_se.QueryParser
+
+    # 1) Helper: extract_date_from_name
+    test("Recency: extract_date_from_name() existiert",
+         hasattr(_rec_se, 'extract_date_from_name'))
+    if hasattr(_rec_se, 'extract_date_from_name'):
+        _ed = _rec_se.extract_date_from_name
+        test("Recency: extract_date erkennt v2-Schema",
+             _ed('2026-04-14_12-50-42_IN_x_at_y_subject.txt')
+             == '2026-04-14T12-50-42')
+        test("Recency: extract_date erkennt YYYY-MM-DD ohne Uhrzeit",
+             _ed('2026-04-14_subject.txt').startswith('2026-04-14T'))
+        test("Recency: extract_date erkennt email_-Prefix",
+             _ed('email_2026-04-06_16-02-57_unread.txt')
+             == '2026-04-06T16-02-57')
+        test("Recency: extract_date returns '' bei Datums-freiem Namen",
+             _ed('attachments/Rechnung.pdf') == '')
+        # Sortierbarkeit: jüngste > ältere
+        _a = _ed('2026-04-14_12-50-42_x.txt')
+        _b = _ed('2026-03-24_09-00-27_x.txt')
+        test("Recency: Datum-Strings sind monoton sortierbar",
+             _a > _b)
+
+    # 2) QueryIntent.recency_first Feld existiert
+    _i = _QP.parse('test')
+    test("QueryParser: QueryIntent.recency_first vorhanden",
+         hasattr(_i, 'recency_first'))
+
+    # 3) Konversationelle Personen-Phrasen lösen Suche aus + recency_first
+    _conversational_cases = [
+        "Hat sich Fabian Adam gemeldet?",
+        "Meldet sich Sebastian noch?",
+        "News von Fabian Adam",
+        "Update zu Signicat",
+        "gibts was neues von Fabian?",
+        "Was macht Fabian Adam?",
+        "Has Fabian replied?",
+        "Heard from Sebastian",
+        "Any news from Thomas?",
+    ]
+    for _q in _conversational_cases:
+        _it = _QP.parse(_q)
+        test(f"Konversationell: is_search=True ({_q!r})",
+             _it.is_search == True)
+        test(f"Konversationell: recency_first=True ({_q!r})",
+             _it.recency_first == True)
+
+    # 4) Personen-Only-Query bekommt recency_first
+    _person_only = _QP.parse("Fabian Adam")
+    test("PersonenOnly: 'Fabian Adam' wird als Suche erkannt",
+         _person_only.is_search == True)
+    test("PersonenOnly: 'Fabian Adam' setzt recency_first",
+         _person_only.recency_first == True)
+
+    # 5) Explizite Recency-Trigger ('letzte', 'neueste', 'latest', 'last')
+    for _q in ['Letzte E-Mail von Fabian',
+               'Neueste Nachricht von Sebastian',
+               'Latest mail from Fabian',
+               'Last email from Sebastian']:
+        _it = _QP.parse(_q)
+        test(f"RecencyTrigger setzt recency_first ({_q!r})",
+             _it.recency_first == True)
+
+    # 6) Konversationelle Greetings/Meta lösen KEINE Suche aus
+    for _q in ['Hallo', 'Hi', 'Danke', 'wer bist du', 'help']:
+        _it = _QP.parse(_q)
+        test(f"NoSearch fuer Conversational ({_q!r})",
+             _it.is_search == False)
+
+    # 7) Frage-ohne-Recency bleibt Score-First (kein recency_first)
+    _it_was = _QP.parse('Was schrieb Fabian Adam?')
+    test("Frage ohne Recency: 'Was schrieb…' bleibt is_search=True",
+         _it_was.is_search == True)
+    test("Frage ohne Recency: 'Was schrieb…' recency_first=False",
+         _it_was.recency_first == False)
+    _it_top = _QP.parse('ExFlow Rechnung')
+    test("TopicQuery: 'ExFlow Rechnung' is_search=True, recency=False",
+         _it_top.is_search == True and _it_top.recency_first == False)
+
+    # 8) E-Mail-Person-Query setzt recency_first (Person-Only kickt rein)
+    _it_em = _QP.parse('E-Mails von Fabian')
+    test("EmailQuery: 'E-Mails von Fabian' bekommt recency_first",
+         _it_em.recency_first == True)
+
+    # 9) HybridSearch.search akzeptiert recency_first Parameter
+    import inspect as _insp
+    _sig = _insp.signature(_rec_se.HybridSearch.search)
+    test("HybridSearch.search: recency_first Parameter vorhanden",
+         'recency_first' in _sig.parameters)
+
+    # 10) hybrid_rag_search akzeptiert recency_first Parameter
+    _sig2 = _insp.signature(_rec_se.hybrid_rag_search)
+    test("hybrid_rag_search: recency_first Parameter vorhanden",
+         'recency_first' in _sig2.parameters)
+
+    # 11) auto_search liefert recency_first im feedback (smoke gegen real index)
+    import os as _os_rec
+    _sp = _os_rec.path.expanduser(
+        "~/Library/Mobile Documents/com~apple~CloudDocs/Downloads shared/"
+        "claude_datalake/signicat")
+    if _os_rec.path.exists(_os_rec.path.join(_sp, '.search_index.json')):
+        _r1, _fb1 = _rec_se.auto_search('Fabian Adam', _sp)
+        test("auto_search liefert recency_first im feedback dict",
+             _fb1 is not None and 'recency_first' in _fb1)
+        # Recency-Verhalten: jüngste Fabian-Mail muss vor älterer kommen
+        if _r1 and _fb1.get('recency_first'):
+            _fab_dates = [
+                _rec_se.extract_date_from_name(r['name']) for r in _r1
+                if 'fabian_adam' in r['name'].lower()
+            ]
+            if len(_fab_dates) >= 2:
+                test("Recency: 1. Fabian-Treffer juenger als 2. Fabian-Treffer",
+                     _fab_dates[0] > _fab_dates[1])
+
+    # 12) ExFlow Rechnung Regression-Test (force_search-Pfad muss intakt sein)
+    if _os_rec.path.exists(_os_rec.path.join(_sp, '.search_index.json')):
+        _re_results, _re_fb = _rec_se.auto_search('ExFlow Rechnung', _sp)
+        test("Regression: 'ExFlow Rechnung' liefert mind. 1 Treffer",
+             _re_fb is not None and len(_re_results) >= 1)
+
+    # 13) Konversationelle Phrasen-Liste enthaelt Schluesselwoerter
+    test("Konversationell: 'hat sich gemeldet' in QUESTION_INTENT_PHRASES",
+         'hat sich gemeldet' in getattr(_rec_se, 'QUESTION_INTENT_PHRASES', []))
+    test("Konversationell: 'news von' in QUESTION_INTENT_PHRASES",
+         'news von' in getattr(_rec_se, 'QUESTION_INTENT_PHRASES', []))
+    test("Konversationell: REGEX-Liste exportiert",
+         hasattr(_rec_se, 'QUESTION_INTENT_REGEXES'))
+    test("Recency: RECENCY_TRIGGER_PHRASES exportiert + 'letzte' enthalten",
+         hasattr(_rec_se, 'RECENCY_TRIGGER_PHRASES')
+         and 'letzte' in _rec_se.RECENCY_TRIGGER_PHRASES)
+
+except Exception as _ex_rec:
+    test("Recency + Konversationelle Suche", False, str(_ex_rec))
+
+
+# ============================================================
+# Email-Watcher-Härtung (Bug Fix 2026-04-16)
+# ============================================================
+section("Email-Watcher-Haertung 2026-04-16")
+
+_ew_path = os.path.expanduser("~/AssistantDev/src/email_watcher.py")
+with open(_ew_path, encoding="utf-8") as _ew_fp:
+    _ew_src = _ew_fp.read()
+
+test("EmailWatcher: POLL_INTERVAL_SEC Konstante definiert",
+     "POLL_INTERVAL_SEC" in _ew_src)
+test("EmailWatcher: Polling-Intervall <= 5s",
+     "POLL_INTERVAL_SEC = 2" in _ew_src
+     or "POLL_INTERVAL_SEC = 3" in _ew_src
+     or "POLL_INTERVAL_SEC = 1" in _ew_src)
+test("EmailWatcher: force_apple_mail_sync() existiert",
+     "def force_apple_mail_sync" in _ew_src)
+test("EmailWatcher: Force-Sync verwendet osascript 'check for new mail'",
+     "check for new mail" in _ew_src)
+test("EmailWatcher: _trigger_index_update_for() existiert",
+     "_trigger_index_update_for" in _ew_src)
+test("EmailWatcher: Index-Update nach process_eml aufgerufen",
+     "_trigger_index_update_for(memory_dir, email_filename)" in _ew_src)
+test("EmailWatcher: Force-Sync periodisch (FORCE_SYNC_EVERY)",
+     "FORCE_SYNC_EVERY" in _ew_src)
+
+# Compiled binary deployed?
+_app_bin = os.path.expanduser("~/Applications/EmailWatcher.app/Contents/MacOS/EmailWatcher")
+if os.path.exists(_app_bin) and os.path.exists(_ew_path):
+    _src_mtime = os.path.getmtime(_ew_path)
+    _bin_mtime = os.path.getmtime(_app_bin)
+    test("EmailWatcher: Deployed binary nicht aelter als Source (-60s)",
+         _bin_mtime >= _src_mtime - 60)
+
+
+# ============================================================
+
+section("Message Dashboard Kanban 2026-04-16")
+
+# Backend: Routen existieren in der Source
+test("Message Dashboard: /messages Route in web_server.py",
+     "@app.route(\"/messages\")" in _ws_src or "@app.route('/messages')" in _ws_src)
+test("Message Dashboard: /api/messages/sources Route",
+     "@app.route(\"/api/messages/sources\")" in _ws_src)
+test("Message Dashboard: /api/messages Route",
+     "@app.route(\"/api/messages\")" in _ws_src)
+test("Message Dashboard: /api/messages/<msg_id> Route",
+     "@app.route(\"/api/messages/<msg_id>\")" in _ws_src)
+test("Message Dashboard: /api/messages/mark-read Route",
+     "@app.route(\"/api/messages/mark-read\"" in _ws_src)
+
+# Source config + Parser-Helper
+test("Message Dashboard: _MSG_SOURCES definiert",
+     "_MSG_SOURCES = [" in _ws_src)
+test("Message Dashboard: _MSG_SOURCE_TO_AGENT Mapping",
+     "_MSG_SOURCE_TO_AGENT" in _ws_src and "signicat" in _ws_src)
+test("Message Dashboard: email-Parser Funktion",
+     "def _msg_normalize_email_content" in _ws_src)
+test("Message Dashboard: whatsapp-Parser Funktion",
+     "def _msg_normalize_whatsapp_file" in _ws_src)
+test("Message Dashboard: chat-Parser Funktion",
+     "def _msg_normalize_chat_file" in _ws_src)
+test("Message Dashboard: In-Memory Cache mit TTL",
+     "_MSG_CACHE_TTL_SECONDS" in _ws_src and "_MSG_CACHE" in _ws_src)
+test("Message Dashboard: State-File Pfad definiert",
+     "_MSG_STATE_FILE" in _ws_src and ".message_dashboard_state.json" in _ws_src)
+test("Message Dashboard: OUT-Richtung wird gefiltert",
+     'direction == "OUT"' in _ws_src)
+test("Message Dashboard: Eigene E-Mails werden gefiltert",
+     "_MSG_OWN_EMAILS" in _ws_src)
+test("Message Dashboard: 90-Tage Window",
+     "_MSG_INBOX_WINDOW_DAYS = 90" in _ws_src)
+
+# HTTP Sanity-Checks gegen laufenden Server
+try:
+    _msg_src_resp = requests.get(BASE_URL + "/api/messages/sources", timeout=15)
+    test("GET /api/messages/sources antwortet mit 200",
+         _msg_src_resp.status_code == 200)
+    _msg_src_json = _msg_src_resp.json()
+    test("/api/messages/sources liefert ok=True",
+         _msg_src_json.get("ok") is True)
+    _src_keys = [s.get("key") for s in _msg_src_json.get("sources", [])]
+    test("/api/messages/sources enthaelt email_signicat",
+         "email_signicat" in _src_keys)
+    test("/api/messages/sources enthaelt email_privat",
+         "email_privat" in _src_keys)
+    test("/api/messages/sources enthaelt whatsapp",
+         "whatsapp" in _src_keys)
+    test("/api/messages/sources enthaelt chat",
+         "chat" in _src_keys)
+    test("/api/messages/sources liefert recommended_agent",
+         all("recommended_agent" in s for s in _msg_src_json.get("sources", [])))
+    test("/api/messages/sources liefert count + unread Felder",
+         all("count" in s and "unread" in s for s in _msg_src_json.get("sources", [])))
+except Exception as e:
+    test("GET /api/messages/sources HTTP-Aufruf", False)
+
+try:
+    _msg_resp = requests.get(BASE_URL + "/api/messages?limit=5", timeout=15)
+    test("GET /api/messages antwortet mit 200",
+         _msg_resp.status_code == 200)
+    _msg_json = _msg_resp.json()
+    test("/api/messages liefert ok=True",
+         _msg_json.get("ok") is True)
+    _ms = _msg_json.get("messages", [])
+    test("/api/messages liefert messages-Array (kann leer sein)",
+         isinstance(_ms, list))
+    if _ms:
+        _first = _ms[0]
+        test("/api/messages Item hat id/source/sender_name/subject/timestamp",
+             all(k in _first for k in ["id", "source", "sender_name", "subject", "timestamp"]))
+        test("/api/messages Item hat read-Flag",
+             "read" in _first)
+        test("/api/messages Item hat timestamp_epoch (float)",
+             isinstance(_first.get("timestamp_epoch"), (int, float)))
+        # Detail-Route
+        _mid = _first["id"]
+        _dresp = requests.get(BASE_URL + "/api/messages/" + _mid, timeout=15)
+        test("GET /api/messages/<id> antwortet mit 200",
+             _dresp.status_code == 200)
+        _djson = _dresp.json()
+        test("/api/messages/<id> liefert message-Objekt",
+             _djson.get("ok") is True and isinstance(_djson.get("message"), dict))
+        test("/api/messages/<id> laedt full_content nach",
+             len(_djson.get("message", {}).get("full_content", "") or "") > 0)
+        # Mark-Read Toggle
+        _mr1 = requests.post(BASE_URL + "/api/messages/mark-read",
+                             json={"message_id": _mid, "read": True}, timeout=10)
+        test("POST /api/messages/mark-read read=True antwortet mit 200",
+             _mr1.status_code == 200 and _mr1.json().get("ok") is True)
+        _mr2 = requests.post(BASE_URL + "/api/messages/mark-read",
+                             json={"message_id": _mid, "read": False}, timeout=10)
+        test("POST /api/messages/mark-read read=False antwortet mit 200",
+             _mr2.status_code == 200 and _mr2.json().get("ok") is True)
+        _mr3 = requests.post(BASE_URL + "/api/messages/mark-read",
+                             json={}, timeout=10)
+        test("POST /api/messages/mark-read ohne message_id gibt 400",
+             _mr3.status_code == 400)
+    _msg_src_filter = requests.get(BASE_URL + "/api/messages?source=email_signicat&limit=3", timeout=15)
+    _mf_json = _msg_src_filter.json()
+    test("/api/messages?source=email_signicat filtert korrekt",
+         all(m.get("source") == "email_signicat" for m in _mf_json.get("messages", [])))
+except Exception as e:
+    test("GET /api/messages HTTP-Aufruf", False)
+
+try:
+    _dash_resp = requests.get(BASE_URL + "/messages", timeout=10)
+    _dash_html = _dash_resp.text
+    test("GET /messages antwortet mit 200",
+         _dash_resp.status_code == 200)
+    test("Dashboard HTML enthaelt Kanban-Board Container",
+         'id="md-board"' in _dash_html)
+    test("Dashboard HTML enthaelt globale Suche",
+         'id="md-search"' in _dash_html)
+    test("Dashboard HTML enthaelt Refresh-Button",
+         'id="md-btn-refresh"' in _dash_html)
+    test("Dashboard HTML enthaelt Agent-Auswahl-Modal",
+         'id="md-agent-modal"' in _dash_html and 'id="md-agent-list"' in _dash_html)
+    test("Dashboard HTML: keine unaufgeloesten \\U-Escapes",
+         "\\U0001F4" not in _dash_html)
+    test("Dashboard HTML: openAgentModal Funktion definiert",
+         "function openAgentModal" in _dash_html)
+    test("Dashboard HTML: openChatWithMessage Funktion definiert",
+         "function openChatWithMessage" in _dash_html)
+    test("Dashboard HTML: auto-refresh via setInterval",
+         "setInterval(softRefresh" in _dash_html)
+    test("Dashboard HTML: Sort unread-first implementiert",
+         "a.timestamp_epoch - b.timestamp_epoch" in _dash_html)
+except Exception as e:
+    test("GET /messages HTTP-Aufruf", False)
+
+# Preload-Mechanismus im Haupt-Chat
+_main_html = requests.get(BASE_URL + "/").text
+test("Main HTML: handlePreloadMessage Funktion vorhanden",
+     "function handlePreloadMessage" in _main_html or "async function handlePreloadMessage" in _main_html)
+test("Main HTML: URLSearchParams Handling in window.onload",
+     "URLSearchParams(window.location.search)" in _main_html)
+test("Main HTML: preload_message Parameter wird gelesen",
+     "preload_message" in _main_html)
+test("Main HTML: agent Parameter wird gelesen",
+     "urlParams.get('agent')" in _main_html)
+test("Main HTML: preload Banner wird eingefuegt",
+     "preload-banner" in _main_html or "Antwort auf eingehende Nachricht" in _main_html)
+
+# app.py Menu-Eintrag
+_app_src = open(os.path.expanduser("~/AssistantDev/src/app.py")).read()
+test("app.py: Messages-Menueintrag vorhanden",
+     "Messages" in _app_src and "_open_messages" in _app_src)
+test("app.py: _open_messages oeffnet /messages",
+     '_open_native_window("/messages")' in _app_src)
+
+# dashboard_window.py: Title-Map
+_dw_src = open(os.path.expanduser("~/AssistantDev/src/dashboard_window.py")).read()
+test("dashboard_window.py: /messages in TITLE_MAP",
+     '"/messages"' in _dw_src)
+
+# /open_in_finder erweitert um path-Parameter
+test("/open_in_finder akzeptiert direct_path (Datalake-sicher)",
+     "direct_path" in _ws_src and "startswith(real_base" in _ws_src)
+
+
+# ============================================================
 # ERGEBNIS
 # ============================================================
 total = len(passed) + len(failed)

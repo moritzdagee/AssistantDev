@@ -6672,8 +6672,72 @@ document.addEventListener('drop', async e => {
   }
 });
 
+function mdEscHtml(s){
+  if (s === null || s === undefined) return '';
+  return String(s).replace(/[&<>"']/g, function(c){
+    return ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'})[c];
+  });
+}
+async function handlePreloadMessage(msgId){
+  try {
+    var r = await fetch('/api/messages/' + encodeURIComponent(msgId));
+    var d = await r.json();
+    if (!d.ok) return;
+    var m = d.message;
+    var body = m.full_content || m.preview || '';
+    if (body.length > 4000) body = body.substring(0, 4000) + '\\n[... gekuerzt]';
+    var previewHtml = mdEscHtml(body.substring(0, 700));
+    var banner = document.createElement('div');
+    banner.className = 'preload-banner';
+    banner.style.cssText = 'background:#1a1a14;border:1px solid #3a3020;border-radius:8px;padding:12px 14px;margin:10px;font-size:12px;color:#d0d0d0;';
+    banner.innerHTML =
+      '<div style="font-weight:700;color:#f0c060;margin-bottom:6px">\u2709\uFE0E Antwort auf eingehende Nachricht</div>' +
+      '<div style="color:#c0c0c0;font-size:11px"><b>Von:</b> ' + mdEscHtml(m.sender_name) +
+        (m.sender_address ? ' &lt;' + mdEscHtml(m.sender_address) + '&gt;' : '') + '</div>' +
+      '<div style="color:#c0c0c0;font-size:11px"><b>Betreff:</b> ' + mdEscHtml(m.subject || '(kein Betreff)') + '</div>' +
+      '<div style="color:#888;font-size:11px;margin-top:6px;max-height:140px;overflow-y:auto;white-space:pre-wrap;background:#111;border:1px solid #262626;border-radius:6px;padding:8px">' +
+        previewHtml + '</div>';
+    var msgsEl = document.getElementById('messages');
+    if (msgsEl) msgsEl.insertBefore(banner, msgsEl.firstChild);
+    var input = document.getElementById('msg-input');
+    if (input) {
+      var sep = '---';
+      var NL = String.fromCharCode(10);
+      var parts = [
+        sep + ' EINGEHENDE NACHRICHT ' + sep,
+        'Von: ' + (m.sender_name || '') + (m.sender_address ? ' <' + m.sender_address + '>' : ''),
+        'Datum: ' + (m.timestamp || ''),
+        'Betreff: ' + (m.subject || ''),
+        '',
+        body,
+        '',
+        sep + ' ENDE NACHRICHT ' + sep,
+        '',
+        'Bitte hilf mir, auf diese Nachricht zu antworten.'
+      ];
+      var quote = parts.join(NL);
+      input.value = quote;
+      if (typeof autoResize === 'function') autoResize(input);
+      input.focus();
+      try { input.setSelectionRange(quote.length, quote.length); } catch(e) {}
+    }
+  } catch(e){ console.log('Preload-Fehler:', e); }
+}
 window.onload = async () => {
   try { await loadProviders(); } catch(e) {}
+  // URL-Parameter haben Vorrang vor localStorage (Message-Dashboard Deep-Link)
+  var urlParams = new URLSearchParams(window.location.search);
+  var agentParam = urlParams.get('agent');
+  var preloadId = urlParams.get('preload_message');
+  if (agentParam) {
+    try {
+      await selectAgent(agentParam);
+      if (preloadId) { await handlePreloadMessage(preloadId); }
+      // URL bereinigen damit Refresh nicht nochmal preloadet
+      try { history.replaceState({}, '', '/'); } catch(e) {}
+      return;
+    } catch(e) { console.log('Deep-link agent load failed:', e); }
+  }
   // Auto-restore last active agent (persists across page reloads and server restarts)
   const savedAgent = localStorage.getItem('last_active_agent');
   if (savedAgent) {
@@ -7408,10 +7472,27 @@ def create_agent():
 @app.route('/open_in_finder', methods=['POST'])
 def open_in_finder():
     import subprocess
-    agent = request.json.get('agent', '')
-    filename = request.json.get('filename', '')
-    memory_dir = os.path.join(BASE, agent, 'memory')
+    body = request.json or {}
+    agent = body.get('agent', '')
+    filename = body.get('filename', '')
+    direct_path = body.get('path', '')
+    memory_dir = os.path.join(BASE, agent, 'memory') if agent else ''
     try:
+        # Direkter Pfad (z.B. aus Message-Dashboard) — nur zulassen wenn er
+        # innerhalb BASE liegt, damit die Route nicht zum allgemeinen
+        # Filesystem-Opener wird.
+        if direct_path:
+            real = os.path.realpath(direct_path)
+            real_base = os.path.realpath(BASE)
+            if not real.startswith(real_base + os.sep) and real != real_base:
+                return jsonify({'ok': False, 'error': 'Pfad ausserhalb des Datalake'})
+            if os.path.isfile(real):
+                subprocess.run(['open', '-R', real], check=True)
+                return jsonify({'ok': True})
+            if os.path.isdir(real):
+                subprocess.run(['open', real], check=True)
+                return jsonify({'ok': True})
+            return jsonify({'ok': False, 'error': 'Pfad nicht gefunden'})
         if filename:
             fpath = os.path.join(memory_dir, filename)
             if os.path.exists(fpath):
@@ -7422,10 +7503,10 @@ def open_in_finder():
                 # File not found - open folder instead
                 subprocess.run(['open', memory_dir], check=True)
                 return jsonify({'ok': True, 'note': 'Datei nicht gefunden, Ordner geoeffnet'})
-        elif os.path.exists(memory_dir):
+        elif memory_dir and os.path.exists(memory_dir):
             subprocess.run(['open', memory_dir], check=True)
             return jsonify({'ok': True})
-        return jsonify({'ok': False, 'error': 'Ordner nicht gefunden: ' + memory_dir})
+        return jsonify({'ok': False, 'error': 'Ordner nicht gefunden: ' + (memory_dir or '(leer)')})
     except Exception as e:
         return jsonify({'ok': False, 'error': str(e)})
 
@@ -10834,6 +10915,1129 @@ mmLoadAgents();
 """
 
 # ── ENDE MEMORY MANAGEMENT UI ────────────────────────────────────────────────
+
+
+# ── MESSAGE DASHBOARD (Kanban-Posteingang) ──────────────────────────────────
+# Aggregiert Nachrichten aus dem Datalake in Kanban-Spalten (eine pro Quelle).
+# Wiederverwendet die Parser-Logik aus src/message_dashboard.py (PyQt6-App),
+# exponiert sie aber als Web-API + HTML-Dashboard unter /messages und /api/messages/*.
+
+import hashlib as _msgd_hashlib
+import re as _msgd_re
+import threading as _msgd_threading
+import time as _msgd_time
+
+_MSG_STATE_FILE = os.path.expanduser("~/.message_dashboard_state.json")
+_MSG_PREVIEW_LEN = 200
+_MSG_INBOX_WINDOW_DAYS = 90
+_MSG_MAX_FILES_PER_SOURCE = 500
+_MSG_PARSE_READ_BYTES = 8192
+_MSG_CACHE_TTL_SECONDS = 60
+_MSG_OWN_EMAILS = {
+    "londoncityfox@gmail.com", "moritz.cremer@me.com", "moritz.cremer@icloud.com",
+    "moritz@demoscapital.co", "moritz@vegatechnology.com.br",
+    "moritz.cremer@signicat.com", "moritz.cremer@trustedcarrier.net",
+    "moritz@casiopayaconsulting.io", "moritz@tangerina.com",
+}
+
+# Quellen — eine pro Spalte im Dashboard
+_MSG_SOURCES = [
+    {"key": "email_signicat",       "label": "Signicat",       "agent": "signicat",       "icon": "\U0001F4E7", "type": "email"},
+    {"key": "email_privat",         "label": "Privat",         "agent": "privat",         "icon": "\U0001F4E7", "type": "email"},
+    {"key": "email_trustedcarrier", "label": "TrustedCarrier", "agent": "trustedcarrier", "icon": "\U0001F4E7", "type": "email"},
+    {"key": "email_standard",       "label": "Standard",       "agent": "standard",       "icon": "\U0001F4E7", "type": "email"},
+    {"key": "email_systemward",     "label": "System Ward",    "agent": "system ward",    "icon": "\U0001F4E7", "type": "email"},
+    {"key": "whatsapp",             "label": "WhatsApp",       "agent": None,             "icon": "\U0001F4F1", "type": "whatsapp"},
+    {"key": "chat",                 "label": "Chat-Verlauf",   "agent": None,             "icon": "\U0001F4AC", "type": "chat"},
+]
+
+# Mapping Source -> empfohlener Agent fuer "Antworten"-Workflow
+_MSG_SOURCE_TO_AGENT = {
+    "email_signicat": "signicat",
+    "email_privat": "privat",
+    "email_trustedcarrier": "trustedcarrier",
+    "email_standard": "standard",
+    "email_systemward": "system ward",
+    "whatsapp": "privat",
+    "chat": "standard",
+}
+
+_MSG_EMAIL_FIELD_RE = _msgd_re.compile(
+    r'^(Von|An|From|To|Betreff|Subject|Datum|Date|Kontakt|Richtung|Agent|Importiert|Quelle|Kanal|Cc|Kopie|Message-ID|Reply-To):\s*(.*)$',
+    _msgd_re.IGNORECASE,
+)
+_MSG_EMAIL_ADDR_RE = _msgd_re.compile(r'[\w.+%-]+@[\w.-]+\.[a-zA-Z]{2,}')
+_MSG_EMAIL_FILE_RE = _msgd_re.compile(r'^\d{4}-\d{2}-\d{2}_\d{2}-\d{2}-\d{2}_(IN|OUT)_.*\.txt$')
+_MSG_LEGACY_EMAIL_RE = _msgd_re.compile(r'^email_.*\.txt$', _msgd_re.IGNORECASE)
+_MSG_WHATSAPP_FILE_RE = _msgd_re.compile(r'^whatsapp_.*\.txt$', _msgd_re.IGNORECASE)
+_MSG_KONV_FILE_RE = _msgd_re.compile(r'^konversation_.*\.txt$', _msgd_re.IGNORECASE)
+
+_MSG_CACHE = {"messages": None, "ts": 0.0, "lock": _msgd_threading.Lock()}
+_MSG_STATE_LOCK = _msgd_threading.Lock()
+
+
+def _msg_hash_path(path):
+    return _msgd_hashlib.sha1(path.encode("utf-8")).hexdigest()[:16]
+
+
+def _msg_load_state():
+    try:
+        with open(_MSG_STATE_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+            if not isinstance(data, dict):
+                return {"read_messages": []}
+            data.setdefault("read_messages", [])
+            return data
+    except Exception:
+        return {"read_messages": []}
+
+
+def _msg_save_state(state):
+    try:
+        with open(_MSG_STATE_FILE, "w", encoding="utf-8") as f:
+            json.dump(state, f, indent=2)
+    except Exception as e:
+        print(f"[MSGD] state save error: {e}", file=sys.stderr)
+
+
+def _msg_strip_separator(text):
+    sep = "\u2500" * 10
+    idx = text.find(sep)
+    if idx != -1:
+        eol = text.find("\n", idx)
+        if eol != -1:
+            return text[eol+1:].lstrip()
+    for marker in ["\n---\n", "\n----\n", "\n-----\n"]:
+        idx = text.find(marker)
+        if idx != -1:
+            return text[idx+len(marker):].lstrip()
+    return text
+
+
+def _msg_parse_date(s):
+    if not s:
+        return None
+    s = s.strip()
+    try:
+        from email.utils import parsedate_to_datetime
+        dt = parsedate_to_datetime(s)
+        if dt:
+            if dt.tzinfo:
+                dt = dt.astimezone().replace(tzinfo=None)
+            return dt
+    except Exception:
+        pass
+    try:
+        return datetime.datetime.fromisoformat(
+            s.replace("Z", "+00:00").split("+")[0].split(".")[0]
+        )
+    except Exception:
+        pass
+    try:
+        return datetime.datetime.strptime(s[:19], "%Y-%m-%d_%H-%M-%S")
+    except Exception:
+        pass
+    return None
+
+
+def _msg_normalize_email_content(fpath, fname, source_key, agent_name, only_header=True):
+    """Liest eine .txt Email-Datei und gibt normalisiertes Dict zurueck.
+    only_header=True liest nur die ersten 8KB (Header + Preview), sonst bis zu 1MB."""
+    try:
+        mode_size = _MSG_PARSE_READ_BYTES if only_header else 1024 * 1024
+        with open(fpath, "rb") as f:
+            raw_bytes = f.read(mode_size)
+        if not raw_bytes.strip():
+            return None
+        raw = raw_bytes.decode("utf-8", errors="replace")
+    except Exception:
+        return None
+
+    fields = {}
+    lines = raw.splitlines()
+    header_end_idx = 0
+    for i, line in enumerate(lines):
+        if "\u2500\u2500\u2500" in line:
+            header_end_idx = i + 1
+            break
+        if line.strip() == "" and fields:
+            header_end_idx = i + 1
+            break
+        m = _MSG_EMAIL_FIELD_RE.match(line)
+        if m:
+            key = m.group(1).lower()
+            value = m.group(2).strip()
+            if key not in fields:
+                fields[key] = value
+        elif i > 30 and not fields:
+            break
+
+    body = (
+        "\n".join(lines[header_end_idx:]).strip() if header_end_idx
+        else _msg_strip_separator(raw).strip()
+    )
+
+    from_raw = fields.get("von", fields.get("from", ""))
+    to_raw = fields.get("an", fields.get("to", fields.get("kanal", "")))
+    subject = fields.get("betreff", fields.get("subject", "")).strip()
+    if not subject:
+        first_body_line = next((l for l in body.splitlines() if l.strip()), "").strip()
+        subject = (first_body_line[:100] if first_body_line else fname)[:200]
+
+    sender_email = ""
+    m_addr = _MSG_EMAIL_ADDR_RE.search(from_raw)
+    if m_addr:
+        sender_email = m_addr.group(0).lower()
+
+    sender_name = from_raw
+    if "<" in from_raw and ">" in from_raw:
+        sender_name = from_raw[:from_raw.index("<")].strip().strip('"')
+    elif sender_email and sender_email in from_raw:
+        sender_name = from_raw.replace(sender_email, "").strip().strip("<>").strip()
+    if not sender_name:
+        sender_name = sender_email or "(unbekannt)"
+
+    direction = (fields.get("richtung", "") or "").strip().upper()
+    if direction == "OUT":
+        return None
+    if sender_email and sender_email in _MSG_OWN_EMAILS:
+        return None
+
+    date_str = fields.get("datum", fields.get("date", ""))
+    dt = _msg_parse_date(date_str)
+    if not dt:
+        m2 = _msgd_re.match(r"(\d{4}-\d{2}-\d{2})_(\d{2})-(\d{2})-(\d{2})_", fname)
+        if m2:
+            try:
+                dt = datetime.datetime.strptime(
+                    f"{m2.group(1)}_{m2.group(2)}-{m2.group(3)}-{m2.group(4)}",
+                    "%Y-%m-%d_%H-%M-%S",
+                )
+            except Exception:
+                pass
+    if not dt:
+        try:
+            dt = datetime.datetime.fromtimestamp(os.path.getmtime(fpath))
+        except Exception:
+            dt = datetime.datetime.now()
+
+    body_clean = body.strip()
+    preview = " ".join(body_clean[:_MSG_PREVIEW_LEN].split())
+    if len(body_clean) > _MSG_PREVIEW_LEN:
+        preview = preview + "..."
+
+    has_attachments = bool(_msgd_re.search(r"(anhang|attachment|\[cid:|\[Bild\]|\.pdf|\.docx|\.xlsx|\.png|\.jpg)", body_clean[:2000], _msgd_re.IGNORECASE))
+
+    return {
+        "id": _msg_hash_path(fpath),
+        "source": source_key,
+        "source_agent": agent_name,
+        "sender_name": sender_name[:150],
+        "sender_address": sender_email,
+        "to": to_raw,
+        "subject": subject[:200],
+        "preview": preview,
+        "full_content": body_clean if not only_header else "",
+        "timestamp": dt.isoformat(),
+        "timestamp_epoch": dt.timestamp(),
+        "read": False,
+        "has_attachments": has_attachments,
+        "attachments": [],
+        "raw_file_path": fpath,
+        "message_id": fields.get("message-id", ""),
+        "type": "email",
+    }
+
+
+def _msg_normalize_whatsapp_file(fpath, fname, source_key, agent_name, only_header=True):
+    try:
+        mode_size = _MSG_PARSE_READ_BYTES if only_header else 1024 * 512
+        with open(fpath, "rb") as f:
+            raw_bytes = f.read(mode_size)
+        if not raw_bytes.strip():
+            return None
+        raw = raw_bytes.decode("utf-8", errors="replace")
+    except Exception:
+        return None
+
+    # Header-Block parsen
+    contact = ""
+    period = ""
+    msg_count = ""
+    lines = raw.splitlines()
+    body_start = 0
+    for i, line in enumerate(lines[:10]):
+        if line.lower().startswith("kontakt:"):
+            contact = line.split(":", 1)[1].strip()
+        elif line.lower().startswith("zeitraum:"):
+            period = line.split(":", 1)[1].strip()
+        elif line.lower().startswith("nachrichten:"):
+            msg_count = line.split(":", 1)[1].strip()
+        elif line.strip() == "" or line.startswith("["):
+            body_start = i
+            break
+
+    body = "\n".join(lines[body_start:]).strip()
+
+    # Letzte eingehende Nachricht finden (nicht "Ich:")
+    last_in_line = ""
+    last_ts = None
+    for line in reversed(body.splitlines()):
+        if line.startswith("[") and "]" in line:
+            try:
+                ts_str = line[1:line.index("]")]
+                rest = line[line.index("]")+1:].strip()
+                if rest.startswith("Ich:"):
+                    continue
+                last_in_line = rest
+                try:
+                    last_ts = datetime.datetime.strptime(ts_str, "%Y-%m-%d %H:%M")
+                except Exception:
+                    try:
+                        last_ts = datetime.datetime.strptime(ts_str[:10], "%Y-%m-%d")
+                    except Exception:
+                        pass
+                break
+            except Exception:
+                continue
+
+    if not last_ts:
+        try:
+            last_ts = datetime.datetime.fromtimestamp(os.path.getmtime(fpath))
+        except Exception:
+            last_ts = datetime.datetime.now()
+
+    preview = " ".join(last_in_line[:_MSG_PREVIEW_LEN].split()) if last_in_line else (body[:_MSG_PREVIEW_LEN].strip())
+    if not preview:
+        preview = f"{msg_count} Nachrichten" if msg_count else "(WhatsApp Chat)"
+
+    subject = f"{contact or fname}"
+    if period:
+        subject += f" \u00b7 {period}"
+
+    return {
+        "id": _msg_hash_path(fpath),
+        "source": source_key,
+        "source_agent": agent_name,
+        "sender_name": contact or fname,
+        "sender_address": "",
+        "to": "",
+        "subject": subject[:200],
+        "preview": preview,
+        "full_content": body if not only_header else "",
+        "timestamp": last_ts.isoformat(),
+        "timestamp_epoch": last_ts.timestamp(),
+        "read": False,
+        "has_attachments": "[Bild]" in body or "[Video]" in body or "[Sprachnachricht]" in body,
+        "attachments": [],
+        "raw_file_path": fpath,
+        "message_id": "",
+        "type": "whatsapp",
+    }
+
+
+def _msg_normalize_chat_file(fpath, fname, source_key, agent_name, only_header=True):
+    try:
+        mode_size = _MSG_PARSE_READ_BYTES if only_header else 1024 * 512
+        with open(fpath, "rb") as f:
+            raw_bytes = f.read(mode_size)
+        if not raw_bytes.strip():
+            return None
+        raw = raw_bytes.decode("utf-8", errors="replace")
+    except Exception:
+        return None
+
+    preview = " ".join(raw[:_MSG_PREVIEW_LEN].split())
+    try:
+        dt = datetime.datetime.fromtimestamp(os.path.getmtime(fpath))
+    except Exception:
+        dt = datetime.datetime.now()
+
+    # Versuche Agent/Datum aus Dateiname konversation_YYYY-MM-DD_HH-MM-SS_agent.txt
+    agent_from_name = agent_name
+    m = _msgd_re.match(r"konversation_(\d{4}-\d{2}-\d{2})_(\d{2})-(\d{2})-(\d{2})_(.+)\.txt$", fname, _msgd_re.IGNORECASE)
+    if m:
+        try:
+            dt = datetime.datetime.strptime(
+                f"{m.group(1)}_{m.group(2)}-{m.group(3)}-{m.group(4)}",
+                "%Y-%m-%d_%H-%M-%S",
+            )
+        except Exception:
+            pass
+        agent_from_name = m.group(5)
+
+    return {
+        "id": _msg_hash_path(fpath),
+        "source": source_key,
+        "source_agent": agent_from_name or agent_name,
+        "sender_name": agent_from_name or "Agent",
+        "sender_address": "",
+        "to": "",
+        "subject": fname.replace(".txt", ""),
+        "preview": preview,
+        "full_content": raw if not only_header else "",
+        "timestamp": dt.isoformat(),
+        "timestamp_epoch": dt.timestamp(),
+        "read": False,
+        "has_attachments": False,
+        "attachments": [],
+        "raw_file_path": fpath,
+        "message_id": "",
+        "type": "chat",
+    }
+
+
+def _msg_scan_email_source(source):
+    agent = source["agent"]
+    speicher = get_agent_speicher(agent)
+    memdir = os.path.join(speicher, "memory")
+    out = []
+    if not os.path.isdir(memdir):
+        return out
+    cutoff = _msgd_time.time() - (_MSG_INBOX_WINDOW_DAYS * 86400)
+    candidates = []
+    try:
+        with os.scandir(memdir) as it:
+            for entry in it:
+                if not entry.is_file(follow_symlinks=False):
+                    continue
+                fname = entry.name
+                if not fname.endswith(".txt"):
+                    continue
+                if fname.startswith("konversation_"):
+                    continue
+                if fname.startswith("whatsapp_"):
+                    continue
+                if fname.startswith("kchat_"):
+                    continue
+                if not (
+                    _MSG_EMAIL_FILE_RE.match(fname)
+                    or _MSG_LEGACY_EMAIL_RE.match(fname)
+                ):
+                    continue
+                try:
+                    st = entry.stat(follow_symlinks=False)
+                    mtime = st.st_mtime
+                except Exception:
+                    mtime = 0
+                # iCloud Drive setzt mtime beim Sync oft neu — deshalb ist das
+                # Datum im Dateinamen (YYYY-MM-DD_HH-MM-SS_...) die verlaessliche
+                # Quelle fuer Inbox-Alter.
+                fname_ts = None
+                m = _msgd_re.match(r"(\d{4}-\d{2}-\d{2})", fname)
+                if m:
+                    try:
+                        fname_ts = datetime.datetime.strptime(m.group(1), "%Y-%m-%d").timestamp()
+                    except Exception:
+                        fname_ts = None
+                if fname_ts is not None:
+                    if fname_ts < cutoff:
+                        continue
+                    sort_ts = fname_ts
+                else:
+                    if mtime < cutoff:
+                        continue
+                    sort_ts = mtime
+                candidates.append((sort_ts, entry.path, fname))
+    except Exception:
+        return out
+    candidates.sort(key=lambda x: x[0], reverse=True)
+    candidates = candidates[:_MSG_MAX_FILES_PER_SOURCE]
+    for _, fpath, fname in candidates:
+        try:
+            msg = _msg_normalize_email_content(fpath, fname, source["key"], agent, only_header=True)
+        except Exception:
+            continue
+        if msg:
+            out.append(msg)
+    return out
+
+
+def _msg_scan_whatsapp_source(source):
+    out = []
+    cutoff = _msgd_time.time() - (_MSG_INBOX_WINDOW_DAYS * 86400)
+    candidates = []
+    for agent in ["signicat", "privat", "trustedcarrier", "standard", "system ward"]:
+        speicher = get_agent_speicher(agent)
+        for subdir in [os.path.join(speicher, "memory", "whatsapp"), os.path.join(speicher, "memory")]:
+            if not os.path.isdir(subdir):
+                continue
+            try:
+                with os.scandir(subdir) as it:
+                    for entry in it:
+                        if not entry.is_file(follow_symlinks=False):
+                            continue
+                        fname = entry.name
+                        if not _MSG_WHATSAPP_FILE_RE.match(fname):
+                            continue
+                        try:
+                            mtime = entry.stat(follow_symlinks=False).st_mtime
+                        except Exception:
+                            mtime = 0
+                        # Datum aus Dateinamen (letztes YYYY-MM-DD vor .txt) hat
+                        # Vorrang vor mtime (iCloud-Sync-Artefakte).
+                        fname_ts = None
+                        dm = _msgd_re.search(r"(\d{4}-\d{2}-\d{2})\.txt$", fname)
+                        if dm:
+                            try:
+                                fname_ts = datetime.datetime.strptime(dm.group(1), "%Y-%m-%d").timestamp()
+                            except Exception:
+                                fname_ts = None
+                        if fname_ts is not None:
+                            if fname_ts < cutoff:
+                                continue
+                            sort_ts = fname_ts
+                        else:
+                            if mtime < cutoff:
+                                continue
+                            sort_ts = mtime
+                        candidates.append((sort_ts, entry.path, fname, agent))
+            except Exception:
+                continue
+    candidates.sort(key=lambda x: x[0], reverse=True)
+    candidates = candidates[:_MSG_MAX_FILES_PER_SOURCE]
+    for _, fpath, fname, agent in candidates:
+        try:
+            msg = _msg_normalize_whatsapp_file(fpath, fname, source["key"], agent, only_header=True)
+        except Exception:
+            continue
+        if msg:
+            out.append(msg)
+    return out
+
+
+def _msg_scan_chat_source(source):
+    out = []
+    cutoff = _msgd_time.time() - (_MSG_INBOX_WINDOW_DAYS * 86400)
+    candidates = []
+    for agent in ["signicat", "privat", "trustedcarrier", "standard", "system ward"]:
+        speicher = get_agent_speicher(agent)
+        memdir = os.path.join(speicher, "memory")
+        if not os.path.isdir(memdir):
+            continue
+        try:
+            with os.scandir(memdir) as it:
+                for entry in it:
+                    if not entry.is_file(follow_symlinks=False):
+                        continue
+                    fname = entry.name
+                    if not _MSG_KONV_FILE_RE.match(fname):
+                        continue
+                    try:
+                        st = entry.stat(follow_symlinks=False)
+                        mtime = st.st_mtime
+                        size = st.st_size
+                    except Exception:
+                        mtime = 0
+                        size = 0
+                    if size < 80:
+                        continue
+                    fname_ts = None
+                    dm = _msgd_re.match(r"konversation_(\d{4}-\d{2}-\d{2})", fname)
+                    if dm:
+                        try:
+                            fname_ts = datetime.datetime.strptime(dm.group(1), "%Y-%m-%d").timestamp()
+                        except Exception:
+                            fname_ts = None
+                    if fname_ts is not None:
+                        if fname_ts < cutoff:
+                            continue
+                        sort_ts = fname_ts
+                    else:
+                        if mtime < cutoff:
+                            continue
+                        sort_ts = mtime
+                    candidates.append((sort_ts, entry.path, fname, agent))
+        except Exception:
+            continue
+    candidates.sort(key=lambda x: x[0], reverse=True)
+    candidates = candidates[:_MSG_MAX_FILES_PER_SOURCE]
+    for _, fpath, fname, agent in candidates:
+        try:
+            msg = _msg_normalize_chat_file(fpath, fname, source["key"], agent, only_header=True)
+        except Exception:
+            continue
+        if msg:
+            out.append(msg)
+    return out
+
+
+def _msg_scan_source(source):
+    stype = source.get("type")
+    if stype == "email":
+        return _msg_scan_email_source(source)
+    if stype == "whatsapp":
+        return _msg_scan_whatsapp_source(source)
+    if stype == "chat":
+        return _msg_scan_chat_source(source)
+    return []
+
+
+def _msg_get_all(force=False):
+    """Liefert alle Nachrichten mit read-state Annotation. Nutzt einen
+    einfachen In-Memory-Cache mit TTL damit die Kanban-UI fluessig scrollt."""
+    with _MSG_CACHE["lock"]:
+        now = _msgd_time.time()
+        if (not force and _MSG_CACHE["messages"] is not None
+                and (now - _MSG_CACHE["ts"]) < _MSG_CACHE_TTL_SECONDS):
+            msgs = _MSG_CACHE["messages"]
+        else:
+            msgs = []
+            for src in _MSG_SOURCES:
+                try:
+                    msgs.extend(_msg_scan_source(src))
+                except Exception as e:
+                    print(f"[MSGD] scan error source={src['key']}: {e}", file=sys.stderr)
+            _MSG_CACHE["messages"] = msgs
+            _MSG_CACHE["ts"] = now
+        state = _msg_load_state()
+        read_set = set(state.get("read_messages", []))
+        # read-state frisch pro Request applizieren, ohne Cache zu invalidieren
+        annotated = []
+        for m in msgs:
+            m2 = dict(m)
+            m2["read"] = m2["id"] in read_set
+            annotated.append(m2)
+        return annotated
+
+
+def _msg_find_by_id(msg_id):
+    """Findet Nachricht inklusive full_content (laedt Volltext nach)."""
+    msgs = _msg_get_all()
+    hit = next((m for m in msgs if m["id"] == msg_id), None)
+    if not hit:
+        return None
+    # Volltext nachladen
+    fpath = hit.get("raw_file_path", "")
+    if not fpath or not os.path.exists(fpath):
+        return hit
+    fname = os.path.basename(fpath)
+    mtype = hit.get("type", "email")
+    src_key = hit.get("source", "")
+    agent = hit.get("source_agent", "")
+    try:
+        if mtype == "email":
+            full = _msg_normalize_email_content(fpath, fname, src_key, agent, only_header=False)
+        elif mtype == "whatsapp":
+            full = _msg_normalize_whatsapp_file(fpath, fname, src_key, agent, only_header=False)
+        else:
+            full = _msg_normalize_chat_file(fpath, fname, src_key, agent, only_header=False)
+        if full:
+            full["read"] = hit["read"]
+            return full
+    except Exception as e:
+        print(f"[MSGD] full-load error: {e}", file=sys.stderr)
+    return hit
+
+
+@app.route("/api/messages/sources")
+def api_messages_sources():
+    """Liefert Liste aller Quellen inkl. Counts + Unread.
+    Felder pro Quelle: key, label, icon, type, available, count, unread,
+    recommended_agent."""
+    try:
+        messages = _msg_get_all()
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 500
+    by_src = {}
+    for m in messages:
+        by_src.setdefault(m["source"], []).append(m)
+    out = []
+    for src in _MSG_SOURCES:
+        items = by_src.get(src["key"], [])
+        count = len(items)
+        unread = sum(1 for m in items if not m["read"])
+        out.append({
+            "key": src["key"],
+            "label": src["label"],
+            "icon": src["icon"],
+            "type": src["type"],
+            "available": count > 0,
+            "count": count,
+            "unread": unread,
+            "recommended_agent": _MSG_SOURCE_TO_AGENT.get(src["key"]),
+        })
+    return jsonify({"ok": True, "sources": out})
+
+
+@app.route("/api/messages")
+def api_messages():
+    """Liefert alle Nachrichten (ohne full_content).
+    Optional: ?source=<key>&limit=<n>."""
+    try:
+        messages = _msg_get_all(force=(request.args.get("refresh") == "1"))
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 500
+    source_filter = request.args.get("source")
+    if source_filter:
+        messages = [m for m in messages if m["source"] == source_filter]
+    try:
+        limit = int(request.args.get("limit", "2000"))
+    except Exception:
+        limit = 2000
+    # Sortierung: ungelesen zuerst (aelteste oben), dann gelesen (neueste oben)
+    messages.sort(key=lambda m: (
+        0 if not m["read"] else 1,
+        m["timestamp_epoch"] if not m["read"] else -m["timestamp_epoch"],
+    ))
+    messages = messages[:limit]
+    slim = [{k: v for k, v in m.items() if k != "full_content"} for m in messages]
+    return jsonify({"ok": True, "messages": slim, "count": len(slim)})
+
+
+@app.route("/api/messages/<msg_id>")
+def api_messages_detail(msg_id):
+    msg = _msg_find_by_id(msg_id)
+    if not msg:
+        return jsonify({"ok": False, "error": "not found"}), 404
+    return jsonify({"ok": True, "message": msg})
+
+
+@app.route("/api/messages/mark-read", methods=["POST"])
+def api_messages_mark_read():
+    data = request.get_json(silent=True) or {}
+    mid = (data.get("message_id") or "").strip()
+    read = bool(data.get("read", True))
+    if not mid:
+        return jsonify({"ok": False, "error": "message_id required"}), 400
+    with _MSG_STATE_LOCK:
+        state = _msg_load_state()
+        read_list = state.get("read_messages", [])
+        read_set = set(read_list)
+        if read:
+            read_set.add(mid)
+        else:
+            read_set.discard(mid)
+        state["read_messages"] = sorted(read_set)
+        _msg_save_state(state)
+    return jsonify({"ok": True, "read": read, "message_id": mid})
+
+
+@app.route("/messages")
+def messages_page():
+    resp = make_response(_MSG_DASHBOARD_HTML)
+    resp.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
+    resp.headers["Content-Type"] = "text/html; charset=utf-8"
+    return resp
+
+
+_MSG_DASHBOARD_HTML = r"""<!DOCTYPE html>
+<html lang="de">
+<head>
+<meta charset="UTF-8">
+<title>📬 AssistantDev — Messages</title>
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='6' fill='%23111'/%3E%3Ctext x='16' y='24' text-anchor='middle' font-family='system-ui' font-weight='700' font-size='22' fill='%23f0c060'%3EM%3C/text%3E%3C/svg%3E">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
+<style>
+  * { margin:0; padding:0; box-sizing:border-box; }
+  html, body { height:100%; }
+  body { font-family:'Inter','Helvetica Neue',sans-serif; background:#111; color:#e0e0e0; display:flex; flex-direction:column; overflow:hidden; }
+  #md-header { background:#0c0c0c; border-bottom:1px solid #2a2a2a; padding:10px 18px; display:flex; align-items:center; gap:14px; flex-shrink:0; }
+  #md-header h1 { font-size:11px; font-weight:700; color:#aaa; letter-spacing:2.5px; text-transform:uppercase; }
+  #md-search { flex:1; max-width:520px; background:#1a1a1a; border:1px solid #333; color:#e0e0e0; border-radius:8px; padding:8px 14px; font-size:13px; font-family:inherit; outline:none; }
+  #md-search:focus { border-color:#f0c060; }
+  .md-hdr-btn { background:none; border:1px solid #333; color:#aaa; padding:7px 14px; font-size:12px; border-radius:7px; cursor:pointer; font-family:inherit; }
+  .md-hdr-btn:hover { border-color:#f0c060; color:#f0c060; }
+  .md-hdr-stat { font-size:11px; color:#777; }
+  .md-hdr-stat strong { color:#f0c060; font-weight:700; }
+  #md-board { flex:1; display:flex; gap:10px; padding:14px; overflow-x:auto; overflow-y:hidden; background:#111; }
+  .md-col { flex:0 0 320px; min-width:320px; max-width:360px; background:#161616; border:1px solid #262626; border-radius:10px; display:flex; flex-direction:column; overflow:hidden; }
+  .md-col-hdr { padding:10px 12px 8px; border-bottom:1px solid #232323; background:#1a1a1a; }
+  .md-col-title { display:flex; align-items:center; gap:8px; font-size:13px; font-weight:600; color:#f0f0f0; }
+  .md-col-title .md-col-icon { font-size:15px; }
+  .md-col-title .md-col-count { font-size:11px; color:#777; font-weight:500; margin-left:auto; }
+  .md-col-title .md-col-unread { background:#f0c060; color:#111; font-size:10px; font-weight:700; padding:1px 7px; border-radius:10px; }
+  .md-col-search { margin-top:7px; width:100%; background:#111; border:1px solid #2a2a2a; color:#d0d0d0; font-size:11px; padding:5px 9px; border-radius:6px; outline:none; font-family:inherit; }
+  .md-col-search:focus { border-color:#3a3a3a; }
+  .md-col-search::placeholder { color:#555; }
+  .md-col-body { flex:1; overflow-y:auto; padding:6px; }
+  .md-col-empty { padding:24px 12px; text-align:center; color:#555; font-size:11px; }
+  .md-card { background:#1d1d1d; border:1px solid #242424; border-radius:8px; padding:9px 11px; margin-bottom:6px; cursor:pointer; transition:border-color .12s, background .12s; position:relative; }
+  .md-card:hover { border-color:#3a3a3a; background:#222; }
+  .md-card.unread { background:#1c1a14; border-color:#3a3020; }
+  .md-card.unread:hover { border-color:#f0c060; }
+  .md-card.highlight { animation:md-flash 1.6s ease-out 1; }
+  @keyframes md-flash { 0%,30% { border-color:#f0c060; box-shadow:0 0 0 3px rgba(240,192,96,0.25); } 100% { box-shadow:none; } }
+  .md-card-top { display:flex; align-items:center; gap:6px; margin-bottom:3px; }
+  .md-dot { width:7px; height:7px; border-radius:50%; flex-shrink:0; background:#333; }
+  .md-dot.unread { background:#f0c060; }
+  .md-card-sender { flex:1; font-size:12px; color:#fafafa; overflow:hidden; white-space:nowrap; text-overflow:ellipsis; }
+  .md-card.unread .md-card-sender { font-weight:700; }
+  .md-card-time { font-size:10px; color:#666; flex-shrink:0; }
+  .md-card-subject { font-size:11.5px; color:#c9c9c9; margin-bottom:3px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+  .md-card.unread .md-card-subject { color:#e8e8e8; font-weight:600; }
+  .md-card-preview { font-size:10.5px; color:#777; line-height:1.45; display:-webkit-box; -webkit-line-clamp:2; -webkit-box-orient:vertical; overflow:hidden; }
+  .md-card-meta { display:flex; align-items:center; gap:6px; margin-top:5px; font-size:9.5px; color:#555; }
+  .md-card-meta .md-attach { color:#9aa; }
+  .md-card-expand { display:none; margin-top:10px; padding-top:9px; border-top:1px solid #2a2a2a; font-size:11px; line-height:1.55; color:#cfcfcf; }
+  .md-card.expanded { cursor:default; background:#1a1a1a; border-color:#3a3a3a; }
+  .md-card.expanded .md-card-expand { display:block; }
+  .md-card-expand .md-full-body { background:#111; border:1px solid #262626; border-radius:6px; padding:8px; max-height:260px; overflow-y:auto; white-space:pre-wrap; word-break:break-word; font-family:'SF Mono',Menlo,monospace; font-size:10.5px; color:#c8c8c8; }
+  .md-card-expand .md-meta-row { margin-bottom:4px; color:#888; font-size:10.5px; }
+  .md-card-expand .md-meta-row b { color:#aaa; }
+  .md-card-expand-actions { margin-top:8px; display:flex; gap:6px; flex-wrap:wrap; }
+  .md-btn { background:#2a2a2a; border:1px solid #3a3a3a; color:#ddd; font-size:11px; padding:5px 11px; border-radius:6px; cursor:pointer; font-family:inherit; }
+  .md-btn:hover { border-color:#f0c060; color:#f0c060; }
+  .md-btn.primary { background:#f0c060; color:#111; border-color:#f0c060; font-weight:700; }
+  .md-btn.primary:hover { background:#f5cc70; color:#000; }
+  /* Agent Modal */
+  #md-agent-modal { display:none; position:fixed; inset:0; background:rgba(0,0,0,0.72); z-index:90; justify-content:center; align-items:center; }
+  #md-agent-modal.show { display:flex; }
+  .md-modal-card { background:#181818; border:1px solid #2d2d2d; border-radius:12px; padding:22px 24px; width:min(560px,92%); max-height:80vh; overflow-y:auto; }
+  .md-modal-card h2 { font-size:14px; font-weight:700; color:#f0c060; margin-bottom:4px; letter-spacing:1px; }
+  .md-modal-card .md-modal-sub { font-size:11.5px; color:#888; margin-bottom:16px; }
+  .md-agent-list { display:grid; grid-template-columns:1fr 1fr; gap:10px; margin-bottom:14px; }
+  .md-agent-choice { background:#1e1e1e; border:1px solid #2e2e2e; border-radius:8px; padding:11px 13px; cursor:pointer; text-align:left; color:#e0e0e0; font-size:12px; font-family:inherit; transition:.12s; }
+  .md-agent-choice:hover { border-color:#f0c060; color:#f0c060; background:#22201a; }
+  .md-agent-choice.recommended { border-color:#f0c060; background:#22201a; color:#f0c060; font-weight:700; }
+  .md-agent-choice .md-agent-desc { font-size:10px; font-weight:400; color:#888; margin-top:3px; display:block; }
+  .md-agent-choice.recommended .md-agent-desc { color:#cba976; }
+  .md-modal-actions { display:flex; justify-content:flex-end; gap:8px; }
+  .md-close { background:none; border:none; color:#666; font-size:20px; cursor:pointer; float:right; margin-top:-6px; }
+  .md-close:hover { color:#f0c060; }
+  ::-webkit-scrollbar { width:9px; height:9px; }
+  ::-webkit-scrollbar-track { background:#111; }
+  ::-webkit-scrollbar-thumb { background:#2a2a2a; border-radius:5px; }
+  ::-webkit-scrollbar-thumb:hover { background:#3d3d3d; }
+  #md-toast { position:fixed; bottom:20px; right:20px; background:#2a2a2a; border:1px solid #3a3a3a; color:#f0c060; padding:10px 16px; border-radius:8px; font-size:12px; z-index:200; opacity:0; transition:opacity .2s; pointer-events:none; }
+  #md-toast.show { opacity:1; }
+</style>
+</head>
+<body>
+<div id="md-header">
+  <h1>📬 Messages</h1>
+  <input id="md-search" type="text" placeholder="Alle Spalten durchsuchen..." autocomplete="off">
+  <span class="md-hdr-stat" id="md-stat-text">Lade...</span>
+  <button class="md-hdr-btn" id="md-btn-refresh">Aktualisieren</button>
+  <button class="md-hdr-btn" onclick="location.href='/'">&larr; Chat</button>
+</div>
+<div id="md-board"></div>
+
+<div id="md-agent-modal">
+  <div class="md-modal-card">
+    <button class="md-close" onclick="mdCloseAgentModal()">&times;</button>
+    <h2>ANTWORTEN MIT AGENT</h2>
+    <div class="md-modal-sub" id="md-modal-sub">Welcher Agent soll die Antwort formulieren?</div>
+    <div class="md-agent-list" id="md-agent-list"></div>
+    <div class="md-modal-actions">
+      <button class="md-btn" onclick="mdCloseAgentModal()">Abbrechen</button>
+    </div>
+  </div>
+</div>
+
+<div id="md-toast"></div>
+
+<script>
+(function(){
+  var BOARD = document.getElementById('md-board');
+  var STATE = { sources:[], messages:[], byId:{}, globalQuery:'', colQuery:{}, selectedForReply:null };
+  var REFRESH_MS = 60000;
+  var agentsCache = null;
+
+  function esc(s){
+    if (s === null || s === undefined) return '';
+    return String(s).replace(/[&<>"']/g, function(c){
+      return ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'})[c];
+    });
+  }
+
+  function fmtTime(iso){
+    try {
+      var d = new Date(iso);
+      var now = new Date();
+      var diffMs = now - d;
+      var diffH = diffMs / 3600000;
+      if (diffH < 1) { var m = Math.max(1, Math.round(diffMs / 60000)); return m + 'min'; }
+      if (diffH < 24) return Math.round(diffH) + 'h';
+      if (diffH < 48) return 'gestern';
+      if (diffH < 168) return Math.round(diffH/24) + 'd';
+      return d.toLocaleDateString('de-DE', {day:'2-digit', month:'short'});
+    } catch(e){ return ''; }
+  }
+
+  function fmtFullDate(iso){
+    try { return new Date(iso).toLocaleString('de-DE'); } catch(e){ return iso; }
+  }
+
+  function showToast(msg){
+    var t = document.getElementById('md-toast');
+    t.textContent = msg;
+    t.classList.add('show');
+    clearTimeout(t._to);
+    t._to = setTimeout(function(){ t.classList.remove('show'); }, 2200);
+  }
+
+  function filterForColumn(sourceKey){
+    var q = (STATE.globalQuery || '').toLowerCase().trim();
+    var qCol = (STATE.colQuery[sourceKey] || '').toLowerCase().trim();
+    return STATE.messages.filter(function(m){
+      if (m.source !== sourceKey) return false;
+      var hay = (m.sender_name + ' ' + m.subject + ' ' + m.preview + ' ' + (m.sender_address||'')).toLowerCase();
+      if (q && hay.indexOf(q) === -1) return false;
+      if (qCol && hay.indexOf(qCol) === -1) return false;
+      return true;
+    }).sort(function(a,b){
+      if (a.read !== b.read) return a.read ? 1 : -1;
+      if (!a.read) return a.timestamp_epoch - b.timestamp_epoch;
+      return b.timestamp_epoch - a.timestamp_epoch;
+    });
+  }
+
+  function renderColumnCards(col, sourceKey){
+    var list = filterForColumn(sourceKey);
+    var body = col.querySelector('.md-col-body');
+    body.innerHTML = '';
+    if (!list.length){
+      var e = document.createElement('div');
+      e.className = 'md-col-empty';
+      e.textContent = 'Keine Nachrichten.';
+      body.appendChild(e);
+      return;
+    }
+    list.forEach(function(m){
+      var card = document.createElement('div');
+      card.className = 'md-card' + (m.read ? '' : ' unread');
+      card.setAttribute('data-id', m.id);
+      card.innerHTML =
+        '<div class="md-card-top">' +
+          '<span class="md-dot ' + (m.read ? '' : 'unread') + '"></span>' +
+          '<span class="md-card-sender">' + esc(m.sender_name) + '</span>' +
+          '<span class="md-card-time">' + esc(fmtTime(m.timestamp)) + '</span>' +
+        '</div>' +
+        '<div class="md-card-subject">' + esc(m.subject || '(kein Betreff)') + '</div>' +
+        '<div class="md-card-preview">' + esc(m.preview || '') + '</div>' +
+        (m.has_attachments ? '<div class="md-card-meta"><span class="md-attach">📎 Anhang</span></div>' : '') +
+        '<div class="md-card-expand"></div>';
+      card.addEventListener('click', function(ev){
+        if (ev.detail === 2) return;
+        setTimeout(function(){ if (!card._dblClicked) onCardSingleClick(card, m); }, 160);
+      });
+      card.addEventListener('dblclick', function(){
+        card._dblClicked = true;
+        setTimeout(function(){ card._dblClicked = false; }, 400);
+        openAgentModal(m);
+      });
+      body.appendChild(card);
+    });
+  }
+
+  function updateColumnHeaderCounts(){
+    var bySrc = {};
+    STATE.messages.forEach(function(m){ (bySrc[m.source] = bySrc[m.source] || []).push(m); });
+    STATE.sources.forEach(function(s){
+      var col = BOARD.querySelector('[data-source="' + s.key + '"]');
+      if (!col) return;
+      var arr = bySrc[s.key] || [];
+      var unread = arr.filter(function(x){ return !x.read; }).length;
+      col.querySelector('.md-col-count').textContent = arr.length + ' gesamt';
+      var ub = col.querySelector('.md-col-unread');
+      if (unread > 0){ ub.style.display = 'inline-block'; ub.textContent = unread; }
+      else { ub.style.display = 'none'; }
+    });
+    var total = STATE.messages.length;
+    var totalUnread = STATE.messages.filter(function(x){ return !x.read; }).length;
+    document.getElementById('md-stat-text').innerHTML =
+      total + ' Nachrichten \u00b7 <strong>' + totalUnread + '</strong> ungelesen';
+  }
+
+  function renderBoard(){
+    BOARD.innerHTML = '';
+    STATE.sources.forEach(function(s){
+      var col = document.createElement('div');
+      col.className = 'md-col';
+      col.setAttribute('data-source', s.key);
+      col.innerHTML =
+        '<div class="md-col-hdr">' +
+          '<div class="md-col-title">' +
+            '<span class="md-col-icon">' + s.icon + '</span>' +
+            '<span>' + esc(s.label) + '</span>' +
+            '<span class="md-col-unread" style="display:none"></span>' +
+            '<span class="md-col-count">0 gesamt</span>' +
+          '</div>' +
+          '<input class="md-col-search" type="text" placeholder="In dieser Spalte..." autocomplete="off">' +
+        '</div>' +
+        '<div class="md-col-body"></div>';
+      var inp = col.querySelector('.md-col-search');
+      inp.addEventListener('input', function(){
+        STATE.colQuery[s.key] = inp.value;
+        renderColumnCards(col, s.key);
+      });
+      BOARD.appendChild(col);
+      renderColumnCards(col, s.key);
+    });
+    updateColumnHeaderCounts();
+  }
+
+  function renderAllColumns(){
+    STATE.sources.forEach(function(s){
+      var col = BOARD.querySelector('[data-source="' + s.key + '"]');
+      if (col) renderColumnCards(col, s.key);
+    });
+    updateColumnHeaderCounts();
+  }
+
+  async function onCardSingleClick(card, msg){
+    if (card.classList.contains('expanded')){
+      card.classList.remove('expanded');
+      return;
+    }
+    // Alle anderen zuklappen in derselben Spalte
+    var col = card.closest('.md-col');
+    col.querySelectorAll('.md-card.expanded').forEach(function(c){ c.classList.remove('expanded'); });
+    card.classList.add('expanded');
+    var expandEl = card.querySelector('.md-card-expand');
+    expandEl.innerHTML = '<em style="color:#666">Lade Vollansicht...</em>';
+    try {
+      var r = await fetch('/api/messages/' + encodeURIComponent(msg.id));
+      var d = await r.json();
+      if (!d.ok){ expandEl.innerHTML = '<span style="color:#c66">Fehler: ' + esc(d.error||'unbekannt') + '</span>'; return; }
+      var m = d.message;
+      expandEl.innerHTML =
+        '<div class="md-meta-row"><b>Von:</b> ' + esc(m.sender_name) + (m.sender_address ? ' &lt;' + esc(m.sender_address) + '&gt;' : '') + '</div>' +
+        (m.to ? '<div class="md-meta-row"><b>An:</b> ' + esc(m.to) + '</div>' : '') +
+        '<div class="md-meta-row"><b>Datum:</b> ' + esc(fmtFullDate(m.timestamp)) + ' \u00b7 <b>Quelle:</b> ' + esc(m.source) + '</div>' +
+        (m.message_id ? '<div class="md-meta-row"><b>Message-ID:</b> <code style="font-size:9px;color:#666">' + esc(m.message_id) + '</code></div>' : '') +
+        '<div class="md-full-body">' + esc(m.full_content || m.preview || '(leer)') + '</div>' +
+        '<div class="md-card-expand-actions">' +
+          '<button class="md-btn primary" data-action="reply">\u21A9\uFE0E Mit Agent antworten</button>' +
+          '<button class="md-btn" data-action="read">' + (msg.read ? 'Als ungelesen' : 'Als gelesen') + '</button>' +
+          '<button class="md-btn" data-action="finder">📂 Im Finder</button>' +
+        '</div>';
+      expandEl.querySelector('[data-action="reply"]').addEventListener('click', function(e){ e.stopPropagation(); openAgentModal(m); });
+      expandEl.querySelector('[data-action="read"]').addEventListener('click', function(e){ e.stopPropagation(); toggleRead(msg); });
+      expandEl.querySelector('[data-action="finder"]').addEventListener('click', function(e){ e.stopPropagation(); openFinder(m.raw_file_path); });
+      // Auto-mark as read
+      if (!msg.read){ await markRead(msg.id, true); msg.read = true; card.classList.remove('unread'); card.querySelector('.md-dot').classList.remove('unread'); updateColumnHeaderCounts(); }
+    } catch(e){
+      expandEl.innerHTML = '<span style="color:#c66">Fehler: ' + esc(e.message) + '</span>';
+    }
+  }
+
+  async function markRead(id, read){
+    try {
+      await fetch('/api/messages/mark-read', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({message_id:id, read:!!read})});
+    } catch(e){}
+  }
+
+  async function toggleRead(msg){
+    msg.read = !msg.read;
+    await markRead(msg.id, msg.read);
+    renderAllColumns();
+    showToast(msg.read ? 'Als gelesen markiert' : 'Als ungelesen markiert');
+  }
+
+  async function openFinder(path){
+    try {
+      await fetch('/open_in_finder', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({path:path})});
+    } catch(e){ showToast('Finder-Fehler'); }
+  }
+
+  async function ensureAgents(){
+    if (agentsCache) return agentsCache;
+    var r = await fetch('/agents');
+    agentsCache = await r.json();
+    return agentsCache;
+  }
+
+  async function openAgentModal(msg){
+    STATE.selectedForReply = msg;
+    document.getElementById('md-modal-sub').innerHTML =
+      'Antwort auf: <strong>' + esc(msg.subject || '(kein Betreff)') + '</strong> von ' + esc(msg.sender_name);
+    var list = document.getElementById('md-agent-list');
+    list.innerHTML = '<em style="color:#666">Lade Agenten...</em>';
+    try {
+      var agents = await ensureAgents();
+      var recommended = (STATE.sources.find(function(s){ return s.key === msg.source; }) || {}).recommended_agent;
+      list.innerHTML = '';
+      agents.forEach(function(a){
+        var btn = document.createElement('button');
+        btn.className = 'md-agent-choice' + (a.name === recommended ? ' recommended' : '');
+        btn.innerHTML = '<span>' + esc(a.label || a.name) + (a.name === recommended ? ' \u2605' : '') + '</span>' +
+                        (a.description ? '<span class="md-agent-desc">' + esc(a.description) + '</span>' : '');
+        btn.addEventListener('click', function(){ openChatWithMessage(a.name, msg.id); });
+        list.appendChild(btn);
+      });
+    } catch(e){
+      list.innerHTML = '<span style="color:#c66">Fehler beim Laden der Agenten.</span>';
+    }
+    document.getElementById('md-agent-modal').classList.add('show');
+  }
+
+  function mdCloseAgentModal(){ document.getElementById('md-agent-modal').classList.remove('show'); }
+  window.mdCloseAgentModal = mdCloseAgentModal;
+
+  function openChatWithMessage(agentName, msgId){
+    var url = '/?agent=' + encodeURIComponent(agentName) + '&preload_message=' + encodeURIComponent(msgId);
+    try { window.open(url, '_blank'); } catch(e) { location.href = url; }
+    mdCloseAgentModal();
+  }
+
+  async function loadSources(){
+    var r = await fetch('/api/messages/sources');
+    var d = await r.json();
+    if (!d.ok) throw new Error(d.error || 'sources load failed');
+    STATE.sources = d.sources;
+  }
+
+  async function loadMessages(force){
+    var r = await fetch('/api/messages' + (force ? '?refresh=1' : ''));
+    var d = await r.json();
+    if (!d.ok) throw new Error(d.error || 'messages load failed');
+    STATE.messages = d.messages;
+    STATE.byId = {};
+    STATE.messages.forEach(function(m){ STATE.byId[m.id] = m; });
+  }
+
+  async function fullReload(force){
+    try {
+      await loadSources();
+      await loadMessages(force);
+      renderBoard();
+    } catch(e){
+      BOARD.innerHTML = '<div style="padding:40px;color:#c66">Fehler: ' + esc(e.message) + '</div>';
+    }
+  }
+
+  async function softRefresh(){
+    try {
+      var prevIds = new Set(STATE.messages.map(function(x){ return x.id; }));
+      await loadSources();
+      await loadMessages(false);
+      renderAllColumns();
+      // Neue Messages highlighten
+      var newIds = STATE.messages.map(function(x){ return x.id; }).filter(function(x){ return !prevIds.has(x); });
+      if (newIds.length){
+        showToast(newIds.length + ' neue Nachricht(en)');
+        newIds.forEach(function(id){
+          var el = document.querySelector('[data-id="' + id + '"]');
+          if (el){ el.classList.add('highlight'); setTimeout(function(){ el.classList.remove('highlight'); }, 2000); }
+        });
+      }
+    } catch(e){ /* silent */ }
+  }
+
+  document.getElementById('md-search').addEventListener('input', function(e){
+    STATE.globalQuery = e.target.value;
+    renderAllColumns();
+  });
+  document.getElementById('md-btn-refresh').addEventListener('click', function(){
+    var b = this; b.disabled = true; b.textContent = 'Lade...';
+    fullReload(true).finally(function(){ b.disabled = false; b.textContent = 'Aktualisieren'; });
+  });
+  document.getElementById('md-agent-modal').addEventListener('click', function(e){
+    if (e.target.id === 'md-agent-modal') mdCloseAgentModal();
+  });
+
+  fullReload(false);
+  setInterval(softRefresh, REFRESH_MS);
+})();
+</script>
+</body>
+</html>
+"""
+
+# ── ENDE MESSAGE DASHBOARD ───────────────────────────────────────────────────
 
 
 if __name__ == '__main__':

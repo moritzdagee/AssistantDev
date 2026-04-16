@@ -44,6 +44,7 @@ url = BASE_URL + path
 TITLE_MAP = {
     "": "AssistantDev",
     "/": "AssistantDev",
+    "/messages": "AssistantDev — Messages",
     "/admin": "AssistantDev — Admin Panel",
     "/admin/docs": "AssistantDev — Technische Dokumentation",
     "/admin/changelog": "AssistantDev — Changelog",

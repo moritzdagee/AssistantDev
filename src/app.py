@@ -153,6 +153,10 @@ class AssistantDevApp(rumps.App):
             callback=self._open_dashboard,
         ))
         open_menu.add(rumps.MenuItem(
+            "\U0001F4EC Messages",
+            callback=self._open_messages,
+        ))
+        open_menu.add(rumps.MenuItem(
             "Admin Panel",
             callback=self._open_admin,
         ))
@@ -330,6 +334,9 @@ class AssistantDevApp(rumps.App):
 
     def _open_dashboard(self, _):
         self._open_native_window("/")
+
+    def _open_messages(self, _):
+        self._open_native_window("/messages")
 
     def _open_admin(self, _):
         self._open_native_window("/admin")

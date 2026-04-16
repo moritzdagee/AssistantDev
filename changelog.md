@@ -6,6 +6,60 @@ Format: [Datum] Änderung | Datei | Grund
 
 ## 2026-04-16
 
+### Feature: Message Dashboard — Kanban-Posteingang in nativer AssistantDev App
+- **Was der Nutzer wollte:** Ein Kanban-artiger Posteingang als eigenes Fenster in der macOS-App, mit einer Spalte pro Message-Quelle (E-Mail pro Agent, WhatsApp, Chat), vollstaendiger Agent-Integration fuer direktes Antworten.
+- **Was umgesetzt wurde:**
+  - **Neuer Web-Endpoint `/messages`:** Serviert ein Single-Page-Dashboard mit horizontal scrollbaren Kanban-Spalten — eine pro Quelle (Signicat, Privat, TrustedCarrier, Standard, System Ward, WhatsApp, Chat-Verlauf).
+  - **Neue API-Routen (alle JSON):**
+    - `GET /api/messages/sources` — Liste aller Quellen mit `count`, `unread`, `available`, `recommended_agent`.
+    - `GET /api/messages?source=<key>&limit=<n>&refresh=1` — Alle Nachrichten, optional gefiltert, sortiert "ungelesen zuerst (aelteste oben), dann gelesen (neueste oben)".
+    - `GET /api/messages/<id>` — Detail mit `full_content` (laedt bei Bedarf bis zu 1 MB nach).
+    - `POST /api/messages/mark-read` `{message_id, read}` — Toggle Read-State.
+  - **Parser wiederverwendbar:** Drei dedizierte Normalizer (Email `Von:/An:/Betreff:/Datum:`-Format, WhatsApp `whatsapp_chat_*.txt`, Chat `konversation_*.txt`) liefern ein einheitliches Schema (id, source, sender_name, sender_address, subject, preview, timestamp, timestamp_epoch, read, has_attachments, raw_file_path, message_id, type).
+  - **90-Tage Inbox-Window + Cap 500 Files/Quelle:** Dateinamens-Datum hat Vorrang vor mtime (iCloud-Sync setzt mtime neu → alte Mails waeren sonst in der Inbox). Eigene Outbound-Mails und `Richtung: OUT` werden gefiltert.
+  - **In-Memory-Cache 60 s:** Scan-Ergebnis wird gecached, Read-State wird pro Request frisch aus `~/.message_dashboard_state.json` annotiert (kompatibel mit der bestehenden PyQt6-App `src/message_dashboard.py`).
+  - **UI-Features:** Single-Click expandiert Card in-place + markiert automatisch als gelesen. Double-Click oeffnet Agent-Auswahl-Modal mit empfohlenem Agenten (Source → Agent Mapping). Globale Suche + spaltenweise Suche. Auto-Refresh 60 s mit Highlight-Animation fuer neue Nachrichten. Toast-Notifications. Mark-As-Read/Unread, Im-Finder zeigen.
+  - **Preload-Mechanismus:** Agent-Auswahl oeffnet `/?agent=<name>&preload_message=<id>` in neuem Tab. Im Haupt-Chat liest `window.onload` die URL-Parameter, waehlt den Agenten und ruft `handlePreloadMessage()` → fetch `/api/messages/<id>` → fuegt einen Banner oberhalb des Chat-Bereichs ein + fuellt die Eingabe mit einem zitierten Block + "Bitte hilf mir, auf diese Nachricht zu antworten".
+  - **App-Integration:** Neuer Menuepunkt "📬 Messages" in `app.py` unter "Oeffnen"; neue Titel-Zuordnung in `dashboard_window.py`. Fenster oeffnet via bestehendem pywebview-Dashboard-Launcher.
+  - **Hardening `/open_in_finder`:** Optionaler `path`-Parameter mit Datalake-Whitelist (realpath muss innerhalb `BASE` liegen), damit das Dashboard Dateien direkt im Finder zeigen kann, ohne dass die Route zum allgemeinen Filesystem-Opener wird.
+- **Konsequenz / nicht umgesetzt (bewusst):**
+  - iMessage- und Slack-Quellen sind nicht aktiv — im Datalake liegen keine aktuellen iMessage/Slack-Files. `SOURCES`-Liste ist erweiterbar.
+  - email_systemward (`system ward` Agent) ist in der Source-Liste, aber derzeit leer (`available=false`).
+- **Inventarisierung im Datalake:** email_signicat 470, email_privat 499 (capped), email_trustedcarrier 429, email_standard 293, whatsapp 85, chat 1, system ward 0.
+- **Dateien:** `src/web_server.py` (+~800 Zeilen: Parser, Scanner, API-Routen, `_MSG_DASHBOARD_HTML`, Preload-Mechanismus in Haupt-HTML, `/open_in_finder` Hardening), `src/app.py` (Messages-Menuepunkt + `_open_messages`), `src/dashboard_window.py` (TITLE_MAP-Eintrag), `tests/run_tests.py` (+55 Tests in "Message Dashboard Kanban 2026-04-16").
+- **Tests:** Suite 811/811 gruen (vorher 756/756). Neue Tests decken Route-Existenz, Schema der Responses, Source-Keys, Mark-Read-Toggle, HTML-Integrity (keine `\U`-Escapes unaufgeloest), Preload-JS, und die app.py/dashboard_window.py Integration ab.
+- **Backups:** `backups/2026-04-16_10-28-05/src/{web_server,app}.py`.
+- **Feature-Branch:** `feature/message-dashboard`.
+
+### Bug-Fix: E-Mail-Suche findet neue Mails nicht / sortiert nicht nach Datum
+- **Was der Nutzer beobachtete:** Suche nach "Hat sich Fabian Adam gemeldet?" findet die neueste Fabian-Mail (14.04.) nicht; "E-Mails von Fabian Adam" sortiert die alte 24.03. vor der neueren 14.04. Heutige Mails (16.04.) sind teilweise gar nicht im Datalake.
+- **Ursachen:**
+  1. `QueryParser` hatte keine Regel fuer konversationelle Personen-Phrasen ("hat sich gemeldet", "news von", "was macht X", "any news from", ...) → `is_search=False` → keine Treffer ans LLM.
+  2. Score-Sortierung hatte keinen Datum-Tie-Break, daher landete bei gleichem Score willkuerlich die aeltere Mail oben.
+  3. Kein Personen-aware Recency-Modus: bei "Letzte E-Mail von Fabian" wurden die juengsten Mails von **irgendwem** gewaehlt, nicht die juengste von Fabian.
+  4. EmailWatcher pollte alle 5 s und triggerte keinen Apple-Mail-Fetch — neue Mails landeten teils minutenlang nicht im iCloud-Inbox-Ordner.
+- **Fix in `src/search_engine.py`:**
+  - `QUESTION_INTENT_PHRASES` um konversationelle Wendungen erweitert + neue `QUESTION_INTENT_REGEXES` fuer deutsche Klammer-Konstruktionen ("hat sich [X] gemeldet").
+  - Neue `RECENCY_TRIGGER_PHRASES` ("letzte", "neueste", "latest", "last", "ultimo" usw.).
+  - `QueryIntent.recency_first` Flag; `QueryParser.parse` setzt es bei Recency-Triggern, Personen-Only-Queries und konversationellen Personen-Phrasen.
+  - `auto_search` setzt `recency_first` automatisch bei Email-Wort-Queries und bei `file_type='email'`.
+  - Helper `extract_date_from_name` + `_recency_key` extrahieren `YYYY-MM-DD_HH-MM-SS` aus Dateinamen.
+  - `HybridSearch.search` und `hybrid_rag_search` akzeptieren `recency_first` Parameter; sortieren bei Score-Ties immer nach Datum (juengste oben). Bei `recency_first=True` Top-Score-Pool nehmen, dann darin nach Datum re-sortieren — mit **Person-aware Narrowing**: wenn die Query Personennamen enthaelt, wird der Pool auf Treffer eingeengt, in denen diese Namen vorkommen (Filename, From, To, Subject, Preview).
+- **Fix in `src/email_watcher.py`:**
+  - `POLL_INTERVAL_SEC = 2` (vorher 5).
+  - Neue `force_apple_mail_sync()` ruft AppleScript "tell application Mail to check for new mail" auf — beim Start und alle ~60 s.
+  - Robuster `_trigger_index_update_for(memory_dir, fname)`: nutzt `index_single_file`, fallback `os.utime` auf `.search_index.json` damit naechster Reader rebuildet.
+  - EmailWatcher.app neu gebaut + deployed.
+- **Verhalten nach Fix (live verifiziert gegen `signicat/.search_index.json`):**
+  - "Hat sich Fabian Adam gemeldet?" → 14.04 Pos 1
+  - "E-Mails von Fabian Adam" → 14.04 Pos 1
+  - "Letzte E-Mail von Fabian Adam" → 14.04 Pos 1
+  - "Was schrieb Fabian Adam?" → 14.04 Pos 1 (Tie-Break)
+  - "ExFlow Rechnung" → 1 PDF-Treffer (Regression-frei)
+- **Dateien:** `src/search_engine.py`, `src/email_watcher.py`, `~/Applications/EmailWatcher.app/Contents/MacOS/EmailWatcher` (rebuild), `tests/run_tests.py`
+- **Tests:** 57 neue Tests in "Recency + Konversationelle Personen-Suche 2026-04-16" und "Email-Watcher-Haertung 2026-04-16". Suite: **756/756 gruen**.
+- **Backups:** `backups/2026-04-16_10-08-23/`
+
 ### Feature: Neuer Tab = frische Konversation, die beim ersten Prompt gespeichert wird
 - **Was der Nutzer wollte:** Klick auf "+" (neuer Tab) soll nicht nur das Fenster leeren, sondern eine neue Konversation starten, die **ab dem ersten Prompt** als Datei gespeichert wird — so kann der Nutzer spaeter via History-Sidebar zurueck.
 - **Vorher:** `/select_agent` rief `find_latest_konversation(speicher, agent)` auf und resumierte dieselbe heutige Datei. Zwei Tabs mit demselben Agenten schrieben in **dieselbe** Datei → Nachrichten vermischten sich. Ausserdem wurde die Datei upfront bei Agent-Auswahl erzeugt, auch wenn der Nutzer nie einen Prompt sendete — leere Dateien als Rauschen in der History.
