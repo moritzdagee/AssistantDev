@@ -1909,6 +1909,108 @@ test("Index-Response setzt Cache-Control: no-store (kein stale-JS nach Update)",
      "no-store" in _resp_root.headers.get("Cache-Control", ""))
 
 
+section("Access Control Matrix-UI 2026-04-15")
+
+_ac_html = requests.get(BASE_URL + "/admin/access-control").text
+
+test("Access Control hat matrix-table CSS-Klasse",
+     "matrix-table" in _ac_html)
+
+test("Access Control hat matrix-wrap Container",
+     "matrix-wrap" in _ac_html)
+
+test("Access Control hat matrix-container div",
+     'id="matrix-container"' in _ac_html)
+
+test("Access Control hat sticky source-cell Klasse",
+     "source-cell" in _ac_html)
+
+test("Access Control hat agent-header Klasse (rotierte Spaltenkoepfe)",
+     "agent-header" in _ac_html)
+
+test("Access Control hat section-row Klasse (Sektions-Trenner)",
+     "section-row" in _ac_html)
+
+test("Access Control hat ac-cb Checkbox-Klasse",
+     "ac-cb" in _ac_html)
+
+test("Access Control hat Eigenes Memory Sektion",
+     "Eigenes Memory" in _ac_html)
+
+test("Access Control hat Shared Memory Sektion",
+     "Shared Memory" in _ac_html)
+
+test("Access Control hat Cross-Agent Read Sektion",
+     "Cross-Agent Read" in _ac_html)
+
+test("Access Control hat Shared Sources: webclips, email_inbox, calendar",
+     "webclips" in _ac_html and "email_inbox" in _ac_html and "calendar" in _ac_html)
+
+test("Access Control hat badge-shared CSS-Klasse",
+     "badge-shared" in _ac_html)
+
+test("Access Control hat badge-exclusive CSS-Klasse",
+     "badge-exclusive" in _ac_html)
+
+test("Access Control hat source-badge Klasse",
+     "source-badge" in _ac_html)
+
+test("Access Control hat loadMatrix JS-Funktion",
+     "function loadMatrix" in _ac_html)
+
+test("Access Control hat saveMatrix JS-Funktion",
+     "function saveMatrix" in _ac_html)
+
+test("Access Control hat renderMatrix JS-Funktion",
+     "function renderMatrix" in _ac_html)
+
+test("Access Control hat collectFromDOM JS-Funktion",
+     "function collectFromDOM" in _ac_html)
+
+test("Access Control hat updateBadges JS-Funktion",
+     "function updateBadges" in _ac_html)
+
+test("Access Control ruft /agents API auf",
+     "fetch('/agents')" in _ac_html)
+
+test("Access Control ruft /api/access-control API auf",
+     "fetch('/api/access-control')" in _ac_html)
+
+test("Access Control hat Speichern-Button",
+     "saveMatrix()" in _ac_html)
+
+test("Access Control hat Verwerfen-Button",
+     "loadMatrix()" in _ac_html)
+
+test("Access Control hat last-mod Anzeige",
+     'id="last-mod"' in _ac_html)
+
+test("Access Control hat KEINE alte agent-card Klasse",
+     "agent-card" not in _ac_html)
+
+test("Access Control hat KEINE alte renderAgents Funktion",
+     "function renderAgents" not in _ac_html)
+
+test("Access Control hat KEINE alte loadAccessControl Funktion",
+     "function loadAccessControl" not in _ac_html)
+
+test("Access Control hat KEINE alte saveAccessControl Funktion",
+     "function saveAccessControl" not in _ac_html)
+
+test("Access Control hat accent-color #1B6FD8 fuer Checkboxen",
+     "#1B6FD8" in _ac_html)
+
+_ac_api = requests.get(BASE_URL + "/api/access-control")
+test("GET /api/access-control antwortet mit 200",
+     _ac_api.status_code == 200)
+try:
+    _ac_json = _ac_api.json()
+    test("GET /api/access-control liefert JSON mit version Feld",
+         'version' in _ac_json)
+except Exception:
+    test("GET /api/access-control liefert JSON mit version Feld", False)
+
+
 # ============================================================
 # ERGEBNIS
 # ============================================================

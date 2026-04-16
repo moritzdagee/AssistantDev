@@ -6628,132 +6628,234 @@ def admin_access_control_page():
     html = """<!DOCTYPE html>
 <html><head><meta charset="UTF-8"><title>Access Control — AssistantDev</title>
 <style>
-* { box-sizing:border-box; }
-body { background:#1a1a2e; color:#e0e0e0; font-family:-apple-system,Inter,sans-serif; margin:0; padding:30px; }
-h1 { color:#f0c060; font-size:24px; margin:0 0 8px; }
-.subtitle { color:#888; font-size:13px; margin-bottom:24px; }
-.container { max-width:900px; margin:0 auto; }
-.agent-card { background:#22224a; border:1px solid #334; border-radius:10px; padding:18px; margin:12px 0; }
-.agent-name { font-size:16px; font-weight:600; color:#e0e0e0; margin-bottom:4px; }
-.agent-desc { font-size:12px; color:#888; margin-bottom:14px; line-height:1.5; }
-.field-row { margin:10px 0; }
-.field-row label { display:inline-flex; align-items:center; color:#ccc; font-size:13px; cursor:pointer; }
-.field-row input[type=checkbox] { margin-right:8px; accent-color:#4a8aca; }
-.field-row span.hint { color:#666; font-size:11px; margin-left:6px; }
-.shared-options { display:flex; gap:12px; margin-top:6px; padding-left:22px; }
-.cross-input { background:#111; border:1px solid #334; color:#e0e0e0; padding:6px 10px; border-radius:5px; font-size:12px; width:100%; font-family:Inter,sans-serif; margin-top:4px; }
-.btn-row { margin-top:24px; padding-top:16px; border-top:1px solid #334; }
-.btn { padding:10px 24px; border:none; border-radius:6px; cursor:pointer; font-size:14px; font-family:Inter,sans-serif; font-weight:600; }
-.btn-primary { background:#4a8aca; color:#fff; }
-.btn-primary:hover { background:#5a9ada; }
-.btn-secondary { background:#333; color:#aaa; margin-left:8px; }
+* { box-sizing:border-box; margin:0; padding:0; }
+body { background:#1a1a2e; color:#e0e0e0; font-family:-apple-system,Inter,sans-serif; padding:24px; }
+.container { max-width:1400px; margin:0 auto; }
+.back-link { color:#4a8aca; text-decoration:none; font-size:13px; }
+.back-link:hover { text-decoration:underline; }
+h1 { color:#f0c060; font-size:24px; margin:8px 0 4px; }
+.subtitle { color:#888; font-size:13px; margin-bottom:20px; }
 .msg { padding:10px 14px; border-radius:6px; margin:10px 0; font-size:13px; display:none; }
 .msg.success { background:#1f4a1f; border:1px solid #4a8a4a; color:#a0d090; display:block; }
 .msg.error { background:#4a1f1f; border:1px solid #8a4a4a; color:#d09090; display:block; }
-.last-mod { color:#666; font-size:11px; margin-top:6px; }
-.back-link { color:#4a8aca; text-decoration:none; font-size:13px; }
-.back-link:hover { text-decoration:underline; }
+
+.matrix-wrap { overflow-x:auto; margin:16px 0; border:1px solid #334; border-radius:10px; background:#16162e; max-height:75vh; overflow-y:auto; }
+.matrix-table { border-collapse:separate; border-spacing:0; width:100%; min-width:600px; }
+.matrix-table thead th { position:sticky; top:0; z-index:20; background:#1e1e40; padding:0; border-bottom:2px solid #445; }
+.matrix-table thead th.corner { z-index:30; left:0; min-width:260px; width:260px; background:#1e1e40; }
+.agent-header { writing-mode:vertical-rl; transform:rotate(180deg); padding:12px 6px 8px; font-size:12px; font-weight:600; color:#c0c0d0; white-space:nowrap; text-align:left; min-height:80px; letter-spacing:0.3px; }
+.matrix-table td.source-cell, .matrix-table th.corner { position:sticky; left:0; z-index:10; background:#1a1a34; }
+.matrix-table td.source-cell { min-width:260px; width:260px; padding:8px 14px; border-right:1px solid #334; font-size:13px; white-space:nowrap; }
+.source-icon { margin-right:8px; font-size:15px; display:inline; }
+.source-name { font-weight:500; color:#d0d0e0; }
+.source-badge { display:inline-block; font-size:10px; padding:1px 7px; border-radius:8px; margin-left:8px; font-weight:600; vertical-align:middle; }
+.badge-shared { background:#2a4a6a; color:#7ab8f5; }
+.badge-exclusive { background:#3a2a5a; color:#b08ae0; }
+.section-row td { background:#12122a !important; color:#888; font-size:11px; font-weight:700; text-transform:uppercase; letter-spacing:1.5px; padding:10px 14px !important; border-bottom:1px solid #334; }
+.section-row td.source-cell { background:#12122a !important; }
+.matrix-table td.data-cell { text-align:center; padding:6px 4px; border-bottom:1px solid #222240; border-right:1px solid #222240; min-width:44px; }
+.matrix-table tr:hover td.data-cell { background:#22224a; }
+.matrix-table tr:hover td.source-cell { background:#1e1e44; }
+.ac-cb { width:18px; height:18px; accent-color:#1B6FD8; cursor:pointer; border-radius:3px; }
+.ac-cb:checked { box-shadow:0 0 4px rgba(27,111,216,0.4); }
+.btn-row { margin-top:16px; padding:16px 0; border-top:1px solid #334; display:flex; align-items:center; gap:12px; flex-wrap:wrap; }
+.btn { padding:10px 28px; border:none; border-radius:6px; cursor:pointer; font-size:14px; font-family:Inter,sans-serif; font-weight:600; }
+.btn-primary { background:#1B6FD8; color:#fff; }
+.btn-primary:hover { background:#2580e8; }
+.btn-secondary { background:#333; color:#aaa; }
+.btn-secondary:hover { background:#444; }
+.last-mod { color:#666; font-size:11px; margin-left:auto; }
+.loading { text-align:center; padding:60px; color:#888; font-size:14px; }
 </style></head><body>
 <div class="container">
-<a href="/" class="back-link">\u2190 Zurueck zum Chat</a>
-<h1>\u2699 Access Control</h1>
-<div class="subtitle">Zugriffsrechte pro Agent — Memory, Shared Memory und Cross-Agent-Reads</div>
+<a href="/" class="back-link">&#8592; Zurueck zum Chat</a>
+<h1>&#9881; Access Control</h1>
+<div class="subtitle">Zugriffsrechte als Matrix &mdash; Datenquellen (Zeilen) &times; Agenten (Spalten)</div>
 <div id="msg" class="msg"></div>
-<div id="agents-container">Lade...</div>
+<div id="matrix-container" class="loading">Lade Konfiguration...</div>
 <div class="btn-row">
-  <button class="btn btn-primary" onclick="saveAccessControl()">Speichern</button>
-  <button class="btn btn-secondary" onclick="loadAccessControl()">Verwerfen</button>
+  <button class="btn btn-primary" onclick="saveMatrix()">&#128190; Speichern</button>
+  <button class="btn btn-secondary" onclick="loadMatrix()">Verwerfen</button>
   <span class="last-mod" id="last-mod"></span>
 </div>
 </div>
 <script>
-let _acData = null;
-const SHARED_OPTIONS = ['webclips', 'email_inbox', 'calendar'];
+var _acData = null;
+var _agents = [];
+var SHARED_SOURCES = [
+  {key:'webclips',    icon:'&#127760;', label:'Webclips'},
+  {key:'email_inbox', icon:'&#9993;',   label:'E-Mail Inbox'},
+  {key:'calendar',    icon:'&#128197;', label:'Kalender'}
+];
 
-async function loadAccessControl() {
-  const r = await fetch('/api/access-control');
-  _acData = await r.json();
-  renderAgents();
-  document.getElementById('last-mod').textContent = _acData.last_modified ? 'Zuletzt geaendert: ' + _acData.last_modified : '';
+function escH(s){ return String(s||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;'); }
+
+async function loadMatrix(){
+  var acRes = await fetch('/api/access-control');
+  var agRes = await fetch('/agents');
+  _acData = await acRes.json();
+  var agList = await agRes.json();
+  _agents = [];
+  agList.forEach(function(a){
+    _agents.push(a.name);
+    if(a.subagents) a.subagents.forEach(function(s){ _agents.push(s.name); });
+  });
+  _agents.sort();
+  if(!_acData.agents) _acData.agents = {};
+  _agents.forEach(function(n){
+    if(!_acData.agents[n]) _acData.agents[n] = {own_memory:true, shared_memory:[], cross_agent_read:[], description:''};
+  });
+  renderMatrix();
+  var lm = document.getElementById('last-mod');
+  lm.textContent = _acData.last_modified ? 'Zuletzt gespeichert: '+_acData.last_modified : '';
 }
 
-function renderAgents() {
-  const container = document.getElementById('agents-container');
+function countAccess(sourceType, sourceKey){
+  var c=0;
+  _agents.forEach(function(ag){
+    var a = _acData.agents[ag];
+    if(!a) return;
+    if(sourceType==='own' && sourceKey===ag && a.own_memory) c++;
+    if(sourceType==='shared' && (a.shared_memory||[]).indexOf(sourceKey)>=0) c++;
+    if(sourceType==='cross' && (a.cross_agent_read||[]).indexOf(sourceKey)>=0) c++;
+  });
+  return c;
+}
+
+function badgeHtml(count){
+  if(count<=0) return '<span class="source-badge" style="background:#333;color:#666;">Kein Zugriff</span>';
+  if(count===1) return '<span class="source-badge badge-exclusive">Exklusiv</span>';
+  return '<span class="source-badge badge-shared">Geteilt von '+count+'</span>';
+}
+
+function renderMatrix(){
+  var container = document.getElementById('matrix-container');
+  container.className = '';
   container.innerHTML = '';
-  const agents = _acData.agents || {};
-  Object.keys(agents).sort().forEach(name => {
-    const a = agents[name];
-    const shared = a.shared_memory || [];
-    const cross = (a.cross_agent_read || []).join(', ');
-    const sharedHtml = SHARED_OPTIONS.map(opt => {
-      const checked = shared.includes(opt) ? 'checked' : '';
-      return `<label><input type="checkbox" data-agent="${name}" data-shared="${opt}" ${checked}> ${opt}</label>`;
-    }).join(' ');
-    container.innerHTML += `
-      <div class="agent-card">
-        <div class="agent-name">${escHtml(name)}</div>
-        <div class="agent-desc">${escHtml(a.description || '')}</div>
-        <div class="field-row">
-          <label>
-            <input type="checkbox" data-agent="${name}" data-field="own_memory" ${a.own_memory ? 'checked' : ''}>
-            Eigenes Memory aktiv
-          </label>
-        </div>
-        <div class="field-row">
-          <label>Shared Memory Zugriff:</label>
-          <div class="shared-options">${sharedHtml}</div>
-        </div>
-        <div class="field-row">
-          <label>Cross-Agent Read Access (komma-separiert):</label>
-          <input type="text" class="cross-input" data-agent="${name}" data-field="cross_agent_read" value="${escHtml(cross)}" placeholder="z.B. standard, privat">
-        </div>
-      </div>
-    `;
+  var wrap = document.createElement('div');
+  wrap.className = 'matrix-wrap';
+  var h = '<table class="matrix-table"><thead><tr><th class="corner"></th>';
+  _agents.forEach(function(ag){
+    h += '<th><div class="agent-header">'+escH(ag)+'</div></th>';
   });
-}
-
-function escHtml(s) {
-  return String(s || '').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
-}
-
-async function saveAccessControl() {
-  if (!_acData) return;
-  // Collect from DOM
-  const agents = _acData.agents || {};
-  Object.keys(agents).forEach(name => {
-    // own_memory
-    const ownBox = document.querySelector(`input[data-agent="${name}"][data-field="own_memory"]`);
-    if (ownBox) agents[name].own_memory = ownBox.checked;
-    // shared_memory
-    const sharedBoxes = document.querySelectorAll(`input[data-agent="${name}"][data-shared]`);
-    agents[name].shared_memory = Array.from(sharedBoxes).filter(b => b.checked).map(b => b.dataset.shared);
-    // cross_agent_read
-    const crossInput = document.querySelector(`input[data-agent="${name}"][data-field="cross_agent_read"]`);
-    if (crossInput) agents[name].cross_agent_read = crossInput.value.split(',').map(s => s.trim()).filter(Boolean);
-  });
-  const msg = document.getElementById('msg');
-  try {
-    const r = await fetch('/api/access-control', {
-      method: 'POST', headers: {'Content-Type': 'application/json'},
-      body: JSON.stringify(_acData)
+  h += '</tr></thead><tbody>';
+  h += '<tr class="section-row"><td class="source-cell" colspan="'+(_agents.length+1)+'">&#128274; Eigenes Memory</td></tr>';
+  _agents.forEach(function(ag){
+    var cnt = _acData.agents[ag] && _acData.agents[ag].own_memory ? 1 : 0;
+    h += '<tr><td class="source-cell"><span class="source-icon">&#129504;</span><span class="source-name">'+escH(ag)+'</span>'+badgeHtml(cnt)+'</td>';
+    _agents.forEach(function(col){
+      if(col===ag){
+        var chk = (_acData.agents[ag] && _acData.agents[ag].own_memory) ? ' checked' : '';
+        h += '<td class="data-cell"><input type="checkbox" class="ac-cb" data-type="own" data-source="'+escH(ag)+'" data-agent="'+escH(col)+'"'+chk+' onchange="updateBadges()"></td>';
+      } else {
+        h += '<td class="data-cell" style="background:#14142a;"></td>';
+      }
     });
-    const d = await r.json();
-    if (d.success) {
-      msg.className = 'msg success';
-      msg.textContent = 'Gespeichert um ' + d.saved_at;
-      document.getElementById('last-mod').textContent = 'Zuletzt geaendert: ' + d.saved_at;
-    } else {
-      msg.className = 'msg error';
-      msg.textContent = 'Fehler: ' + (d.error || 'unbekannt');
-    }
-  } catch(e) {
-    msg.className = 'msg error';
-    msg.textContent = 'Netzwerk-Fehler: ' + e.message;
-  }
-  setTimeout(() => { msg.style.display = 'none'; }, 5000);
+    h += '</tr>';
+  });
+  h += '<tr class="section-row"><td class="source-cell" colspan="'+(_agents.length+1)+'">&#128279; Shared Memory</td></tr>';
+  SHARED_SOURCES.forEach(function(src){
+    var cnt = countAccess('shared', src.key);
+    h += '<tr><td class="source-cell"><span class="source-icon">'+src.icon+'</span><span class="source-name">'+escH(src.label)+'</span>'+badgeHtml(cnt)+'</td>';
+    _agents.forEach(function(ag){
+      var a = _acData.agents[ag];
+      var chk = (a && (a.shared_memory||[]).indexOf(src.key)>=0) ? ' checked' : '';
+      h += '<td class="data-cell"><input type="checkbox" class="ac-cb" data-type="shared" data-source="'+escH(src.key)+'" data-agent="'+escH(ag)+'"'+chk+' onchange="updateBadges()"></td>';
+    });
+    h += '</tr>';
+  });
+  h += '<tr class="section-row"><td class="source-cell" colspan="'+(_agents.length+1)+'">&#128101; Cross-Agent Read</td></tr>';
+  _agents.forEach(function(srcAg){
+    var cnt = countAccess('cross', srcAg);
+    h += '<tr><td class="source-cell"><span class="source-icon">&#128100;</span><span class="source-name">'+escH(srcAg)+'</span>'+badgeHtml(cnt)+'</td>';
+    _agents.forEach(function(col){
+      if(col===srcAg){
+        h += '<td class="data-cell" style="background:#14142a;"></td>';
+      } else {
+        var a = _acData.agents[col];
+        var chk = (a && (a.cross_agent_read||[]).indexOf(srcAg)>=0) ? ' checked' : '';
+        h += '<td class="data-cell"><input type="checkbox" class="ac-cb" data-type="cross" data-source="'+escH(srcAg)+'" data-agent="'+escH(col)+'"'+chk+' onchange="updateBadges()"></td>';
+      }
+    });
+    h += '</tr>';
+  });
+  h += '</tbody></table>';
+  wrap.innerHTML = h;
+  container.appendChild(wrap);
 }
 
-loadAccessControl();
+function updateBadges(){
+  collectFromDOM();
+  var rows = document.querySelectorAll('tr:not(.section-row)');
+  rows.forEach(function(row){
+    var cb = row.querySelector('.ac-cb');
+    if(!cb) return;
+    var type = cb.dataset.type;
+    var source = cb.dataset.source;
+    var cnt;
+    if(type==='own'){
+      cnt = (_acData.agents[source] && _acData.agents[source].own_memory) ? 1 : 0;
+    } else if(type==='shared'){
+      cnt = countAccess('shared', source);
+    } else {
+      cnt = countAccess('cross', source);
+    }
+    var badgeEl = row.querySelector('.source-badge');
+    if(badgeEl) badgeEl.outerHTML = badgeHtml(cnt);
+  });
+}
+
+function collectFromDOM(){
+  if(!_acData) return;
+  _agents.forEach(function(ag){
+    if(!_acData.agents[ag]) _acData.agents[ag] = {own_memory:false, shared_memory:[], cross_agent_read:[], description:''};
+    _acData.agents[ag].shared_memory = [];
+    _acData.agents[ag].cross_agent_read = [];
+  });
+  document.querySelectorAll('.ac-cb').forEach(function(cb){
+    var type = cb.dataset.type;
+    var src  = cb.dataset.source;
+    var ag   = cb.dataset.agent;
+    if(!_acData.agents[ag]) return;
+    if(type==='own'){
+      _acData.agents[ag].own_memory = cb.checked;
+    } else if(type==='shared'){
+      if(cb.checked) _acData.agents[ag].shared_memory.push(src);
+    } else if(type==='cross'){
+      if(cb.checked) _acData.agents[ag].cross_agent_read.push(src);
+    }
+  });
+}
+
+async function saveMatrix(){
+  if(!_acData) return;
+  collectFromDOM();
+  var msg = document.getElementById('msg');
+  try {
+    var r = await fetch('/api/access-control', {
+      method:'POST', headers:{'Content-Type':'application/json'},
+      body:JSON.stringify(_acData)
+    });
+    var d = await r.json();
+    if(d.success){
+      msg.className='msg success';
+      msg.textContent='Gespeichert um '+d.saved_at;
+      msg.style.display='block';
+      document.getElementById('last-mod').textContent='Zuletzt gespeichert: '+d.saved_at;
+    } else {
+      msg.className='msg error';
+      msg.textContent='Fehler: '+(d.error||'unbekannt');
+      msg.style.display='block';
+    }
+  } catch(e){
+    msg.className='msg error';
+    msg.textContent='Netzwerk-Fehler: '+e.message;
+    msg.style.display='block';
+  }
+  setTimeout(function(){ msg.style.display='none'; }, 5000);
+}
+
+loadMatrix();
 </script>
 </body></html>"""
     return html
