@@ -6,6 +6,28 @@ Format: [Datum] Änderung | Datei | Grund
 
 ## 2026-04-16
 
+### Feature: Dynamic Capabilities Injection — Agent-Prompts beim Server-Start
+- **Was:** Jeder Agent-System-Prompt in `config/agents/*.txt` wird beim Start von `web_server.py` automatisch um einen aktuellen **System-Capabilities-Block** ergaenzt/aktualisiert. Der Block dokumentiert dynamisch (aus `models.json` + Agent-Config generiert): Memory- und Working-Memory-Pfade, Datei-/Bild-/Video-Aktions-Tags, Kalender-/Canva-/Slack-Tools, aktive Provider samt Modellen, Ausgabe-Pfade, OUTPUT-Konvention. So bleiben Agents immer ueber ihre tatsaechlichen Faehigkeiten informiert, ohne dass der Nutzer Promptdateien anfassen muss.
+- **Warum:** Capabilities waren bisher statisch in jeder Agent-Datei eingetragen und veralteten — neue Provider, neue Aktions-Tags oder Pfad-Aenderungen waren pro Agent manuell nachzuziehen.
+- **Trennzeichen-Konvention:** Jede Agent-Datei besteht aus zwei Teilen, getrennt durch die Marker-Zeile
+  `--- SYSTEM CAPABILITIES (AUTO-GENERATED - DO NOT EDIT BELOW) ---`
+  - **USER SECTION** (alles oberhalb des Trennzeichens): vom Nutzer gepflegt, wird **niemals** ueberschrieben.
+  - **SYSTEM SECTION** (Trennzeichen + alles darunter): vom Server gepflegt, wird bei jedem Start frisch generiert.
+- **Neues Modul `src/capabilities_template.py`:**
+  - `SEPARATOR` Konstante
+  - `split_agent_prompt(content) -> (user, system)`
+  - `merge_sections(user, system) -> str`
+  - `get_capabilities_block(agent_config) -> str` — generiert Block aus aktueller Config; Provider/Modelle aus `models.json` gelesen, Image-/Video-Provider werden dynamisch gelistet. Pfade aus `agent_config['datalake_base']` und Parent/Sub-Label abgeleitet.
+  - `migrate_agent_file(path, block) -> bool` — schreibt nur bei tatsaechlicher Aenderung (idempotent). Erkennt Sub-Agents (Namen der Form `<parent>_<sub>` mit bekanntem Parent) und liefert Parent-Memory-Pfad + eigenes `working_memory/_<sub>`.
+  - `inject_capabilities_on_startup(agents_dir, models_file, datalake_base)` — iteriert `*.txt` im Agents-Dir (ignoriert `*.backup*`), aktualisiert alle Agenten, loggt `[CAPABILITIES] N/M Agent-Datei(en) aktualisiert`.
+- **Server-Hook `src/web_server.py`:** Neuer Import `from capabilities_template import inject_capabilities_on_startup` mit Fallback. In den beiden Startup-Bloecken (beide Duplikate) wird direkt nach `cleanup_agent_files()` `inject_capabilities_on_startup(AGENTS_DIR, MODELS_FILE, BASE)` aufgerufen.
+- **Migration:** Beim ersten Deploy wurden alle 8 aktiven Agent-Dateien (`privat`, `signicat`, `signicat_lamp`, `signicat_meddpicc`, `signicat_outbound`, `system ward`, `trustedcarrier`, `trustedcarrier_instagramm`) um den Trennzeichen-Block ergaenzt. User-Sections byteweise erhalten. Zweiter Deploy = 0 Writes (idempotent).
+- **Tests:** Neues `tests/test_capabilities_injection.py` (unittest, laeuft auch unter pytest): 16 Tests fuer split/merge, Block-Generierung, Sub-Agent-Pfade, Migration inkl. Idempotenz + Keine-Doppel-Trennzeichen-Regel, End-to-End `inject_capabilities_on_startup` mit Tempdir. Zusaetzlich 15 Tests in `tests/run_tests.py` unter `section("Dynamic Capabilities Injection 2026-04-16")`: prueft Modul-Existenz, Import, Web-Server-Integration, Live-Zustand aller Agent-Dateien (Trennzeichen vorhanden, kein Doppel, User-Section nicht-leer).
+- **Dateien:** `src/capabilities_template.py` (neu, ~280 Zeilen), `src/web_server.py` (+24 Zeilen: Import + 2 Startup-Hooks), `tests/test_capabilities_injection.py` (neu, ~290 Zeilen), `tests/run_tests.py` (+82 Zeilen).
+- **Tests:** Suite **826/826 gruen** (vorher 811/811). Unit-Tests 16/16 gruen.
+- **Backups:** `backups/2026-04-16_13-02-49/src/web_server.py`, `backups/2026-04-16_agents_pre_capabilities/` (alle Agent-Dateien).
+- **Feature-Branch:** `feature/dynamic-capabilities-injection`.
+
 ### Feature: Message Dashboard — Kanban-Posteingang in nativer AssistantDev App
 - **Was der Nutzer wollte:** Ein Kanban-artiger Posteingang als eigenes Fenster in der macOS-App, mit einer Spalte pro Message-Quelle (E-Mail pro Agent, WhatsApp, Chat), vollstaendiger Agent-Integration fuer direktes Antworten.
 - **Was umgesetzt wurde:**

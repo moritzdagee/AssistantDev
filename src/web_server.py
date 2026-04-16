@@ -37,6 +37,11 @@ import requests
 from flask import Flask, request, jsonify, render_template_string, make_response
 from bs4 import BeautifulSoup
 
+try:
+    from capabilities_template import inject_capabilities_on_startup
+except ImportError:
+    inject_capabilities_on_startup = None
+
 # ─── IMAGE HELPERS ───────────────────────────────────────────────────────────
 # Anthropic API limitiert Bild-Dimensionen auf max. 8000 px pro Seite.
 # Groessere Bilder muessen vor dem Senden herunterskaliert werden.
@@ -418,6 +423,21 @@ def cleanup_agent_files():
             print(f"Cleanup error {fname}: {e}")
 
 cleanup_agent_files()
+
+# ─── DYNAMIC CAPABILITIES: Agent-Prompts beim Start aktualisieren ─────────────
+def _inject_capabilities():
+    if inject_capabilities_on_startup is None:
+        return
+    try:
+        inject_capabilities_on_startup(
+            agents_dir=AGENTS_DIR,
+            models_file=MODELS_FILE,
+            datalake_base=BASE,
+        )
+    except Exception as e:
+        print(f"[CAPABILITIES] Startup-Injection fehlgeschlagen: {e}")
+
+_inject_capabilities()
 
 # ─── RECOVERY: Pending-Marker aus abgebrochenen Sessions ersetzen ─────────────
 def _recover_pending_markers():
@@ -1828,6 +1848,17 @@ def cleanup_agent_files():
             print(f"Cleanup error {fname}: {e}")
 
 cleanup_agent_files()
+
+# ─── DYNAMIC CAPABILITIES: Agent-Prompts beim Start aktualisieren ─────────────
+if inject_capabilities_on_startup is not None:
+    try:
+        inject_capabilities_on_startup(
+            agents_dir=AGENTS_DIR,
+            models_file=MODELS_FILE,
+            datalake_base=BASE,
+        )
+    except Exception as e:
+        print(f"[CAPABILITIES] Startup-Injection fehlgeschlagen: {e}")
 
 # ─── PROVIDER ADAPTERS ────────────────────────────────────────────────────────
 

@@ -3008,6 +3008,98 @@ test("/open_in_finder akzeptiert direct_path (Datalake-sicher)",
      "direct_path" in _ws_src and "startswith(real_base" in _ws_src)
 
 
+section("Dynamic Capabilities Injection 2026-04-16")
+
+# Modul existiert und ist importierbar
+_cap_src_path = os.path.expanduser("~/AssistantDev/src/capabilities_template.py")
+test("capabilities_template.py existiert",
+     os.path.isfile(_cap_src_path))
+
+try:
+    sys.path.insert(0, os.path.expanduser("~/AssistantDev/src"))
+    import capabilities_template as _ct
+    _ct_import_ok = True
+except Exception as _ct_import_err:
+    _ct_import_ok = False
+    _ct = None
+test("capabilities_template importierbar",
+     _ct_import_ok,
+     details=str(_ct_import_err) if not _ct_import_ok else "")
+
+if _ct_import_ok:
+    test("SEPARATOR-Konstante definiert und nicht-leer",
+         isinstance(_ct.SEPARATOR, str) and "AUTO-GENERATED" in _ct.SEPARATOR)
+
+    _u, _s = _ct.split_agent_prompt("Hallo\n" + _ct.SEPARATOR + "\nsys")
+    test("split_agent_prompt trennt korrekt",
+         _u.strip() == "Hallo" and _s.startswith(_ct.SEPARATOR))
+
+    _u2, _s2 = _ct.split_agent_prompt("Kein Trennzeichen hier")
+    test("split_agent_prompt ohne Separator liefert (alles, leer)",
+         _u2 == "Kein Trennzeichen hier" and _s2 == "")
+
+    _block = _ct.get_capabilities_block({
+        "agent_name": "demo",
+        "parent_agent": "demo",
+        "models_config": {"providers": {
+            "anthropic": {"name": "Anthropic", "models": [{"id": "x", "name": "Claude-X"}]}
+        }},
+    })
+    test("get_capabilities_block startet mit Separator",
+         _block.startswith(_ct.SEPARATOR))
+    test("get_capabilities_block enthaelt Kern-Sektionen",
+         all(s in _block for s in [
+             "## MEMORY & SUCHE", "## DATEI-ERSTELLUNG",
+             "## BILD & VIDEO", "## KALENDER & TOOLS",
+             "## AKTIVE MODELLE & PROVIDER", "## WORKING MEMORY",
+             "## PFADE (WICHTIG)"]))
+    test("get_capabilities_block listet aktives Modell",
+         "Claude-X" in _block)
+
+# Integration in web_server.py
+test("web_server.py importiert inject_capabilities_on_startup",
+     "from capabilities_template import inject_capabilities_on_startup" in _ws_src)
+test("web_server.py ruft inject_capabilities_on_startup beim Start auf",
+     _ws_src.count("inject_capabilities_on_startup(") >= 2)
+test("web_server.py behandelt ImportError des capabilities-Moduls",
+     "inject_capabilities_on_startup = None" in _ws_src)
+
+# Live-Wirkung: jede Agent-Datei hat nach dem Server-Start das Trennzeichen
+_agents_dir = os.path.join(DATALAKE, "config", "agents")
+if os.path.isdir(_agents_dir) and _ct_import_ok:
+    _agent_files = [f for f in os.listdir(_agents_dir)
+                    if f.endswith(".txt") and ".backup" not in f]
+    test("Mindestens eine Agent-Datei im Datalake vorhanden",
+         len(_agent_files) > 0)
+    _missing_sep = []
+    _double_sep = []
+    _lost_user = []
+    for _fname in _agent_files:
+        _fpath = os.path.join(_agents_dir, _fname)
+        try:
+            with open(_fpath, "r", encoding="utf-8", errors="replace") as _f:
+                _content = _f.read()
+        except Exception:
+            continue
+        _sep_count = _content.count(_ct.SEPARATOR)
+        if _sep_count == 0:
+            _missing_sep.append(_fname)
+        elif _sep_count > 1:
+            _double_sep.append(_fname)
+        _user, _ = _ct.split_agent_prompt(_content)
+        if not _user.strip():
+            _lost_user.append(_fname)
+    test("Alle Agent-Dateien enthalten das Capabilities-Trennzeichen",
+         len(_missing_sep) == 0,
+         details="Fehlend: " + ", ".join(_missing_sep))
+    test("Keine Agent-Datei hat doppelte Trennzeichen",
+         len(_double_sep) == 0,
+         details="Doppelt: " + ", ".join(_double_sep))
+    test("Keine Agent-Datei hat leere User-Section",
+         len(_lost_user) == 0,
+         details="Leer: " + ", ".join(_lost_user))
+
+
 # ============================================================
 # ERGEBNIS
 # ============================================================
