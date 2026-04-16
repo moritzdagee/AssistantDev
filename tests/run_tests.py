@@ -2048,8 +2048,8 @@ test("Nav-Menu: Link zu /admin/docs vorhanden",
 test("Nav-Menu: Link zu /admin/changelog vorhanden",
      "navigateTo('/admin/changelog')" in _nav_html)
 
-test("Nav-Menu: Zurueck zum Chat Link vorhanden",
-     "navigateTo('/')" in _nav_html)
+test("Nav-Menu: Changelog Link vorhanden",
+     "navigateTo('/admin/changelog')" in _nav_html)
 
 test("Nav-Menu: nav-menu-section CSS-Klasse vorhanden",
      "nav-menu-section" in _nav_html)
@@ -2110,8 +2110,8 @@ test("Nav-Menu: restartService JS-Funktion vorhanden",
 test("Nav-Menu: openNewWindow JS-Funktion vorhanden",
      "function openNewWindow" in _nav2)
 
-test("Nav-Menu: Neues Chat-Fenster Button vorhanden",
-     "Neues Chat-Fenster" in _nav2)
+test("Nav-Menu: Admin Panel Link vorhanden",
+     "navigateTo('/admin')" in _nav2)
 
 test("Nav-Menu: svc-dot CSS-Klasse vorhanden",
      "svc-dot" in _nav2)
@@ -2140,8 +2140,8 @@ test("History: Event-Delegation via document.addEventListener click",
 test("History: _histSessions Lookup-Map vorhanden",
      "_histSessions" in _fix_html)
 
-test("History: closest('.history-item') fuer Event-Delegation",
-     "closest('.history-item')" in _fix_html or 'closest(".history-item")' in _fix_html)
+test("History: onHistoryClick via inline onclick statt event delegation",
+     "onHistoryClick(this)" in _fix_html)
 
 test("History: KEIN btn.onclick = () => loadConversation mehr",
      "btn.onclick = () => loadConversation" not in _fix_html)
@@ -2168,6 +2168,51 @@ test("deploy.sh referenziert NICHT mehr Assistant.app",
 
 test("deploy.sh startet Server aus src/",
      "web_server.py" in _deploy_src and "SRC" in _deploy_src)
+
+
+section("UI-Fixes 2026-04-15 (Topbar, History-onclick, Chrome-Fix)")
+
+_ui_html = requests.get(BASE_URL + "/").text
+
+test("History: onHistoryClick inline onclick vorhanden",
+     "onHistoryClick" in _ui_html)
+
+test("History: function onHistoryClick definiert",
+     "function onHistoryClick" in _ui_html)
+
+test("Chrome-Fix: webbrowser.open NICHT mehr im Server-Code",
+     "webbrowser" not in _ws_src)
+
+test("Chrome-Fix: kein import webbrowser",
+     "import webbrowser" not in _ws_src)
+
+# Admin-Topbar auf allen Admin-Seiten
+_admin_html = requests.get(BASE_URL + "/admin").text
+test("Admin-Topbar auf /admin vorhanden",
+     "admin-topbar" in _admin_html)
+
+test("Admin-Topbar hat Zurueck-zum-Chat Button",
+     "back-btn" in _admin_html and ("href='/'" in _admin_html or 'href="/"' in _admin_html))
+
+_ac_topbar = requests.get(BASE_URL + "/admin/access-control").text
+test("Admin-Topbar auf /admin/access-control vorhanden",
+     "admin-topbar" in _ac_topbar)
+
+_perm_topbar = requests.get(BASE_URL + "/admin/permissions").text
+test("Admin-Topbar auf /admin/permissions vorhanden",
+     "admin-topbar" in _perm_topbar)
+
+_docs_topbar = requests.get(BASE_URL + "/admin/docs").text
+test("Admin-Topbar auf /admin/docs vorhanden",
+     "admin-topbar" in _docs_topbar)
+
+_cl_topbar = requests.get(BASE_URL + "/admin/changelog").text
+test("Admin-Topbar auf /admin/changelog vorhanden",
+     "admin-topbar" in _cl_topbar)
+
+# Nav-Menu: kein doppelter Admin Panel Eintrag mit openNewWindow
+test("Nav-Menu: kein openNewWindow('/admin') mehr",
+     "openNewWindow('/admin')" not in _ui_html)
 
 
 # ============================================================

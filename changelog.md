@@ -6,6 +6,13 @@ Format: [Datum] Änderung | Datei | Grund
 
 ## 2026-04-15
 
+### Fix: Konversationshistorie-Klick (Event-Delegation), Working Memory in Matrix, Deploy ohne App-Bundle
+- **Konversationshistorie (2. Fix):** Event-Delegation mit `closest()` durch inline `onclick="onHistoryClick(this)"` ersetzt — zuverlässiger in pywebview. `_histSessions` Map als Lookup statt Closure.
+- **Chrome-Tab-Popup gestoppt:** `webbrowser.open('http://localhost:8080')` beim Serverstart entfernt. Kein Chrome-Tab wird mehr automatisch geöffnet.
+- **Admin-Topbar:** Alle Admin-Seiten (Admin, Access Control, Permissions, Docs, Changelog) haben jetzt eine einheitliche Navigationsleiste oben mit Buttons statt kleinem Textlink. "← Chat" Button führt direkt zurück.
+- **Menü bereinigt:** Doppelter "Admin Panel" Eintrag und "Neues Chat-Fenster" entfernt. Menü zeigt nur Services + Administration + Dokumentation.
+- **Tests:** 12 neue Tests. Suite: 581/581 gruen.
+
 ### Fix: Konversationshistorie-Klick, Working Memory in Matrix, Deploy-Script
 - **Konversationshistorie:** Klick auf Konversationen in der Sidebar funktionierte in pywebview nicht (programmatische `onclick`-Handler). Umgestellt auf Event-Delegation via `document.addEventListener('click')` mit `closest('.history-item')`. Betrifft alle Agenten und Sub-Agenten.
 - **Access Control Matrix:** Working Memory als vierte Shared-Datenquelle hinzugefuegt (neben Webclips, E-Mail, Kalender).

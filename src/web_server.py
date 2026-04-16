@@ -4,7 +4,6 @@ import datetime
 import threading
 import uuid
 import copy
-import webbrowser
 import re
 import signal
 import sys
@@ -3617,10 +3616,6 @@ HTML = """<!DOCTYPE html>
       <div class="nav-menu-section">Services</div>
       <div id="svc-list"><div class="svc-row" style="color:#666;">Lade...</div></div>
       <div class="nav-menu-divider"></div>
-      <div class="nav-menu-section">Fenster</div>
-      <a class="nav-menu-item" onclick="openNewWindow('/')"><span class="nav-icon">&#128468;</span><span class="nav-label">Neues Chat-Fenster</span></a>
-      <a class="nav-menu-item" onclick="openNewWindow('/admin')"><span class="nav-icon">&#9881;</span><span class="nav-label">Admin Panel</span></a>
-      <div class="nav-menu-divider"></div>
       <div class="nav-menu-section">Administration</div>
       <a class="nav-menu-item" onclick="navigateTo('/admin')"><span class="nav-icon">&#9881;</span><span class="nav-label">Admin Panel</span><span class="nav-hint">Status &amp; Uebersicht</span></a>
       <a class="nav-menu-item" onclick="navigateTo('/admin/access-control')"><span class="nav-icon">&#128274;</span><span class="nav-label">Access Control</span><span class="nav-hint">Matrix</span></a>
@@ -3629,9 +3624,6 @@ HTML = """<!DOCTYPE html>
       <div class="nav-menu-section">Dokumentation</div>
       <a class="nav-menu-item" onclick="navigateTo('/admin/docs')"><span class="nav-icon">&#128214;</span><span class="nav-label">Technische Docs</span><span class="nav-hint">API &amp; Architektur</span></a>
       <a class="nav-menu-item" onclick="navigateTo('/admin/changelog')"><span class="nav-icon">&#128203;</span><span class="nav-label">Changelog</span><span class="nav-hint">Aenderungshistorie</span></a>
-      <div class="nav-menu-divider"></div>
-      <div class="nav-menu-section">Chat</div>
-      <a class="nav-menu-item" onclick="navigateTo('/')"><span class="nav-icon">&#128172;</span><span class="nav-label">Zurueck zum Chat</span></a>
     </div>
   </div>
 </div>
@@ -4288,7 +4280,7 @@ async function reloadPrompt() {
 }
 
 // ─── HISTORY ────────────────────────────────────────────────────────────────────
-var _histSessions = {};  // file -> session data for delegation
+var _histSessions = {};
 async function loadHistory(agentName) {
   var r = await fetch('/get_history?agent=' + encodeURIComponent(agentName) + '&session_id=' + SESSION_ID);
   var data = await r.json();
@@ -4301,21 +4293,18 @@ async function loadHistory(agentName) {
   var h = '';
   data.sessions.forEach(function(s, i) {
     _histSessions[s.file] = s;
-    h += '<button class="history-item' + (i===0?' active':'') + '" data-file="' + escHtml(s.file) + '">';
+    h += '<button class="history-item' + (i===0?' active':'') + '" data-file="' + escHtml(s.file) + '" onclick="onHistoryClick(this)">';
     h += '<span class="h-date">' + escHtml(s.date) + '</span>';
     h += '<span class="h-summary">' + escHtml(s.title || s.date) + '</span>';
     h += '</button>';
   });
   list.innerHTML = h;
 }
-// Event delegation for history clicks (pywebview-compatible)
-document.addEventListener('click', function(e) {
-  var btn = e.target.closest('.history-item');
-  if (!btn) return;
-  var file = btn.dataset.file;
+function onHistoryClick(btn) {
+  var file = btn.getAttribute('data-file');
   var session = _histSessions[file];
   if (session) loadConversation(session, btn);
-});
+}
 
 async function loadConversation(session, btn) {
   document.querySelectorAll('.history-item').forEach(function(b) { b.classList.remove('active'); });
@@ -6760,8 +6749,11 @@ def admin_access_control_page():
 * { box-sizing:border-box; margin:0; padding:0; }
 body { background:#1a1a2e; color:#e0e0e0; font-family:-apple-system,Inter,sans-serif; padding:24px; }
 .container { max-width:1400px; margin:0 auto; }
-.back-link { color:#4a8aca; text-decoration:none; font-size:13px; }
-.back-link:hover { text-decoration:underline; }
+.admin-topbar { display:flex; align-items:center; gap:12px; padding:10px 0 16px; border-bottom:1px solid #334; margin-bottom:20px; flex-wrap:wrap; }
+.admin-topbar a { color:#aaa; text-decoration:none; font-size:12px; padding:6px 14px; border:1px solid #444; border-radius:6px; transition:all .15s; }
+.admin-topbar a:hover { border-color:#f0c060; color:#f0c060; text-decoration:none; }
+.admin-topbar .back-btn { background:#222; border-color:#555; color:#ccc; font-weight:600; }
+.admin-topbar .back-btn:hover { background:#333; border-color:#f0c060; color:#f0c060; }
 h1 { color:#f0c060; font-size:24px; margin:8px 0 4px; }
 .subtitle { color:#888; font-size:13px; margin-bottom:20px; }
 .msg { padding:10px 14px; border-radius:6px; margin:10px 0; font-size:13px; display:none; }
@@ -6797,7 +6789,14 @@ h1 { color:#f0c060; font-size:24px; margin:8px 0 4px; }
 .loading { text-align:center; padding:60px; color:#888; font-size:14px; }
 </style></head><body>
 <div class="container">
-<a href="/" class="back-link">&#8592; Zurueck zum Chat</a>
+<div class="admin-topbar">
+  <a class="back-btn" href="/">&#8592; Chat</a>
+  <a href="/admin">Admin</a>
+  <a href="/admin/access-control" style="border-color:#4a8aca;color:#4a8aca;background:#1a2a4a;">Access Control</a>
+  <a href="/admin/permissions">Berechtigungen</a>
+  <a href="/admin/docs">Docs</a>
+  <a href="/admin/changelog">Changelog</a>
+</div>
 <h1>&#9881; Access Control</h1>
 <div class="subtitle">Zugriffsrechte als Matrix &mdash; Datenquellen (Zeilen) &times; Agenten (Spalten)</div>
 <div id="msg" class="msg"></div>
@@ -9692,6 +9691,12 @@ a { color:#4a8aca; text-decoration:none; }
 a:hover { text-decoration:underline; }
 .subtitle { color:#888; font-size:13px; margin-bottom:24px; }
 .back { color:#4a8aca; font-size:13px; }
+.admin-topbar { display:flex; align-items:center; gap:12px; padding:10px 0 16px; border-bottom:1px solid #334; margin-bottom:20px; }
+.admin-topbar a { color:#aaa; text-decoration:none; font-size:12px; padding:6px 14px; border:1px solid #444; border-radius:6px; transition:all .15s; }
+.admin-topbar a:hover { border-color:#f0c060; color:#f0c060; }
+.admin-topbar a.active { border-color:#4a8aca; color:#4a8aca; background:#1a2a4a; }
+.admin-topbar .back-btn { background:#222; border-color:#555; color:#ccc; font-weight:600; }
+.admin-topbar .back-btn:hover { background:#333; border-color:#f0c060; color:#f0c060; }
 .card-grid { display:grid; grid-template-columns:repeat(auto-fit,minmax(220px,1fr)); gap:14px; margin-top:18px; }
 .card { background:#22224a; border:1px solid #334; border-radius:10px; padding:18px; text-decoration:none; color:#e0e0e0; transition:border-color .15s, transform .1s; }
 .card:hover { border-color:#4a8aca; transform:translateY(-2px); text-decoration:none; }
@@ -9711,11 +9716,21 @@ td { padding:8px 12px; border-top:1px solid #2c2c4a; font-size:13px; color:#d0d0
 
 
 def _admin_layout(title, body_html):
+    topbar = (
+        "<div class='admin-topbar'>"
+        "<a class='back-btn' href='/'>&#8592; Chat</a>"
+        "<a href='/admin'>Admin</a>"
+        "<a href='/admin/access-control'>Access Control</a>"
+        "<a href='/admin/permissions'>Berechtigungen</a>"
+        "<a href='/admin/docs'>Docs</a>"
+        "<a href='/admin/changelog'>Changelog</a>"
+        "</div>"
+    )
     return ("<!DOCTYPE html><html lang='de'><head><meta charset='UTF-8'>"
             f"<title>{_html_lib.escape(title)} — Admin</title>"
             f"<style>{_ADMIN_CSS}</style></head>"
             "<body><div class='container'>"
-            f"{body_html}"
+            f"{topbar}{body_html}"
             "</div></body></html>")
 
 
@@ -10393,10 +10408,7 @@ mmLoadAgents();
 
 
 if __name__ == '__main__':
-    def open_browser():
-        import time; time.sleep(1)
-        webbrowser.open('http://localhost:8080')
-    threading.Thread(target=open_browser, daemon=True).start()
+    # Browser wird NICHT mehr automatisch geoeffnet — native AssistantDev.app nutzt pywebview
     # Cleanup old sessions every hour
     def session_cleanup_loop():
         import time
