@@ -194,6 +194,70 @@ QUESTION_INTENT_PHRASES = [
     'o que disse', 'o que escreveu', 'o que tinha', 'qual data', 'qual arquivo',
     'quando foi', 'quando disse', 'quem disse', 'quem enviou',
     'lembra', 'se lembra', 'lembra-se',
+    # Konversationelle Personen-Phrasen ("hat sich gemeldet", "news von", ...).
+    # Diese Phrasen sind selbst kein Frage-Verb, signalisieren aber klar
+    # Such-Intent wenn ein Personenname mitgeliefert wird.
+    'hat sich gemeldet', 'meldet sich', 'meldete sich', 'meldung von',
+    'gibt es was von', 'gibts was von', 'gibts neues von', 'gibt es neues von',
+    'gibt es was neues von', 'gibts was neues von',
+    'was gibt es von', 'was gibts von', 'was gibts neues von',
+    'was l\u00e4uft mit', 'was laeuft mit', 'was geht mit', 'was macht',
+    'wie steht es um', 'wie sieht es aus mit',
+    'h\u00f6re ich von', 'hoere ich von', 'h\u00f6ren wir von', 'hoeren wir von',
+    'news von', 'update zu', 'update von', 'neues von', 'antwort von',
+    'antwort auf', 'feedback von', 'r\u00fcckmeldung von', 'rueckmeldung von',
+    'zuletzt von', 'zuletzt mit',
+    # Englisch
+    'heard from', 'any news from', 'any update from', 'any update on',
+    'update on', 'news from', 'reached out', 'replied', 'response from',
+    'latest from', 'last from',
+    # Portugiesisch
+    'novidades de', 'resposta de', 'falou comigo', 'me escreveu', 'me mandou',
+]
+
+# German often splits a verb phrase around the subject — "hat sich [X] gemeldet"
+# instead of "hat sich gemeldet [X]". A flat substring match misses those, so
+# we add regex patterns that allow up to a few words between the parts.
+# Each pattern is `re.search`ed against the lowercased message.
+QUESTION_INTENT_REGEXES = [
+    # "hat/hatte sich [X] gemeldet/gemailt"
+    r'\bhat(?:te)?\s+sich\s+\w+(?:\s+\w+){0,4}\s+(?:gemeldet|gemailt|gemailed|gemeldet)\b',
+    # "meldet/meldete sich [X]"
+    r'\bmelde(?:t|te)\s+sich\s+\w+',
+    # "[X] hat sich gemeldet/gemailt"
+    r'\b\w+(?:\s+\w+){0,3}\s+hat\s+sich\s+(?:gemeldet|gemailt|gemailed|gemeldet)\b',
+    # "gibt es (was/neues/news) (von/zu) [X]" / "gibts was neues von [X]"
+    r'\bgib(?:t|ts|t es)\s+(?:was\s+)?(?:neues|news)?\s*(?:von|zu)\s+\w+',
+    # "was (macht|läuft|geht) [X]"
+    r'\bwas\s+(?:macht|l\u00e4uft|laeuft|geht|gibt es bei)\s+\w+',
+    # "wie steht es um [X]" / "wie sieht es aus mit [X]"
+    r'\bwie\s+steht\s+es\s+um\s+\w+',
+    r'\bwie\s+sieht\s+es\s+aus\s+(?:mit|bei)\s+\w+',
+    # English forms
+    r'\bany\s+(?:news|update[s]?)\s+from\s+\w+',
+    r'\bheard\s+from\s+\w+',
+    r'\bdid\s+\w+(?:\s+\w+){0,3}\s+(?:reply|respond|reach\s+out|message|email|write)',
+    r'\bhas\s+\w+(?:\s+\w+){0,3}\s+(?:replied|responded|reached\s+out|messaged|emailed|written|gotten\s+back)',
+    # Portuguese
+    r'\b(?:tem|teve)\s+(?:noticia|not\u00edcia)s?\s+(?:de|do|da)\s+\w+',
+    r'\b\w+(?:\s+\w+){0,3}\s+me\s+(?:escreveu|mandou|chamou|respondeu)',
+]
+
+# Phrases the user uses to signal they want the *most recent* item(s) first.
+# When detected, the search ranks results by date (newest first) and uses
+# scores only as a tie-break.
+RECENCY_TRIGGER_PHRASES = [
+    # Deutsch
+    'letzte', 'letzten', 'letzter', 'letztes',
+    'neueste', 'neuesten', 'neueste', 'neuste', 'neusten',
+    'aktuell', 'aktuelle', 'aktuellste', 'aktuellsten',
+    'j\u00fcngste', 'juengste', 'j\u00fcngsten', 'juengsten',
+    'zuletzt', 'k\u00fcrzlich', 'kuerzlich', 'gerade',
+    # Englisch
+    'last', 'latest', 'newest', 'most recent', 'recent', 'recently', 'just now',
+    # Portugiesisch
+    '\u00faltima', 'ultima', '\u00faltimo', 'ultimo', '\u00faltimas', 'ultimas',
+    'recente', 'recentes', 'mais recente', 'mais recentes',
 ]
 
 # Conversational phrases that should NOT trigger a search even if a proper noun is present.
@@ -839,6 +903,51 @@ class SearchIndex:
         return len(self.entries)
 
 
+# ─── Recency helpers (used by HybridSearch and hybrid_rag_search) ────────────
+
+# Standard email-watcher names start with YYYY-MM-DD_HH-MM-SS_…
+# Older "email_…" exports start with email_YYYY-MM-DD_HH-MM-SS_…
+_DATE_RX = re.compile(r'(\d{4}-\d{2}-\d{2})(?:[_T-](\d{2}-\d{2}-\d{2}|\d{2}:\d{2}:\d{2}))?')
+
+
+def extract_date_from_name(fname):
+    """Pull a date/time string out of a memory filename.
+
+    Returns an ISO-ish string like '2026-04-14T12-50-42' (sortable, newest =
+    largest) when one is found, or '' when nothing date-like is present.
+    Both the new email_watcher v2 schema (YYYY-MM-DD_HH-MM-SS_*) and legacy
+    forms (email_YYYY-MM-DD…, YYYY-MM-DD…) are recognised.
+    """
+    if not fname:
+        return ''
+    base = os.path.basename(fname)
+    m = _DATE_RX.search(base)
+    if not m:
+        return ''
+    date_part = m.group(1)
+    time_part = m.group(2) or '00-00-00'
+    # Normalise ':' -> '-' so the string sorts correctly.
+    time_part = time_part.replace(':', '-')
+    return f"{date_part}T{time_part}"
+
+
+def _recency_key(name, entry=None):
+    """Sort key for newest-first ordering. Falls back to mtime if no date in
+    the filename, so files without a stamped date still sort sensibly."""
+    iso = extract_date_from_name(name)
+    if iso:
+        return iso
+    mt = (entry or {}).get('mtime', 0) if entry else 0
+    if mt:
+        # Convert to an ISO-shaped string so the comparison stays string-based
+        # and we never mix int/str when sorting alongside ISO keys.
+        try:
+            return datetime.datetime.fromtimestamp(mt).strftime('%Y-%m-%dT%H-%M-%S')
+        except Exception:
+            return ''
+    return ''
+
+
 # ═══════════════════════════════════════════════════════════════════════════════
 # TEIL 2 — QUERY PARSER
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -860,6 +969,7 @@ class QueryIntent:
         self.is_search = False      # True if search intent detected
         self.max_results = None     # Optional result-count hint ("die letzten 10" -> 10)
         self.wants_global = False   # True when user explicitly asks for global / "everywhere"
+        self.recency_first = False  # True -> sort results by date desc (score is tie-break)
         self.wants_deep = False     # True when user asks for detailed/thorough / /deep prefix
 
     def summary(self):
@@ -902,6 +1012,10 @@ class QueryParser:
 
         has_object = any(w.rstrip('.,;:!?') in SEARCH_OBJECTS for w in words)
         has_question_intent = any(phrase in msg_lower for phrase in QUESTION_INTENT_PHRASES)
+        if not has_question_intent:
+            has_question_intent = any(
+                re.search(pat, msg_lower) for pat in QUESTION_INTENT_REGEXES
+            )
 
         # Legacy trigger
         if 'memory folder' in msg_lower or 'memory ordner' in msg_lower:
@@ -994,6 +1108,52 @@ class QueryParser:
                 return intent
 
         intent.is_search = True
+
+        # ── Recency-first detection ─────────────────────────────────────
+        # 1) Explicit recency words ("letzte mail", "neueste", "latest", ...)
+        for trig in RECENCY_TRIGGER_PHRASES:
+            # Whole-word/phrase containment so "letzte" doesn't fire inside "verletzte".
+            if re.search(r'(?<![\w])' + re.escape(trig) + r'(?![\w])', msg_lower):
+                intent.recency_first = True
+                break
+
+        # 2) Person-only short query: "Fabian Adam", "Thomas Smith" — assume
+        #    the user wants the freshest item from that person.
+        if not intent.recency_first and not force_search:
+            substantial = [w for w in words if w.rstrip('.,;:!?') not in STOPWORDS]
+            if (len(intent.person_names) >= 1
+                    and len(substantial) <= 3
+                    and not has_object
+                    and not has_question_intent
+                    and not has_action):
+                intent.recency_first = True
+
+        # 3) Conversational person-phrases ("hat sich gemeldet", "news von ...")
+        #    imply recency too — the user is asking about the latest contact.
+        if not intent.recency_first:
+            CONVERSATIONAL_PERSON_HINTS = (
+                'hat sich gemeldet', 'meldet sich', 'meldete sich',
+                'gibt es was von', 'gibts was von', 'gibts neues von',
+                'gibt es neues von', 'gibt es was neues von', 'gibts was neues von',
+                'was gibt es von', 'was gibts von', 'was gibts neues von',
+                'h\u00f6re ich von', 'hoere ich von', 'h\u00f6ren wir von', 'hoeren wir von',
+                'news von', 'update zu', 'update von', 'neues von',
+                'antwort von', 'antwort auf', 'feedback von',
+                'r\u00fcckmeldung von', 'rueckmeldung von',
+                'zuletzt von', 'zuletzt mit',
+                'heard from', 'any news from', 'any update from', 'any update on',
+                'update on', 'news from', 'reached out', 'replied',
+                'response from', 'latest from', 'last from',
+                'novidades de', 'resposta de', 'me escreveu', 'me mandou',
+            )
+            if any(p in msg_lower for p in CONVERSATIONAL_PERSON_HINTS):
+                intent.recency_first = True
+
+        # 4) Any QUESTION_INTENT_REGEXES match implies a conversational
+        #    "what's the latest" question -> recency_first.
+        if not intent.recency_first:
+            if any(re.search(pat, msg_lower) for pat in QUESTION_INTENT_REGEXES):
+                intent.recency_first = True
 
         # ── 2. Time filter ──────────────────────────────────────────────
         today = datetime.date.today()
@@ -1149,12 +1309,17 @@ class HybridSearch:
     """Multi-stage search combining index filtering, BM25 scoring, and full-text."""
 
     @staticmethod
-    def search(intent, speicher_path, max_results=3, forced_type=None):
+    def search(intent, speicher_path, max_results=3, forced_type=None,
+               recency_first=None):
         """Execute a structured search. Returns (results, feedback_info).
         results: list of {name, content, score}
         feedback_info: dict with query, date_label, field_label, found_count, index_count
         forced_type: if set, overrides intent's type filter (e.g. 'email', 'webclip', 'document', 'conversation', 'screenshot')
+        recency_first: if True, sort by date desc and use score as tie-break.
+            Defaults to intent.recency_first.
         """
+        if recency_first is None:
+            recency_first = bool(getattr(intent, 'recency_first', False))
         # Apply forced type filter
         if forced_type:
             st, eff = detect_source_filter(forced_type)
@@ -1364,7 +1529,48 @@ class HybridSearch:
             scored[fname] = scored.get(fname, 0) + body_score
 
         # ── SCHRITT 4: Ranking and return ──────────────────────────────
-        final_sorted = sorted(scored.items(), key=lambda x: x[1], reverse=True)
+        # Default: sort by score desc, with date as tie-break (newest first).
+        # When recency_first is set, we do the same Score sort first — but then
+        # take a Top-N pool (still requires score > 0) and re-sort *that pool*
+        # by date. When a person is mentioned in the query, the pool is further
+        # restricted to hits that actually mention that person, so "Hat sich
+        # Fabian gemeldet?" returns Fabian's mails sorted newest-first instead
+        # of arbitrary newest mails from anyone.
+        score_then_date = sorted(
+            scored.items(),
+            key=lambda kv: (kv[1], _recency_key(kv[0], candidates.get(kv[0], {}))),
+            reverse=True,
+        )
+        if recency_first:
+            relevant = [(n, s) for n, s in score_then_date if s > 0]
+            # Person-aware narrowing: when the query names someone, only keep
+            # hits where that name surfaces in the filename, sender, subject
+            # or preview. Falls back to the unfiltered pool if nothing matches
+            # so we never lose the user's hits entirely.
+            if names_norm:
+                filtered = []
+                for n, s in relevant:
+                    entry = candidates.get(n, {})
+                    haystack = ' '.join([
+                        normalize_unicode(n),
+                        normalize_unicode(entry.get('from', '')),
+                        normalize_unicode(entry.get('to', '')),
+                        normalize_unicode(entry.get('subject', '')),
+                        normalize_unicode(entry.get('preview', '')),
+                    ]).lower()
+                    if any(pn in haystack for pn in names_norm):
+                        filtered.append((n, s))
+                if filtered:
+                    relevant = filtered
+            pool_size = max(max_results + 3, 10)
+            pool = relevant[:pool_size]
+            final_sorted = sorted(
+                pool,
+                key=lambda kv: (_recency_key(kv[0], candidates.get(kv[0], {})), kv[1]),
+                reverse=True,
+            )
+        else:
+            final_sorted = score_then_date
         results = []
         for fname, score in final_sorted[:max_results]:
             if score <= 0:
@@ -1638,6 +1844,19 @@ def auto_search(msg, speicher_path, max_results=None, use_rag=True,
     # query expansion + compression.
     effective_fast = fast and not intent.wants_deep
 
+    # If the user is searching for emails (explicit "email"/"mail" keyword or
+    # a file_type=email filter), default to recency_first so the freshest mail
+    # always sits at position 1.
+    msg_lower_for_rec = msg.lower()
+    if not intent.recency_first:
+        EMAIL_WORDS = ('email', 'emails', 'mail', 'mails', 'e-mail', 'e-mails',
+                       'nachricht', 'nachrichten', 'message', 'messages',
+                       'mensagem', 'mensagens')
+        words_in_msg = msg_lower_for_rec.split()
+        if (intent.file_type == 'email'
+                or any(w.rstrip('.,;:!?') in EMAIL_WORDS for w in words_in_msg)):
+            intent.recency_first = True
+
     # ── Route to global search when requested ──
     if enable_global and intent.wants_global:
         try:
@@ -1659,6 +1878,7 @@ def auto_search(msg, speicher_path, max_results=None, use_rag=True,
                 max_results=effective_max,
                 compress=compress,
                 n_variants=n_variants,
+                recency_first=intent.recency_first,
             )
         except Exception as e:
             print(f"[auto_search] hybrid_rag_search error: {e}")
@@ -1685,6 +1905,7 @@ def auto_search(msg, speicher_path, max_results=None, use_rag=True,
             'semantic': rag_out.get('semantic', False),
             'queries': rag_out.get('queries', [msg]),
             'fallback': rag_out.get('fallback'),
+            'recency_first': intent.recency_first,
         }
         return (results, feedback)
 
@@ -1695,9 +1916,13 @@ def auto_search(msg, speicher_path, max_results=None, use_rag=True,
     except Exception as e:
         print(f"[auto_search] index update error: {e}")
 
-    results, feedback = HybridSearch.search(intent, speicher_path, max_results=effective_max)
+    results, feedback = HybridSearch.search(
+        intent, speicher_path, max_results=effective_max,
+        recency_first=intent.recency_first,
+    )
     if feedback is not None:
         feedback['rag'] = False
+        feedback['recency_first'] = intent.recency_first
     return (results, feedback)
 
 
@@ -3094,12 +3319,17 @@ def compress_chunk(chunk_text, query, speicher_path=None, max_tokens=220):
 # ─── HYBRID RAG SEARCH (top-level orchestrator) ──────────────────────────────
 
 def hybrid_rag_search(query, speicher_path, max_results=5,
-                      fuse_top=20, compress=True, n_variants=2):
+                      fuse_top=20, compress=True, n_variants=2,
+                      recency_first=None):
     """Full RAG pipeline:
         1) expand query into {original + variants} (skipped if n_variants=0)
         2) parallel keyword search (existing HybridSearch) + semantic search
         3) RRF fusion -> top `fuse_top`
         4) take first `max_results`, optionally contextually compress
+
+    recency_first: if True, after RRF the top items are reordered so the newest
+        date wins, with the RRF score acting as tie-break. If None (default),
+        the parsed intent of `query` decides.
 
     Returns dict with:
         queries:    list of all expanded queries
@@ -3118,6 +3348,11 @@ def hybrid_rag_search(query, speicher_path, max_results=5,
     out['queries'] = queries
 
     # --- Keyword side: run existing HybridSearch per query variant ---
+    # We use force_search=True so every word is treated as a candidate person
+    # name — that's what makes "ExFlow Rechnung" find a PDF named
+    # "Rechnung_*.pdf". The recency narrowing below uses the *normal* parse
+    # (person_names only) so that step still distinguishes real people from
+    # ordinary query terms.
     keyword_lists = []
     for q in queries:
         try:
@@ -3156,7 +3391,52 @@ def hybrid_rag_search(query, speicher_path, max_results=5,
 
     # --- RRF fusion ---
     fused = rrf_fuse(keyword_lists + semantic_lists, k=_RRF_K, top_n=fuse_top)
-    top = fused[:max_results]
+
+    # Decide recency mode: explicit override > intent of original query
+    if recency_first is None:
+        try:
+            recency_first = bool(getattr(QueryParser.parse(query), 'recency_first', False))
+        except Exception:
+            recency_first = False
+
+    # Score-first sort with date tie-break.
+    fused.sort(
+        key=lambda it: (it['rrf_score'], extract_date_from_name(it['name'])),
+        reverse=True,
+    )
+    if recency_first:
+        # Take the top-N RRF candidates as a relevance pool, then re-sort that
+        # pool by date so the freshest *relevant* item lands at position 1.
+        # When the query mentions a person, narrow the pool to hits that
+        # actually contain that person's name (in filename/snippet) — otherwise
+        # the freshest *unrelated* mail of the day wins.
+        master_intent_for_recency = QueryParser.parse(query)
+        person_names = [
+            normalize_unicode(p).lower() for p in master_intent_for_recency.person_names
+        ]
+        pool_size = max(max_results + 3, 10)
+        pool = fused[:pool_size]
+        if person_names:
+            narrowed = []
+            for it in pool:
+                hay = normalize_unicode(it['name']).lower()
+                if any(pn in hay for pn in person_names):
+                    narrowed.append(it)
+                    continue
+                # Cheap snippet check — read the file head if we have nothing else.
+                snippet_blob = chunk_by_key.get(it['name'], (None, 0))[0]
+                if snippet_blob and any(pn in normalize_unicode(snippet_blob).lower()
+                                        for pn in person_names):
+                    narrowed.append(it)
+            if narrowed:
+                pool = narrowed
+        pool.sort(
+            key=lambda it: (extract_date_from_name(it['name']), it['rrf_score']),
+            reverse=True,
+        )
+        top = pool[:max_results]
+    else:
+        top = fused[:max_results]
 
     # --- Build output: prefer semantic chunk if we have one, else file head ---
     results = []

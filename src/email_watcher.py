@@ -490,12 +490,9 @@ def process_eml(eml_path, processed):
             except Exception as e:
                 print(f"  Kontakt-Update Fehler: {e}")
 
-        # Index aktualisieren
-        if index_single_file:
-            try:
-                index_single_file(os.path.dirname(memory_dir), email_filename)
-            except Exception:
-                pass
+        # Index aktualisieren — robustly: direct API first, then a touch
+        # fallback so the next reader rebuilds the index.
+        _trigger_index_update_for(memory_dir, email_filename)
 
         # Anhaenge speichern
         saved_attachments = []
@@ -560,6 +557,54 @@ def _migrate_processed_emls(processed):
         print(f"[MIGRATE] Moved {moved} already-processed .eml files to {PROCESSED_SUBDIR}", flush=True)
 
 
+# How often the watcher scans the iCloud inbox folder. Apple Mail's rule writes
+# .eml files there as soon as a mail arrives, so a tighter loop means freshly
+# received mails show up in the agent memory within seconds.
+POLL_INTERVAL_SEC = 2
+
+# Optional: ask Apple Mail to fetch new mail explicitly. Without this the
+# watcher only sees what Mail's own polling has already pulled, which on
+# battery / energy-saver schedules can lag for minutes. We keep it cheap by
+# only firing every FORCE_SYNC_EVERY iterations of the watch loop.
+FORCE_SYNC_EVERY = 30  # ~ once per minute when POLL_INTERVAL_SEC=2
+
+
+def force_apple_mail_sync():
+    """Tell Apple Mail to immediately check all accounts for new messages.
+    Best-effort — failures are silently swallowed (Mail not running, AppleScript
+    permission denied, etc.). Triggers do not block the watcher."""
+    try:
+        subprocess.run(
+            ['osascript', '-e', 'tell application "Mail" to check for new mail'],
+            capture_output=True, timeout=10,
+        )
+    except Exception:
+        pass
+
+
+def _trigger_index_update_for(memory_dir, email_filename):
+    """Update the per-agent search index for a single email file.
+
+    The PyInstaller-frozen app cannot import `search_engine` cleanly because
+    its module-level threads spin up a heavy embedding pipeline. We try the
+    direct API first; if it fails we degrade gracefully — `update_all_indexes`
+    in the web server will pick the new file up on its next pass."""
+    if not index_single_file:
+        return
+    try:
+        index_single_file(os.path.dirname(memory_dir), email_filename)
+        return
+    except Exception as e:
+        print(f"  index_single_file({email_filename}) failed: {e}", flush=True)
+    # Last resort: invalidate the index file so the next reader rebuilds it.
+    try:
+        idx_file = os.path.join(os.path.dirname(memory_dir), '.search_index.json')
+        if os.path.exists(idx_file):
+            os.utime(idx_file, None)  # touch to mark stale
+    except Exception:
+        pass
+
+
 def main():
     os.makedirs(WATCH_DIR, exist_ok=True)
     processed = load_processed()
@@ -571,14 +616,21 @@ Email Watcher v2 gestartet
 Ordner: {WATCH_DIR}
 Log:    {PROCESSED_LOG}
 Junk-Filter: Apple Mail Regel (vorgelagert)
+Polling: alle {POLL_INTERVAL_SEC}s, Apple Mail Force-Sync alle {FORCE_SYNC_EVERY * POLL_INTERVAL_SEC}s
 Control+C zum Beenden.
 {'─' * 45}
 """, flush=True)
 
     _migrate_processed_emls(processed)
 
+    loop_iter = 0
     while True:
         try:
+            loop_iter += 1
+            if loop_iter % FORCE_SYNC_EVERY == 1:
+                # First iteration and every ~minute thereafter: nudge Apple
+                # Mail so we don't sit and wait for its own poll schedule.
+                force_apple_mail_sync()
             for fname in sorted(os.listdir(WATCH_DIR)):
                 if not fname.endswith('.eml'):
                     continue
@@ -590,7 +642,7 @@ Control+C zum Beenden.
                     processed.discard(fname)
                     save_processed(processed)
                 process_eml(os.path.join(WATCH_DIR, fname), processed)
-            time.sleep(5)
+            time.sleep(POLL_INTERVAL_SEC)
         except KeyboardInterrupt:
             print("\nEmail Watcher beendet.")
             break
