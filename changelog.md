@@ -6,6 +6,13 @@ Format: [Datum] Änderung | Datei | Grund
 
 ## 2026-04-15
 
+### Feature: Access Control Matrix-UI
+- **Was:** Access Control Seite (`/admin/access-control`) von Checkbox-Karten-Liste zu einer Agenten x Datenquellen Matrix umgebaut. Drei Sektionen: Eigenes Memory, Shared Memory (webclips, email_inbox, calendar), Cross-Agent Read. Jede Zelle ist eine Checkbox. Badges zeigen pro Datenquelle ob Zugriff exklusiv oder geteilt ist. Sticky Header und erste Spalte fuer horizontales/vertikales Scrollen. Agent-Namen 45-Grad-rotiert im Tabellenkopf.
+- **Warum:** Alte UI war unuebersichtlich und zeigte nicht auf einen Blick wer auf welche Daten Zugriff hat. Matrix-Darstellung macht Zugriffsrechte sofort sichtbar.
+- **Dateien:** `src/web_server.py`, `tests/run_tests.py`
+- **Tests:** 31 neue Tests in Sektion "Access Control Matrix-UI 2026-04-15". Suite: 530/530 gruen.
+- **Backups:** `backups/2026-04-15_22-05-59/src/web_server.py`
+
 ### Feature: System Tray App komplett neu aufgebaut
 - **Was:** `src/app.py` komplett ueberarbeitet. Neue Klasse `AssistantDevApp` mit klarer Menu-Struktur.
 - **Name:** App heisst jetzt "AssistantDev" (statt "Assistant"), Prozessname via setproctitle ebenfalls "AssistantDev".
