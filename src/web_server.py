@@ -3815,6 +3815,9 @@ function switchToTab(tabId) {
     document.getElementById('msg-input').placeholder = 'Nachricht an ' + (tab.label || tab.agentName) + '...';
     loadHistory(tab.agentName);
   }
+  // Per-Tab Processing-State ins DOM spiegeln (typing-indicator, stop-btn,
+  // queue-display) und im Hintergrund gesammelte Responses einfliessen lassen
+  renderActiveTabState();
   renderTabs();
 }
 
@@ -3823,6 +3826,15 @@ function closeTab(tabId, evt) {
   if (_tabs.length <= 1) return; // mindestens 1 Tab
   var idx = _tabs.findIndex(function(t){ return t.id === tabId; });
   if (idx < 0) return;
+  var closingTab = _tabs[idx];
+  // Polling und Typing-Animation fuer diese Session beenden, sonst laufen
+  // sie im Hintergrund weiter und lecken Speicher.
+  if (closingTab && closingTab.sessionId && _tabStates[closingTab.sessionId]) {
+    var cs = _tabStates[closingTab.sessionId];
+    if (cs.pollIntervalId) { clearInterval(cs.pollIntervalId); cs.pollIntervalId = null; }
+    if (cs.typingIntervalId) { clearInterval(cs.typingIntervalId); cs.typingIntervalId = null; }
+    delete _tabStates[closingTab.sessionId];
+  }
   _tabs.splice(idx, 1);
   if (_activeTabId === tabId) {
     var newIdx = Math.min(idx, _tabs.length - 1);
@@ -5175,10 +5187,98 @@ function onFindLiveKey(e) {
 }
 
 // ─── SEND ────────────────────────────────────────────────────────────────────────
-// ─── QUEUE SYSTEM ──────────────────────────────────────────────────────────
-let pollInterval = null;
-let typingInterval = null;
-let queuedPlaceholders = {};  // queue_id -> DOM element
+// ─── QUEUE SYSTEM (per-session / per-tab isolated state) ──────────────────
+// Jeder Browser-Tab hat eine eigene SESSION_ID. Processing-State (laeuft/idle,
+// aktueller Prompt, Stop-Button-Sichtbarkeit, Queue-Laenge, Pending-Responses,
+// Placeholder-DOM-Refs und setInterval-IDs) wird pro Session in _tabStates
+// gefuehrt. DOM-Updates passieren nur, wenn die betroffene Session aktuell
+// aktiv ist; sonst wird der State silent aktualisiert und Responses fuer den
+// inaktiven Tab werden gepuffert, bis dieser Tab wieder aktiv wird.
+var _tabStates = {};  // sessionId -> state
+
+function _tabState(sid) {
+  sid = sid || SESSION_ID;
+  if (!_tabStates[sid]) {
+    _tabStates[sid] = {
+      processing: false,
+      currentPrompt: '',
+      stopBtnVisible: false,
+      queueLength: 0,
+      pollIntervalId: null,
+      typingIntervalId: null,
+      queuedPlaceholders: {},  // queue_id -> DOM element (only valid while tab active)
+      pendingResponses: []     // responses received while tab inactive
+    };
+  }
+  return _tabStates[sid];
+}
+
+function _isActiveSession(sid) {
+  return (sid || SESSION_ID) === SESSION_ID;
+}
+
+// Backwards-compat shim: legacy code reads/writes queuedPlaceholders directly.
+// Via Proxy aliasen wir das auf den aktuellen Tab-State.
+var queuedPlaceholders = new Proxy({}, {
+  get: function(_, key) {
+    var s = _tabState(SESSION_ID);
+    if (key === Symbol.iterator) return s.queuedPlaceholders[Symbol.iterator];
+    return s.queuedPlaceholders[key];
+  },
+  set: function(_, key, value) {
+    _tabState(SESSION_ID).queuedPlaceholders[key] = value;
+    return true;
+  },
+  deleteProperty: function(_, key) {
+    delete _tabState(SESSION_ID).queuedPlaceholders[key];
+    return true;
+  },
+  ownKeys: function() { return Object.keys(_tabState(SESSION_ID).queuedPlaceholders); },
+  getOwnPropertyDescriptor: function(_, key) {
+    var v = _tabState(SESSION_ID).queuedPlaceholders[key];
+    return v === undefined ? undefined : {enumerable: true, configurable: true, value: v};
+  }
+});
+
+// Rendert den gespeicherten State des aktiven Tabs ins globale DOM.
+// Wird von switchToTab() aufgerufen, wenn der Nutzer Tabs wechselt.
+function renderActiveTabState() {
+  var s = _tabState(SESSION_ID);
+  // Typing indicator
+  var indicator = document.getElementById('typing-indicator');
+  var typingText = document.getElementById('typing-text');
+  if (s.processing) {
+    indicator.style.display = 'flex';
+    typingText.textContent = s.currentPrompt ? 'Verarbeite: '+s.currentPrompt+'...' : 'Verarbeitet...';
+  } else {
+    indicator.style.display = 'none';
+  }
+  // Stop btn
+  document.getElementById('stop-btn').style.display = s.stopBtnVisible ? 'inline-block' : 'none';
+  // Queue badge
+  var qel = document.getElementById('queue-display');
+  var qtxt = document.getElementById('queue-text');
+  if (s.queueLength > 0) {
+    qel.style.display = 'block';
+    qtxt.textContent = '\u23f3 '+s.queueLength+' Prompt'+(s.queueLength>1?'s':'')+' in der Warteschlange';
+  } else {
+    qel.style.display = 'none';
+  }
+  // Flush buffered responses collected while this tab was inactive
+  if (s.pendingResponses && s.pendingResponses.length) {
+    var pending = s.pendingResponses;
+    s.pendingResponses = [];
+    pending.forEach(function(resp){
+      // Placeholder aus dem jetzt aktiven DOM entfernen (data-queue-id Lookup)
+      if (resp.queue_id) {
+        var ph = document.querySelector('.msg.queued[data-queue-id="'+resp.queue_id+'"]');
+        if (ph) ph.remove();
+        if (s.queuedPlaceholders[resp.queue_id]) delete s.queuedPlaceholders[resp.queue_id];
+      }
+      handleResponse(resp);
+    });
+  }
+}
 
 function handleResponse(data) {
   if (data.error) { addStatusMsg('Fehler: '+data.error); return; }
@@ -5234,7 +5334,10 @@ function addQueuedMessage(text, position, queueId) {
   return div;
 }
 
-function updateQueueDisplay(count) {
+function updateQueueDisplay(count, sid) {
+  sid = sid || SESSION_ID;
+  _tabState(sid).queueLength = count || 0;
+  if (!_isActiveSession(sid)) return;  // Nur DOM aktualisieren wenn dieser Tab aktiv ist
   const el = document.getElementById('queue-display');
   const txt = document.getElementById('queue-text');
   if (count > 0) {
@@ -5245,85 +5348,116 @@ function updateQueueDisplay(count) {
   }
 }
 
-function showStopBtn(show) {
+function showStopBtn(show, sid) {
+  sid = sid || SESSION_ID;
+  _tabState(sid).stopBtnVisible = !!show;
+  if (!_isActiveSession(sid)) return;
   document.getElementById('stop-btn').style.display = show ? 'inline-block' : 'none';
 }
 
-function startTyping(prompt) {
+function startTyping(prompt, sid) {
+  sid = sid || SESSION_ID;
+  var s = _tabState(sid);
+  s.processing = true;
+  s.currentPrompt = prompt || '';
+  showStopBtn(true, sid);
+  if (s.typingIntervalId) { clearInterval(s.typingIntervalId); s.typingIntervalId = null; }
+  const typingMsgs = ['Denkt nach...','Verarbeitet...','Analysiert...','Arbeitet...','Formuliert Antwort...','Noch einen Moment...'];
+  var mi = 0;
+  // Rotations-Animation laeuft pro Tab. Wenn inaktiv: State wird gesetzt, DOM nicht.
+  s.typingIntervalId = setInterval(function(){
+    mi = (mi+1) % typingMsgs.length;
+    if (!_isActiveSession(sid)) return;
+    var st = _tabState(sid);
+    var ttx = document.getElementById('typing-text');
+    if (ttx) ttx.textContent = st.currentPrompt ? 'Verarbeite: '+st.currentPrompt+'...' : typingMsgs[mi];
+  }, 2500);
+  if (!_isActiveSession(sid)) return;
   const indicator = document.getElementById('typing-indicator');
   const typingText = document.getElementById('typing-text');
   indicator.style.display = 'flex';
-  showStopBtn(true);
-  if (prompt) {
-    typingText.textContent = 'Verarbeite: '+prompt+'...';
-  }
-  const msgs = ['Denkt nach...','Verarbeitet...','Analysiert...','Arbeitet...','Formuliert Antwort...','Noch einen Moment...'];
-  let mi = 0;
-  if (typingInterval) clearInterval(typingInterval);
-  typingInterval = setInterval(() => {
-    mi = (mi+1)%msgs.length;
-    typingText.textContent = prompt ? 'Verarbeite: '+prompt+'...' : msgs[mi];
-  }, 2500);
+  typingText.textContent = prompt ? 'Verarbeite: '+prompt+'...' : typingMsgs[0];
 }
 
-function stopTyping() {
+function stopTyping(sid) {
+  sid = sid || SESSION_ID;
+  var s = _tabState(sid);
+  s.processing = false;
+  s.currentPrompt = '';
+  if (s.typingIntervalId) { clearInterval(s.typingIntervalId); s.typingIntervalId = null; }
+  if (!_isActiveSession(sid)) return;
   document.getElementById('typing-indicator').style.display = 'none';
-  if (typingInterval) { clearInterval(typingInterval); typingInterval = null; }
 }
 
-function startPolling() {
-  if (pollInterval) return;
-  pollInterval = setInterval(async () => {
+function startPolling(sid) {
+  sid = sid || SESSION_ID;
+  var s = _tabState(sid);
+  if (s.pollIntervalId) return;
+  s.pollIntervalId = setInterval(async function(){
     try {
-      const r = await fetch('/poll_responses?session_id=' + SESSION_ID);
+      const r = await fetch('/poll_responses?session_id=' + sid);
       const data = await r.json();
       if (data.responses && data.responses.length) {
-        data.responses.forEach(resp => {
-          if (queuedPlaceholders[resp.queue_id]) {
-            queuedPlaceholders[resp.queue_id].remove();
-            delete queuedPlaceholders[resp.queue_id];
+        data.responses.forEach(function(resp){
+          if (_isActiveSession(sid)) {
+            if (s.queuedPlaceholders[resp.queue_id]) {
+              s.queuedPlaceholders[resp.queue_id].remove();
+              delete s.queuedPlaceholders[resp.queue_id];
+            }
+            handleResponse(resp);
+          } else {
+            // Tab inaktiv: Response puffern und auf Tab-Switch flushen
+            s.pendingResponses.push(resp);
           }
-          handleResponse(resp);
         });
       }
     } catch(e) {}
     try {
-      const r2 = await fetch('/queue_status?session_id=' + SESSION_ID);
+      const r2 = await fetch('/queue_status?session_id=' + sid);
       const st = await r2.json();
-      updateQueueDisplay(st.queue_length);
-      if (st.processing && st.current_prompt) {
-        const typingText = document.getElementById('typing-text');
-        typingText.textContent = 'Verarbeite: '+st.current_prompt+'...';
+      updateQueueDisplay(st.queue_length, sid);
+      if (st.processing) {
+        s.processing = true;
+        if (st.current_prompt) s.currentPrompt = st.current_prompt;
+        if (_isActiveSession(sid) && st.current_prompt) {
+          const ttx = document.getElementById('typing-text');
+          if (ttx) ttx.textContent = 'Verarbeite: '+st.current_prompt+'...';
+        }
       }
-      // Discover active video/image generation tasks and spawn progress bars
-      if (st && Array.isArray(st.active_tasks)) {
+      // Progress bars nur fuer aktiven Tab
+      if (_isActiveSession(sid) && st && Array.isArray(st.active_tasks)) {
         st.active_tasks.forEach(function(t){
           if (!progressBars[t.task_id]) createProgressBar(t.task_id, t.kind || 'video');
           updateProgressBar(t.task_id, t);
         });
       }
       if (!st.processing && st.queue_length === 0) {
-        stopPolling();
+        stopPolling(sid);
       }
     } catch(e) {}
   }, 2000);
 }
 
-function stopPolling() {
-  if (pollInterval) { clearInterval(pollInterval); pollInterval = null; }
-  stopTyping();
-  showStopBtn(false);
-  updateQueueDisplay(0);
+function stopPolling(sid) {
+  sid = sid || SESSION_ID;
+  var s = _tabState(sid);
+  if (s.pollIntervalId) { clearInterval(s.pollIntervalId); s.pollIntervalId = null; }
+  stopTyping(sid);
+  showStopBtn(false, sid);
+  updateQueueDisplay(0, sid);
 }
 
 async function stopQueue() {
+  var sid = SESSION_ID;
+  var s = _tabState(sid);
   try {
-    const r = await fetch('/stop_queue', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({session_id:SESSION_ID})});
+    const r = await fetch('/stop_queue', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({session_id: sid})});
     const data = await r.json();
     if (data.cancelled > 0) addStatusMsg(data.cancelled+' Prompt(s) abgebrochen.');
-    Object.values(queuedPlaceholders).forEach(el => el.remove());
-    queuedPlaceholders = {};
-    stopPolling();
+    // Entfernt Placeholders nur im DOM des aktiven Tabs (ist ohnehin dieser Tab)
+    Object.values(s.queuedPlaceholders).forEach(function(el){ try { el.remove(); } catch(e) {} });
+    s.queuedPlaceholders = {};
+    stopPolling(sid);
   } catch(e) { addStatusMsg('Stop Fehler: '+e.message); }
 }
 

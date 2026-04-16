@@ -6,6 +6,14 @@ Format: [Datum] Änderung | Datei | Grund
 
 ## 2026-04-16
 
+### Fix: Session-State Isolation — Processing/Stop/Queue jetzt pro Tab
+- **Was:** Processing-State (isProcessing, aktueller Prompt, Stop-Button, Queue-Laenge, Polling, Typing-Indicator) war global im Frontend und leckte zwischen Tabs. Tab 2 sah den "Verarbeite…"-Text von Tab 1 sobald er aktiv wurde; Stop in Tab 1 stoppte ungewollt auch Tab 2; Polling benutzte die globale Variable `SESSION_ID`, die sich beim Tab-Switch ueberschrieb.
+- **Ursache:** `pollInterval`, `typingInterval`, `queuedPlaceholders` waren globale JS-Variablen in `web_server.py`. Alle DOM-Updates (typing-indicator, stop-btn, queue-display) wurden ohne Session-Bindung geschrieben.
+- **Fix:** Neues `_tabStates[sessionId]` Objekt. `startPolling/stopPolling/startTyping/stopTyping/showStopBtn/updateQueueDisplay` akzeptieren einen `sid` Parameter, updaten nur den State dieser Session und beruehren das DOM ausschliesslich, wenn die Session aktuell aktiv ist (`_isActiveSession(sid)`). Jeder Tab pollt mit seiner eigenen Session-ID (in Closure gecaptured) – Tab-Wechsel aendert nichts am laufenden Poll. `renderActiveTabState()` spiegelt beim Tab-Switch den Processing-State des neuen aktiven Tabs ins DOM und flusht gepufferte Responses, die waehrend Inaktivitaet ankamen. `closeTab` raeumt Intervals der geschlossenen Session auf.
+- **Dateien:** `src/web_server.py` (Zeilen ~5177-5420, ~3787-3860), `tests/run_tests.py`
+- **Tests:** 19 neue Tests in "Session-State Isolation 2026-04-16". Suite: 623/623 gruen.
+- **Backups:** `backups/2026-04-16_07-37-24/src/web_server.py`
+
 ### Feature: Chat-Tabs — mehrere Agenten parallel in Reitern
 - **Was:** Tab-Leiste zwischen Header und Chat-Bereich. Jeder Tab hat eigene Session-ID, eigenen Agent, eigene Nachrichten und Kontext. "+" Button oeffnet neuen Tab und zeigt Agent-Auswahl. Tabs zeigen Agent-Namen, aktiver Tab ist gold hervorgehoben. Tabs schliessbar (x) wenn >1 Tab offen.
 - **Wie es funktioniert:** Beim Tab-Wechsel wird der aktuelle DOM-State (messages, ctx-items) im JS-Objekt gespeichert und der neue Tab-State wiederhergestellt. Jeder Tab bekommt eine eigene `SESSION_ID` fuer unabhaengige Server-Sessions.

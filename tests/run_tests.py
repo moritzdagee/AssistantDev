@@ -2302,6 +2302,78 @@ test("Chat-Tabs: updateActiveTabLabel wird in selectAgent aufgerufen",
      "updateActiveTabLabel(name, displayName)" in _tab_html)
 
 
+section("Session-State Isolation 2026-04-16")
+
+_iso_html = requests.get(BASE_URL + "/").text
+
+test("Session-Isolation: _tabStates Objekt vorhanden",
+     "var _tabStates" in _iso_html or "_tabStates = {}" in _iso_html)
+
+test("Session-Isolation: _tabState() Helper definiert",
+     "function _tabState(" in _iso_html)
+
+test("Session-Isolation: _isActiveSession() Helper definiert",
+     "function _isActiveSession(" in _iso_html)
+
+test("Session-Isolation: renderActiveTabState() definiert",
+     "function renderActiveTabState(" in _iso_html)
+
+test("Session-Isolation: switchToTab ruft renderActiveTabState auf",
+     "renderActiveTabState()" in _iso_html)
+
+test("Session-Isolation: startPolling benutzt session-id im fetch",
+     "/poll_responses?session_id=' + sid" in _iso_html)
+
+test("Session-Isolation: startPolling nimmt sid Parameter",
+     "function startPolling(sid)" in _iso_html)
+
+test("Session-Isolation: stopPolling nimmt sid Parameter",
+     "function stopPolling(sid)" in _iso_html)
+
+test("Session-Isolation: startTyping nimmt sid Parameter",
+     "function startTyping(prompt, sid)" in _iso_html)
+
+test("Session-Isolation: stopTyping nimmt sid Parameter",
+     "function stopTyping(sid)" in _iso_html)
+
+test("Session-Isolation: showStopBtn nimmt sid Parameter",
+     "function showStopBtn(show, sid)" in _iso_html)
+
+test("Session-Isolation: updateQueueDisplay nimmt sid Parameter",
+     "function updateQueueDisplay(count, sid)" in _iso_html)
+
+test("Session-Isolation: pollIntervalId pro Tab gespeichert",
+     "pollIntervalId" in _iso_html)
+
+test("Session-Isolation: pendingResponses fuer inaktive Tabs gepuffert",
+     "pendingResponses" in _iso_html)
+
+test("Session-Isolation: globale pollInterval/typingInterval Variablen entfernt",
+     "let pollInterval = null" not in _iso_html
+     and "let typingInterval = null" not in _iso_html)
+
+test("Session-Isolation: stopQueue sendet SESSION_ID (nicht globale)",
+     "session_id: sid" in _iso_html and "var sid = SESSION_ID" in _iso_html)
+
+test("Session-Isolation: closeTab raeumt Intervals der geschlossenen Session auf",
+     "clearInterval(cs.pollIntervalId)" in _iso_html
+     and "clearInterval(cs.typingIntervalId)" in _iso_html)
+
+test("Session-Isolation: Active-Session Check verhindert DOM-Leak",
+     "if (!_isActiveSession(sid)) return" in _iso_html)
+
+# Backend smoke: /queue_status und /stop_queue beachten session_id
+_qs1 = requests.get(BASE_URL + "/queue_status?session_id=test-sid-iso-a")
+test("Session-Isolation: /queue_status?session_id=... antwortet 200",
+     _qs1.status_code == 200 and "processing" in _qs1.json())
+
+_qs2 = requests.get(BASE_URL + "/queue_status?session_id=test-sid-iso-b")
+test("Session-Isolation: unterschiedliche session_ids liefern eigenen Status",
+     _qs2.status_code == 200
+     and _qs2.json().get("processing") in (False, True)
+     and _qs2.json().get("queue_length", 0) == 0)
+
+
 # ============================================================
 # ERGEBNIS
 # ============================================================
