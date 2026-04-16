@@ -6,6 +6,18 @@ Format: [Datum] Änderung | Datei | Grund
 
 ## 2026-04-15
 
+### Feature: System Tray App komplett neu aufgebaut
+- **Was:** `src/app.py` komplett ueberarbeitet. Neue Klasse `AssistantDevApp` mit klarer Menu-Struktur.
+- **Name:** App heisst jetzt "AssistantDev" (statt "Assistant"), Prozessname via setproctitle ebenfalls "AssistantDev".
+- **Icon:** Roboter-Emoji (🤖) als Menu-Bar-Titel.
+- **Status-Checks:** Alle 30 Sekunden im Hintergrund-Thread. Web Server (Port 8080), Web Clipper (Port 8081), Email Watcher (Prozess-Check). Gruen/Rot-Anzeige direkt im Menu.
+- **Neustart-Buttons:** Web Server, Web Clipper, Email Watcher einzeln oder alle zusammen neu starten (jeweils in Background-Thread).
+- **Oeffnen-Submenu:** Dashboard (localhost:8080), Admin Panel (/admin), Technische Dokumentation (lokale .md-Datei), Changelog (lokale .md-Datei).
+- **Logs-Submenu:** Web Server Log und Watchdog Log direkt in Console.app oeffnen.
+- **Beenden:** Beendet nur die Tray App, Services laufen weiter.
+- **LaunchAgent:** `com.assistantdev.tray.plist` korrigiert — zeigt jetzt auf `src/app.py` (statt `tray_app.py`), KeepAlive=false, Log nach `~/AssistantDev/logs/tray.log`.
+- **Dateien:** `src/app.py`, `~/Library/LaunchAgents/com.assistantdev.tray.plist`
+
 ### Fix: CREATE_FILE Fehler "'set' object has no attribute 'get'" behoben
 - **Problem:** `sanitize_llm_json()` nutzt `ast.literal_eval()` als Fallback wenn `json.loads()` scheitert. `ast.literal_eval` interpretiert malformed JSON wie `{"wert1", "wert2"}` als Python `set` statt `dict`. Die `create_*_from_spec()` Handler rufen dann `spec.get('title', ...)` auf, aber `set` hat keine `.get()`-Methode → Fehler.
 - **Root Cause:** `ast.literal_eval` kann Sets, Tuples und Listen erzeugen — nur Dicts sind valide.
