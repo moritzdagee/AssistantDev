@@ -6,6 +6,17 @@ Format: [Datum] Änderung | Datei | Grund
 
 ## 2026-04-16
 
+### Fix: Cross-Session Pollution — Prompt-Resultate leckten zwischen Agenten/Fenstern
+- **Problem:** Konkret beobachtet: Nutzer oeffnet Agent "System-Wort", gibt Prompt ein; oeffnet dann Agent "Signicat Outbound", gibt dort Prompt ein. Das Resultat des System-Wort-Prompts erscheint im Signicat-Outbound-Fenster.
+- **Ursache 1 (sessionStorage-Sharing):** Der Init-Code speicherte die Session-ID via `sessionStorage.setItem('assistant_session_id', ...)` und las sie beim naechsten Laden zurueck. In pywebview kann `sessionStorage` jedoch zwischen mehreren Fenstern desselben Origins geteilt sein — zwei parallele Fenster landeten auf **derselben** Server-Session. Beide pollten mit der gleichen `session_id` und zeigten sich gegenseitig Responses.
+- **Ursache 2 (doSendChat Race):** `doSendChat` machte `await fetch('/chat', ...body: {session_id: SESSION_ID})` und rief danach `handleResponse(data)` ins globale `#messages`-DOM auf. Wechselt der Nutzer den Tab waehrend des awaits, liest die Body-Variable SESSION_ID beim JSON.stringify zwar schon den richtigen Wert, aber nach dem await schreibt `handleResponse` ins DOM des jetzt aktiven (falschen) Tabs.
+- **Fix:** 
+  - Init generiert IMMER eine frische `makeSessionId()` und loescht einen ggf. in sessionStorage vorhandenen Wert aus Alt-Installationen. `sessionStorage` wird fuer die Session-ID nicht mehr benutzt.
+  - `doSendChat` capturet `var mySid = SESSION_ID` zu Beginn, uebergibt `mySid` an alle Helper (`startTyping/stopTyping/startPolling/updateQueueDisplay/showStopBtn`), sendet `session_id: mySid` und puffert die Response via `_tabState(mySid).pendingResponses.push(data)` wenn `_isActiveSession(mySid)` false ist. `renderActiveTabState()` flusht den Puffer beim Tab-Switch, sodass das Resultat spaeter im richtigen Tab erscheint. Queue-Placeholders werden ebenfalls in `mySt.queuedPlaceholders` (richtiger Tab-State) abgelegt.
+- **Dateien:** `src/web_server.py` (Init-Block ~3862, doSendChat ~6413-6470), `tests/run_tests.py`
+- **Tests:** 11 neue Tests in "Cross-Session-Pollution Fix 2026-04-16". Suite: 648/648 gruen.
+- **Backups:** `backups/2026-04-16_07-57-42/src/web_server.py`
+
 ### Fix: Copy-Button robust gegen fehlende Clipboard-API (pywebview)
 - **Problem:** In der nativen pywebview-App war `navigator.clipboard` unter Umstaenden `undefined`. `navigator.clipboard.writeText(...)` warf dann synchron einen `TypeError`, der vom angehaengten `.catch()` NICHT erfasst wurde — der Fallback auf `document.execCommand('copy')` lief also nie, und der Nutzer bekam kein Feedback. Zusaetzlich setzte der Fallback blind `btn.textContent = 'Kopiert'`, ohne den Rueckgabewert von `execCommand` zu pruefen.
 - **Fix:** Feature-Detection (`navigator.clipboard && window.isSecureContext && typeof navigator.clipboard.writeText === 'function'`) vor dem Aufruf; aeusseres `try/catch` um den gesamten Clipboard-Block (faengt synchrone Throws). Fallback-Textarea wird off-screen platziert, `execCommand('copy')`-Rueckgabewert wird ausgewertet — nur bei echtem Erfolg "Kopiert", sonst "Fehler". Gleicher Fix in `copyLastAssistantMessage()` (Ctrl+C Shortcut), die zusaetzlich `innerText || textContent` nutzt (Plain Text, kein HTML).

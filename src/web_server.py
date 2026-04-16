@@ -3872,14 +3872,19 @@ function updateActiveTabLabel(name, displayName) {
 
 // Init first tab
 (function() {
-  var saved = sessionStorage.getItem('assistant_session_id');
-  var sessId = saved || makeSessionId();
-  if (!saved) sessionStorage.setItem('assistant_session_id', sessId);
+  // WICHTIG: Session-ID wird bewusst NICHT mehr in sessionStorage persistiert.
+  // In pywebview kann sessionStorage zwischen Fenstern desselben Origins geteilt
+  // werden — zwei Fenster wuerden dann dieselbe Server-Session teilen, und
+  // Responses eines Fensters taucht im anderen auf (cross-window pollution).
+  // Jede Seiten-Ladung bekommt daher eine komplett frische Session-ID.
+  var sessId = makeSessionId();
   var savedAgent = localStorage.getItem('last_active_agent');
   var tab = {id: 'tab_init', sessionId: sessId, agentName: savedAgent || '', label: savedAgent || 'Neuer Chat', messagesHtml: '', ctxHtml: ''};
   _tabs.push(tab);
   _activeTabId = 'tab_init';
   SESSION_ID = sessId;
+  // Alten, ggf. geteilten Wert in sessionStorage aufraeumen
+  try { sessionStorage.removeItem('assistant_session_id'); } catch(e) {}
   renderTabs();
 })();
 
@@ -6411,39 +6416,61 @@ async function handleCanvaCommand(text) {
 }
 
 async function doSendChat(text) {
+  // Session-ID zum Sendezeitpunkt CAPTUREN. Wenn der Nutzer waehrend des
+  // await Tab wechselt, darf die Response nicht ins DOM des neuen Tabs
+  // fallen — sie gehoert zu mySid. Deshalb alles ueber mySid routen und
+  // nur dann DOM anfassen, wenn mySid aktuell aktiv ist. Sonst puffern.
+  var mySid = SESSION_ID;
+  var mySt = _tabState(mySid);
   // Inject email context if set (one-time use)
   var ectx = _getAndClearEmailContext();
   if (ectx) {
     var ctxBlock = '[E-MAIL KONTEXT: Von: ' + ectx.from_email + (ectx.from_name ? ' (' + ectx.from_name + ')' : '') + ', Betreff: ' + ectx.subject + ', Message-ID: ' + ectx.message_id + (ectx.cc ? ', CC: ' + ectx.cc : '') + ']\\n\\nUser-Anweisung: ';
     text = ctxBlock + text;
   }
-  startTyping(text.substring(0,50));
+  startTyping(text.substring(0,50), mySid);
   startTaskDiscovery();
   let data;
   try {
-    const r = await fetch('/chat', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({message:text, session_id:SESSION_ID})});
+    const r = await fetch('/chat', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({message:text, session_id: mySid})});
     data = await r.json();
-  } catch(err) { stopTaskDiscovery(); stopTyping(); showStopBtn(false); addStatusMsg('Verbindungsfehler: '+err.message); return; }
-
-  if (data.queued) {
-    const ph = addQueuedMessage(text, data.position, data.queue_id);
-    queuedPlaceholders[data.queue_id] = ph;
-    updateQueueDisplay(data.position);
-    startPolling();
-    startTyping(null);
+  } catch(err) {
+    stopTaskDiscovery();
+    stopTyping(mySid);
+    showStopBtn(false, mySid);
+    if (_isActiveSession(mySid)) addStatusMsg('Verbindungsfehler: '+err.message);
     return;
   }
 
-  // Direct response — hide typing
+  if (data.queued) {
+    if (_isActiveSession(mySid)) {
+      const ph = addQueuedMessage(text, data.position, data.queue_id);
+      mySt.queuedPlaceholders[data.queue_id] = ph;
+    }
+    // Wenn Tab inaktiv: Placeholder wird spaeter beim Flushen/Tab-Switch
+    // anhand der queue_id im DOM gefunden — wir muessen nichts buffern.
+    updateQueueDisplay(data.position, mySid);
+    startPolling(mySid);
+    startTyping(null, mySid);
+    return;
+  }
+
+  // Direct response
   stopTaskDiscovery();
-  stopTyping();
-  handleResponse(data);
+  stopTyping(mySid);
+  if (_isActiveSession(mySid)) {
+    handleResponse(data);
+  } else {
+    // Response gehoert zu inaktivem Tab — puffern und auf Tab-Switch
+    // flushen (renderActiveTabState uebernimmt das).
+    mySt.pendingResponses.push(data);
+  }
 
   if (data.queue_active) {
-    startPolling();
-    startTyping(null);
+    startPolling(mySid);
+    startTyping(null, mySid);
   } else {
-    showStopBtn(false);
+    showStopBtn(false, mySid);
   }
 }
 

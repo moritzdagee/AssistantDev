@@ -2432,6 +2432,54 @@ test("Copy-Button: jeder writeText-Aufruf ist durch Feature-Detection geschuetzt
      and _copy_html.count("typeof navigator.clipboard.writeText === 'function'") == 2)
 
 
+section("Cross-Session-Pollution Fix 2026-04-16")
+
+_xsp_html = requests.get(BASE_URL + "/").text
+
+test("Cross-Session: sessionStorage-Persistenz der Session-ID entfernt",
+     "sessionStorage.getItem('assistant_session_id')" not in _xsp_html
+     and "sessionStorage.setItem('assistant_session_id'" not in _xsp_html)
+
+test("Cross-Session: Init generiert immer frische Session-ID (makeSessionId())",
+     "var sessId = makeSessionId()" in _xsp_html)
+
+test("Cross-Session: Alter sessionStorage-Wert wird auf Init geloescht",
+     "sessionStorage.removeItem('assistant_session_id')" in _xsp_html)
+
+test("Cross-Session: doSendChat capturet Session-ID zum Sendezeitpunkt",
+     "var mySid = SESSION_ID" in _xsp_html
+     and "var mySt = _tabState(mySid)" in _xsp_html)
+
+test("Cross-Session: doSendChat sendet mySid im /chat-Body (nicht globales SESSION_ID)",
+     "session_id: mySid" in _xsp_html)
+
+test("Cross-Session: doSendChat puffert Response bei inaktivem Tab",
+     "mySt.pendingResponses.push(data)" in _xsp_html)
+
+test("Cross-Session: doSendChat Queue-Placeholder im richtigen Tab-State",
+     "mySt.queuedPlaceholders[data.queue_id] = ph" in _xsp_html)
+
+test("Cross-Session: doSendChat startet Typing/Polling mit mySid",
+     "startTyping(text.substring(0,50), mySid)" in _xsp_html
+     and "startPolling(mySid)" in _xsp_html)
+
+test("Cross-Session: doSendChat prueft _isActiveSession vor handleResponse",
+     "if (_isActiveSession(mySid)) {\n    handleResponse(data);" in _xsp_html)
+
+test("Cross-Session: doSendChat stopTyping/showStopBtn mit mySid",
+     "stopTyping(mySid)" in _xsp_html and "showStopBtn(false, mySid)" in _xsp_html)
+
+# Backend-Smoke: zwei frisch generierte Session-IDs liefern isolierte Status
+import uuid as _uuid
+_sa = "iso-a-" + _uuid.uuid4().hex[:8]
+_sb = "iso-b-" + _uuid.uuid4().hex[:8]
+_r_a = requests.get(BASE_URL + "/queue_status?session_id=" + _sa).json()
+_r_b = requests.get(BASE_URL + "/queue_status?session_id=" + _sb).json()
+test("Cross-Session: zwei frische session_ids haben je eigenen Status",
+     _r_a.get("processing") is False and _r_b.get("processing") is False
+     and _r_a.get("queue_length", 0) == 0 and _r_b.get("queue_length", 0) == 0)
+
+
 # ============================================================
 # ERGEBNIS
 # ============================================================
