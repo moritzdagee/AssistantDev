@@ -2064,6 +2064,71 @@ test("Nav-Menu: Alter admin-btn mit window.open NICHT mehr vorhanden",
      "window.open('/admin/access-control'" not in _nav_html)
 
 
+section("Services-API und Multi-Fenster 2026-04-15")
+
+# Services API
+_svc_resp = requests.get(BASE_URL + "/api/services")
+test("GET /api/services antwortet mit 200",
+     _svc_resp.status_code == 200)
+
+try:
+    _svc_json = _svc_resp.json()
+    _svc_ids = [s['id'] for s in _svc_json.get('services', [])]
+    test("/api/services liefert web_server",
+         "web_server" in _svc_ids)
+    test("/api/services liefert web_clipper",
+         "web_clipper" in _svc_ids)
+    test("/api/services liefert email_watcher",
+         "email_watcher" in _svc_ids)
+    test("/api/services liefert kchat_watcher",
+         "kchat_watcher" in _svc_ids)
+    test("/api/services enthaelt online-Status",
+         all('online' in s for s in _svc_json.get('services', [])))
+except Exception:
+    test("/api/services JSON-Parsing", False)
+
+# Services Restart API existiert
+test("/api/services/restart Route in web_server.py",
+     "@app.route('/api/services/restart'" in _ws_src)
+
+# Open Window API existiert
+test("/api/open-window Route in web_server.py",
+     "@app.route('/api/open-window'" in _ws_src)
+
+# Nav-Menu: Services und Multi-Fenster im HTML
+_nav2 = requests.get(BASE_URL + "/").text
+
+test("Nav-Menu: svc-list Container vorhanden",
+     'id="svc-list"' in _nav2)
+
+test("Nav-Menu: loadServices JS-Funktion vorhanden",
+     "function loadServices" in _nav2)
+
+test("Nav-Menu: restartService JS-Funktion vorhanden",
+     "function restartService" in _nav2)
+
+test("Nav-Menu: openNewWindow JS-Funktion vorhanden",
+     "function openNewWindow" in _nav2)
+
+test("Nav-Menu: Neues Chat-Fenster Button vorhanden",
+     "Neues Chat-Fenster" in _nav2)
+
+test("Nav-Menu: svc-dot CSS-Klasse vorhanden",
+     "svc-dot" in _nav2)
+
+test("Nav-Menu: svc-restart CSS-Klasse vorhanden",
+     "svc-restart" in _nav2)
+
+test("Nav-Menu: Menu oeffnet rechts (right:0 statt left:0)",
+     "right:0" in _nav2 and "nav-menu" in _nav2)
+
+test("Nav-Menu: loadServices wird bei toggleNavMenu aufgerufen",
+     "loadServices()" in _nav2)
+
+test("Nav-Menu: kchat_watcher in _admin_status_check",
+     "kchat_watcher" in _ws_src and "kchat_watcher.py" in _ws_src)
+
+
 # ============================================================
 # ERGEBNIS
 # ============================================================

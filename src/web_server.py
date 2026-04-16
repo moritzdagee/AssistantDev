@@ -3288,7 +3288,7 @@ HTML = """<!DOCTYPE html>
   .nav-wrap { position:relative; display:inline-block; }
   .nav-btn { background:none; border:1px solid #444; color:#ccc; padding:5px 10px; cursor:pointer; font-size:16px; border-radius:6px; font-family:Inter,sans-serif; transition:all 0.15s; line-height:1; }
   .nav-btn:hover, .nav-btn.active { border-color:#f0c060; color:#f0c060; background:#1a1a10; }
-  .nav-menu { display:none; position:absolute; left:0; top:calc(100% + 6px); background:#1a1a2e; border:1px solid #444; border-radius:10px; min-width:260px; z-index:200; box-shadow:0 8px 24px rgba(0,0,0,0.6); padding:6px 0; }
+  .nav-menu { display:none; position:absolute; right:0; top:calc(100% + 6px); background:#1a1a2e; border:1px solid #444; border-radius:10px; min-width:280px; z-index:200; box-shadow:0 8px 24px rgba(0,0,0,0.6); padding:6px 0; max-height:80vh; overflow-y:auto; }
   .nav-menu.open { display:block; }
   .nav-menu-section { padding:6px 14px 4px; font-size:10px; color:#888; font-weight:700; text-transform:uppercase; letter-spacing:1.2px; }
   .nav-menu-item { display:flex; align-items:center; gap:10px; padding:9px 14px; color:#d0d0e0; font-size:13px; cursor:pointer; text-decoration:none; transition:background 0.12s; }
@@ -3297,6 +3297,14 @@ HTML = """<!DOCTYPE html>
   .nav-menu-item .nav-label { flex:1; }
   .nav-menu-item .nav-hint { font-size:10px; color:#666; }
   .nav-menu-divider { height:1px; background:#333; margin:4px 0; }
+  /* Services status in nav */
+  .svc-row { display:flex; align-items:center; gap:8px; padding:6px 14px; font-size:12px; color:#ccc; }
+  .svc-dot { width:8px; height:8px; border-radius:50%; flex-shrink:0; }
+  .svc-dot.online { background:#4ade80; box-shadow:0 0 4px #4ade80; }
+  .svc-dot.offline { background:#f87171; box-shadow:0 0 4px #f87171; }
+  .svc-name { flex:1; }
+  .svc-restart { background:none; border:1px solid #444; color:#888; font-size:10px; padding:2px 8px; border-radius:4px; cursor:pointer; }
+  .svc-restart:hover { border-color:#f0c060; color:#f0c060; }
   #main { display:flex; flex:1; overflow:hidden; }
   #sidebar { width:30%; min-width:280px; background:#141414; border-right:1px solid #2a2a2a; display:flex; flex-direction:column; overflow:hidden; transition:width 0.2s,min-width 0.2s; flex-shrink:0; }
   #sidebar-header { padding:12px 16px; border-bottom:1px solid #333; display:flex; align-items:center; justify-content:space-between; flex-shrink:0; }
@@ -3589,22 +3597,6 @@ HTML = """<!DOCTYPE html>
   <div id="header-spacer" style="flex:1;"></div><!-- AGENT_BTN_V1 -->
   <button class="hdr-btn" onclick="newSession()" style="background:#2a3a2a;border-color:#4a6a4a;color:#a0d090;">+ Neu <span class="shortcut-label">[N]</span></button>
   <button id="agent-btn" class="hdr-btn" data-tooltip-kind="agent" onclick="showAgentModal()"><span id="agent-label">Kein Agent</span> <span class="shortcut-label">[A]</span></button>
-  <div class="nav-wrap" id="nav-wrap">
-    <button class="nav-btn" onclick="toggleNavMenu()" title="Navigation">&#9776;</button>
-    <div class="nav-menu" id="nav-menu">
-      <div class="nav-menu-section">Administration</div>
-      <a class="nav-menu-item" onclick="navigateTo('/admin')"><span class="nav-icon">&#9881;</span><span class="nav-label">Admin Panel</span><span class="nav-hint">Status &amp; Uebersicht</span></a>
-      <a class="nav-menu-item" onclick="navigateTo('/admin/access-control')"><span class="nav-icon">&#128274;</span><span class="nav-label">Access Control</span><span class="nav-hint">Matrix</span></a>
-      <a class="nav-menu-item" onclick="navigateTo('/admin/permissions')"><span class="nav-icon">&#128272;</span><span class="nav-label">Berechtigungen</span><span class="nav-hint">Memory-Zugriff</span></a>
-      <div class="nav-menu-divider"></div>
-      <div class="nav-menu-section">Dokumentation</div>
-      <a class="nav-menu-item" onclick="navigateTo('/admin/docs')"><span class="nav-icon">&#128214;</span><span class="nav-label">Technische Docs</span><span class="nav-hint">API &amp; Architektur</span></a>
-      <a class="nav-menu-item" onclick="navigateTo('/admin/changelog')"><span class="nav-icon">&#128203;</span><span class="nav-label">Changelog</span><span class="nav-hint">Aenderungshistorie</span></a>
-      <div class="nav-menu-divider"></div>
-      <div class="nav-menu-section">Chat</div>
-      <a class="nav-menu-item" onclick="navigateTo('/')"><span class="nav-icon">&#128172;</span><span class="nav-label">Zurueck zum Chat</span></a>
-    </div>
-  </div>
   <select id="provider-select" class="hdr-select" onchange="onProviderChange()">
     <option>Anthropic</option>
   </select>
@@ -3617,6 +3609,29 @@ HTML = """<!DOCTYPE html>
       <div style="font-size:11px;color:#888;margin-bottom:8px;font-weight:600;">KONTEXT-DETAILS</div>
       <div id="token-details" style="font-size:12px;color:#ccc;"></div>
       <button onclick="slimMode()" style="margin-top:8px;background:#2a2020;border:1px solid #6a3a3a;color:#d09090;border-radius:4px;padding:4px 10px;font-size:11px;cursor:pointer;width:100%;">Slim Mode — alle Memory-Dateien entfernen</button>
+    </div>
+  </div>
+  <div class="nav-wrap" id="nav-wrap">
+    <button class="nav-btn" onclick="toggleNavMenu()" title="Navigation">&#9776;</button>
+    <div class="nav-menu" id="nav-menu">
+      <div class="nav-menu-section">Services</div>
+      <div id="svc-list"><div class="svc-row" style="color:#666;">Lade...</div></div>
+      <div class="nav-menu-divider"></div>
+      <div class="nav-menu-section">Fenster</div>
+      <a class="nav-menu-item" onclick="openNewWindow('/')"><span class="nav-icon">&#128468;</span><span class="nav-label">Neues Chat-Fenster</span></a>
+      <a class="nav-menu-item" onclick="openNewWindow('/admin')"><span class="nav-icon">&#9881;</span><span class="nav-label">Admin Panel</span></a>
+      <div class="nav-menu-divider"></div>
+      <div class="nav-menu-section">Administration</div>
+      <a class="nav-menu-item" onclick="navigateTo('/admin')"><span class="nav-icon">&#9881;</span><span class="nav-label">Admin Panel</span><span class="nav-hint">Status &amp; Uebersicht</span></a>
+      <a class="nav-menu-item" onclick="navigateTo('/admin/access-control')"><span class="nav-icon">&#128274;</span><span class="nav-label">Access Control</span><span class="nav-hint">Matrix</span></a>
+      <a class="nav-menu-item" onclick="navigateTo('/admin/permissions')"><span class="nav-icon">&#128272;</span><span class="nav-label">Berechtigungen</span><span class="nav-hint">Memory-Zugriff</span></a>
+      <div class="nav-menu-divider"></div>
+      <div class="nav-menu-section">Dokumentation</div>
+      <a class="nav-menu-item" onclick="navigateTo('/admin/docs')"><span class="nav-icon">&#128214;</span><span class="nav-label">Technische Docs</span><span class="nav-hint">API &amp; Architektur</span></a>
+      <a class="nav-menu-item" onclick="navigateTo('/admin/changelog')"><span class="nav-icon">&#128203;</span><span class="nav-label">Changelog</span><span class="nav-hint">Aenderungshistorie</span></a>
+      <div class="nav-menu-divider"></div>
+      <div class="nav-menu-section">Chat</div>
+      <a class="nav-menu-item" onclick="navigateTo('/')"><span class="nav-icon">&#128172;</span><span class="nav-label">Zurueck zum Chat</span></a>
     </div>
   </div>
 </div>
@@ -4154,12 +4169,13 @@ async function newSession() {
 
 // ─── NAV MENU ────────────────────────────────────────────────────────────────────
 function toggleNavMenu() {
-  const menu = document.getElementById('nav-menu');
-  const btn = document.querySelector('.nav-btn');
-  const isOpen = menu.classList.contains('open');
+  var menu = document.getElementById('nav-menu');
+  var btn = document.querySelector('.nav-btn');
+  var isOpen = menu.classList.contains('open');
   menu.classList.toggle('open');
   btn.classList.toggle('active');
   if (!isOpen) {
+    loadServices();
     setTimeout(function() {
       document.addEventListener('click', closeNavOnClickOutside, {once: true});
     }, 10);
@@ -4180,6 +4196,51 @@ function navigateTo(path) {
   document.getElementById('nav-menu').classList.remove('open');
   document.querySelector('.nav-btn').classList.remove('active');
   window.location.href = path;
+}
+async function loadServices() {
+  try {
+    var r = await fetch('/api/services');
+    var d = await r.json();
+    var el = document.getElementById('svc-list');
+    if (!el) return;
+    var h = '';
+    (d.services || []).forEach(function(s) {
+      var dot = s.online ? 'online' : 'offline';
+      var label = s.online ? 'online' : 'offline';
+      var port = s.port ? ' :' + s.port : '';
+      h += '<div class="svc-row">';
+      h += '<span class="svc-dot ' + dot + '"></span>';
+      h += '<span class="svc-name">' + s.name + port + '</span>';
+      h += '<span style="font-size:10px;color:' + (s.online ? '#4ade80' : '#f87171') + ';">' + label + '</span>';
+      h += '<button class="svc-restart" onclick="restartService(\\''+s.id+'\\')">&#x21bb;</button>';
+      h += '</div>';
+    });
+    el.innerHTML = h;
+  } catch(e) { /* silent */ }
+}
+async function restartService(id) {
+  var btn = event.target;
+  btn.textContent = '...';
+  btn.disabled = true;
+  try {
+    await fetch('/api/services/restart', {
+      method: 'POST', headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({service: id})
+    });
+    setTimeout(loadServices, 3000);
+  } catch(e) { /* silent */ }
+}
+async function openNewWindow(path) {
+  document.getElementById('nav-menu').classList.remove('open');
+  document.querySelector('.nav-btn').classList.remove('active');
+  try {
+    await fetch('/api/open-window', {
+      method: 'POST', headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({path: path})
+    });
+  } catch(e) {
+    window.open(path, '_blank');
+  }
 }
 
 // ─── SIDEBAR ────────────────────────────────────────────────────────────────────
@@ -9674,7 +9735,79 @@ def _admin_status_check():
                 pass
         return False
     watcher_ok = proc_alive("email_watcher.py", "AssistantDev EmailWatcher")
-    return {"web_8080": web_ok, "clipper_8081": clip_ok, "email_watcher": watcher_ok}
+    kchat_ok = proc_alive("kchat_watcher.py")
+    return {"web_8080": web_ok, "clipper_8081": clip_ok, "email_watcher": watcher_ok, "kchat_watcher": kchat_ok}
+
+
+@app.route('/api/services', methods=['GET'])
+def api_services_status():
+    """Returns status of all services as JSON."""
+    st = _admin_status_check()
+    services = [
+        {"id": "web_server",     "name": "Web Server",     "port": 8080, "online": st["web_8080"]},
+        {"id": "web_clipper",    "name": "Web Clipper",     "port": 8081, "online": st["clipper_8081"]},
+        {"id": "email_watcher",  "name": "Email Watcher",   "port": None, "online": st["email_watcher"]},
+        {"id": "kchat_watcher",  "name": "kChat Watcher",   "port": None, "online": st["kchat_watcher"]},
+    ]
+    return jsonify({"services": services})
+
+
+@app.route('/api/services/restart', methods=['POST'])
+def api_services_restart():
+    """Restart a specific service by id."""
+    import subprocess as _sp
+    data = request.get_json(silent=True)
+    service_id = (data or {}).get('service')
+    RESTART_MAP = {
+        "web_server":    ("web_server.py", "AssistantDev WebServer"),
+        "web_clipper":   ("web_clipper_server.py",),
+        "email_watcher": ("email_watcher.py", "AssistantDev EmailWatcher"),
+        "kchat_watcher": ("kchat_watcher.py",),
+    }
+    if service_id not in RESTART_MAP:
+        return jsonify({"ok": False, "error": "Unbekannter Service: " + str(service_id)}), 400
+    patterns = RESTART_MAP[service_id]
+    # Kill
+    for pat in patterns:
+        try:
+            _sp.run(["pkill", "-f", pat], capture_output=True, timeout=5)
+        except Exception:
+            pass
+    import time as _time
+    _time.sleep(2)
+    # Start (except web_server — watchdog restarts it)
+    if service_id != "web_server":
+        script_name = patterns[0]
+        script_path = os.path.join(BASE, "src", script_name)
+        if os.path.exists(script_path):
+            log_path = os.path.join(BASE, "logs", script_name.replace(".py", ".log"))
+            os.makedirs(os.path.dirname(log_path), exist_ok=True)
+            lf = open(log_path, "a")
+            _sp.Popen(
+                [sys.executable, script_path],
+                stdout=lf, stderr=_sp.STDOUT,
+                cwd=os.path.join(BASE, "src"),
+            )
+    return jsonify({"ok": True, "restarted": service_id})
+
+
+@app.route('/api/open-window', methods=['POST'])
+def api_open_window():
+    """Open a new native pywebview window with a given path."""
+    import subprocess as _sp
+    data = request.get_json(silent=True)
+    path = (data or {}).get('path', '/')
+    # Sanitize path
+    if not path.startswith('/'):
+        path = '/' + path
+    dashboard_script = os.path.join(BASE, "src", "dashboard_window.py")
+    if not os.path.exists(dashboard_script):
+        return jsonify({"ok": False, "error": "dashboard_window.py nicht gefunden"}), 500
+    _sp.Popen(
+        [sys.executable, dashboard_script, path],
+        stdout=_sp.DEVNULL, stderr=_sp.DEVNULL,
+    )
+    return jsonify({"ok": True, "path": path})
 
 
 @app.route('/admin', methods=['GET'])
