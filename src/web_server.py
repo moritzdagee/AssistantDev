@@ -8627,6 +8627,15 @@ def process_single_message(msg, kontext_override=None, state=None, **kwargs):
                 else:
                     raise ValueError('Unbekannter Typ: ' + ftype)
                 created_files.append({'filename': fname, 'path': fpath, 'type': ftype})
+                # Copy to agent memory
+                if state.get('speicher'):
+                    _mem_dir = os.path.join(state['speicher'], 'memory')
+                    os.makedirs(_mem_dir, exist_ok=True)
+                    import shutil
+                    try:
+                        shutil.copy2(fpath, os.path.join(_mem_dir, fname))
+                    except Exception:
+                        pass
                 text = text.replace(full_block, '')
             except Exception as fe:
                 err_msg = str(fe)
