@@ -2480,6 +2480,139 @@ test("Cross-Session: zwei frische session_ids haben je eigenen Status",
      and _r_a.get("queue_length", 0) == 0 and _r_b.get("queue_length", 0) == 0)
 
 
+section("SOTA RAG + Auto-Search 2026-04-16")
+
+# Direkt-Import aus src/: QueryParser + auto_search
+_se_path = os.path.expanduser("~/AssistantDev/src")
+if _se_path not in sys.path:
+    sys.path.insert(0, _se_path)
+
+try:
+    import search_engine as _se
+    QueryParser = _se.QueryParser
+    _se_import_ok = True
+except Exception as _se_err:
+    _se_import_ok = False
+    test("search_engine importierbar", False, str(_se_err))
+
+if _se_import_ok:
+    test("search_engine importierbar", True)
+
+    # --- Trigger-Cases (positive) ---
+    _pos = [
+        "Was stand nochmal in der ExFlow-Mail?",
+        "Welches Datum hatten wir mit Thomas vereinbart?",
+        "Suche die Rechnung von gestern",
+        "ExFlow Rechnung",
+        "Pitch Folien",
+        "Zeig mir die letzten 10 Rechnungen",
+        "die drei neuesten Mails",
+    ]
+    for _msg in _pos:
+        _intent = QueryParser.parse(_msg)
+        test(f"Trigger POSITIV: '{_msg[:40]}'", _intent.is_search,
+             f"QueryParser.is_search war False")
+
+    # --- Trigger-Cases (negative) ---
+    _neg = [
+        "Hallo, wie geht es dir?",
+        "Wer bist du?",
+        "Was ist die Hauptstadt von Frankreich?",
+        "hi",
+        "danke",
+        "ok",
+        "Thomas",  # Einzelner Name zu ambiguous
+    ]
+    for _msg in _neg:
+        _intent = QueryParser.parse(_msg)
+        test(f"Trigger NEGATIV: '{_msg[:40]}'", not _intent.is_search,
+             f"QueryParser.is_search war True (ungewollt)")
+
+    # --- max_results Extraktion ---
+    test("max_results aus 'letzten 10 Rechnungen'",
+         QueryParser.parse("Zeig mir die letzten 10 Rechnungen").max_results == 10)
+    test("max_results aus 'drei neuesten Mails'",
+         QueryParser.parse("die drei neuesten Mails").max_results == 3)
+    test("max_results aus 'letzten 5 Emails'",
+         QueryParser.parse("die letzten 5 Emails von Simonas").max_results == 5)
+    test("max_results bei Datum 20.03.2024 NICHT gesetzt",
+         QueryParser.parse("Suche die Rechnung vom 20.03.2024").max_results is None)
+
+    # --- wants_global Trigger ---
+    test("wants_global bei 'überall suchen'",
+         QueryParser.parse("Suche überall nach ExFlow").wants_global is True)
+    test("wants_global bei 'extended memory'",
+         QueryParser.parse("Search extended memory for thomas").wants_global is True)
+    test("wants_global NICHT bei normaler Query",
+         QueryParser.parse("Suche die Rechnung").wants_global is False)
+
+    # --- wants_deep Trigger ---
+    test("wants_deep bei '/deep' Prefix",
+         QueryParser.parse("/deep Was stand in der ExFlow-Mail?").wants_deep is True)
+    test("wants_deep bei 'ausführlich'",
+         QueryParser.parse("Erkläre mir ausführlich die Rechnung").wants_deep is True)
+    test("wants_deep NICHT bei normaler Query",
+         QueryParser.parse("Was stand in der Mail?").wants_deep is False)
+
+    # --- SEARCH_OBJECTS Plural-Coverage ---
+    _plurals = ['mails', 'emails', 'rechnungen', 'dateien', 'dokumente']
+    for _p in _plurals:
+        test(f"SEARCH_OBJECTS enthaelt Plural '{_p}'", _p in _se.SEARCH_OBJECTS)
+
+    # --- rstrip-Bug Fix: 'Mails' bleibt 'Mails', nicht 'Mail' ---
+    test("Proper-Noun 'Mails' wird nicht zu 'Mail' verstuemmelt (rstrip-Bug)",
+         'mails' in _se.SEARCH_OBJECTS)  # wenn mails als Plural, ist Mail->Mail-Verstuemmelung egal
+
+    # --- auto_search-Signatur akzeptiert neue Parameter ---
+    import inspect as _inspect
+    _as_sig = _inspect.signature(_se.auto_search)
+    _as_params = set(_as_sig.parameters.keys())
+    test("auto_search hat neue Parameter (max_results, use_rag, fast, enable_global)",
+         {'max_results', 'use_rag', 'fast', 'enable_global'}.issubset(_as_params))
+
+    # --- hybrid_rag_search akzeptiert n_variants ---
+    _hr_sig = _inspect.signature(_se.hybrid_rag_search)
+    test("hybrid_rag_search akzeptiert n_variants-Parameter",
+         'n_variants' in _hr_sig.parameters)
+
+    # --- global_rag_search existiert ---
+    test("global_rag_search existiert und ist callable",
+         callable(getattr(_se, 'global_rag_search', None)))
+
+    # --- reindex_all_embeddings_async existiert ---
+    test("reindex_all_embeddings_async existiert und ist callable",
+         callable(getattr(_se, 'reindex_all_embeddings_async', None)))
+
+    # --- QueryIntent-Felder ---
+    _qi = _se.QueryIntent()
+    for _attr in ('max_results', 'wants_global', 'wants_deep'):
+        test(f"QueryIntent hat Feld '{_attr}'", hasattr(_qi, _attr))
+
+    # --- QUESTION_INTENT_PHRASES vorhanden ---
+    test("QUESTION_INTENT_PHRASES exportiert und non-empty",
+         hasattr(_se, 'QUESTION_INTENT_PHRASES') and len(_se.QUESTION_INTENT_PHRASES) > 10)
+    test("NO_SEARCH_OVERRIDES exportiert und non-empty",
+         hasattr(_se, 'NO_SEARCH_OVERRIDES') and len(_se.NO_SEARCH_OVERRIDES) > 5)
+
+    # --- GLOBAL_TRIGGERS werden vom Parser gelesen (nicht nur detect_global_trigger) ---
+    test("GLOBAL_TRIGGERS sind im QueryParser-Pfad integriert",
+         QueryParser.parse("alles durchsuchen nach ExFlow").wants_global is True)
+
+# --- Backend-Smoke: format_search_feedback behandelt neue Felder ---
+if _se_import_ok:
+    _fb = {'query': 'test', 'found_count': 2, 'index_count': 100,
+           'rag': True, 'semantic': True, 'global': False}
+    _formatted = _se.format_search_feedback(_fb, 2)
+    test("format_search_feedback markiert RAG-Mode",
+         'RAG' in _formatted and 'semantic' in _formatted)
+
+    _fb_global = {'query': 'test', 'found_count': 0, 'index_count': 0,
+                  'rag': True, 'semantic': False, 'global': True}
+    _formatted_g = _se.format_search_feedback(_fb_global, 0)
+    test("format_search_feedback markiert global-Mode",
+         'global' in _formatted_g)
+
+
 # ============================================================
 # ERGEBNIS
 # ============================================================

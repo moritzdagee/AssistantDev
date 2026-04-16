@@ -24,7 +24,7 @@ _active_requests_lock = threading.Lock()
 
 # Search engine
 try:
-    from search_engine import auto_search, format_search_feedback, build_index_async, build_global_index_async, detect_global_trigger, update_all_indexes
+    from search_engine import auto_search, format_search_feedback, build_index_async, build_global_index_async, detect_global_trigger, update_all_indexes, reindex_all_embeddings_async
 except ImportError:
     auto_search = None
     format_search_feedback = None
@@ -32,6 +32,7 @@ except ImportError:
     build_global_index_async = None
     detect_global_trigger = None
     update_all_indexes = None
+    reindex_all_embeddings_async = None
 import requests
 from flask import Flask, request, jsonify, render_template_string, make_response
 from bs4 import BeautifulSoup
@@ -8355,17 +8356,33 @@ def process_single_message(msg, kontext_override=None, state=None, **kwargs):
         pass  # Overrides provided — skip auto-search
     elif auto_search and state.get('speicher'):
         try:
+            # Dedup against files already pinned in working memory so we don't
+            # double-inject the same file into the prompt.
+            wm_names = set()
+            try:
+                agent_name_for_wm = state.get('agent', '')
+                wm_manifest = working_memory_list(agent_name_for_wm)
+                for f in wm_manifest.get('files', []):
+                    if f.get('filename'):
+                        wm_names.add(f['filename'])
+            except Exception:
+                pass
+
             search_results, search_feedback = auto_search(msg, state['speicher'])
             for item in search_results:
-                if not any(k['name'] == item['name'] for k in kontext_items):
+                fname = item['name']
+                if fname in wm_names:
+                    continue  # already pinned in working memory
+                if not any(k['name'] == fname for k in kontext_items):
                     kontext_items.append(item)
-                    if item['name'] not in state['session_files']:
-                        state['session_files'].append(item['name'])
-                    auto_loaded_names.append(item['name'])
+                    if fname not in state['session_files']:
+                        state['session_files'].append(fname)
+                    auto_loaded_names.append(fname)
             if search_feedback:
                 auto_search_info = format_search_feedback(search_feedback, len(auto_loaded_names))
         except Exception as e:
             print(f"auto_search error: {e}")
+            import traceback; traceback.print_exc()
 
     # Fallback: deep_memory_search only for explicit /find command (passed through from frontend)
     if not auto_loaded_names and state.get('speicher') and not kontext_override:
@@ -10855,16 +10872,27 @@ if __name__ == '__main__':
     # Build global search index in background at startup
     if build_global_index_async:
         build_global_index_async()
+    # Background-backfill semantic embeddings for all agents (no-op without OpenAI key)
+    if reindex_all_embeddings_async:
+        try:
+            reindex_all_embeddings_async()
+        except Exception as e:
+            print(f'[EMBEDDINGS] Initial backfill error: {e}')
     # Periodic incremental index update (every 5 minutes)
     def index_update_loop():
         import time
         time.sleep(60)  # Wait 1 min after startup before first run
+        tick = 0
         while True:
             try:
                 if update_all_indexes:
                     update_all_indexes()
+                # Every 6th tick (~30 min) also catch new files for embeddings
+                if reindex_all_embeddings_async and tick % 6 == 0:
+                    reindex_all_embeddings_async()
             except Exception as e:
                 print(f'[INDEX] Periodischer Update Fehler: {e}')
+            tick += 1
             time.sleep(300)  # Every 5 minutes
     threading.Thread(target=index_update_loop, daemon=True).start()
     print('\nAssistant Web Interface laeuft auf http://localhost:8080')

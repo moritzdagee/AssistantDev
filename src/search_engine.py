@@ -169,12 +169,53 @@ SEARCH_PHRASES = [
     'onde está', 'onde esta', 'tem algum', 'tem alguma',
 ]
 
+# Question-intent markers: user asking about past/stored information.
+# Together with a subject (SEARCH_OBJECTS or a proper noun) these count as search intent
+# even without an explicit SEARCH_ACTIONS verb.
+QUESTION_INTENT_PHRASES = [
+    # Deutsch
+    'was stand', 'was steht', 'was schrieb', 'was schreibt', 'was hatte', 'was habe', 'was haben',
+    'was sagte', 'was sagt', 'was meinte', 'was meint', 'was war', 'was ist mit',
+    'welches datum', 'welche datei', 'welcher tag', 'welche mail', 'welche email',
+    'welcher termin', 'welche nachricht', 'welche info',
+    'wo haben wir', 'wo hat', 'wo hatten wir', 'wo steht', 'wo stand',
+    'wann haben wir', 'wann war', 'wann hatten wir', 'wann ist', 'wann wurde',
+    'wer hat', 'wer war', 'wer schrieb', 'wer schickt',
+    'erinnerst du dich', 'weisst du noch', 'weißt du noch', 'erinnere mich',
+    'erinnerung an', 'erinner dich an',
+    'nochmal die', 'noch einmal die', 'nochmal der', 'nochmal das',
+    'uns nochmal', 'mir nochmal',
+    # Englisch
+    'what did', 'what was', 'what does', 'what is the', 'which date', 'which file',
+    'which email', 'which message', 'when did', 'when was', 'who was', 'who did',
+    'who sent', 'where did', 'where is the',
+    'remember when', 'do you remember', 'remind me', 'remember the',
+    # Portugiesisch
+    'o que disse', 'o que escreveu', 'o que tinha', 'qual data', 'qual arquivo',
+    'quando foi', 'quando disse', 'quem disse', 'quem enviou',
+    'lembra', 'se lembra', 'lembra-se',
+]
+
+# Conversational phrases that should NOT trigger a search even if a proper noun is present.
+# Examples: greetings, acknowledgements, meta-conversation about the assistant itself.
+NO_SEARCH_OVERRIDES = [
+    'hallo', 'hi ', 'hey', 'guten morgen', 'guten tag', 'guten abend',
+    'hello', 'good morning', 'good evening', 'bom dia', 'boa tarde', 'boa noite',
+    'danke', 'vielen dank', 'thanks', 'thank you', 'obrigado', 'obrigada',
+    'verstanden', 'alles klar', 'ok', 'ok.', 'okay', 'got it', 'entendido',
+    # Meta about the agent
+    'wer bist du', 'was kannst du', 'hilfe', 'help', 'who are you',
+]
+
 SEARCH_OBJECTS = {
     # E-Mail
     'email', 'mail', 'e-mail', 'nachricht', 'message', 'mensagem', 'correo',
+    'emails', 'mails', 'nachrichten', 'messages', 'mensagens', 'correos',
     # Dokumente allgemein
     'datei', 'dokument', 'file', 'document', 'arquivo',
+    'dateien', 'dokumente', 'files', 'documents', 'arquivos',
     'doc', 'bericht', 'report', 'relatorio',
+    'docs', 'berichte', 'reports', 'relatorios',
     # Word
     'word', 'brief', 'schreiben', 'letter', 'carta',
     'word-dokument', 'worddokument', 'textdokument',
@@ -191,9 +232,13 @@ SEARCH_OBJECTS = {
     'pdf', 'anhang', 'attachment', 'anexo',
     # Vertraege / Rechnungen
     'vertrag', 'contract', 'contrato', 'agreement',
+    'vertraege', 'contracts', 'contratos', 'agreements',
     'rechnung', 'invoice', 'fatura', 'billing',
+    'rechnungen', 'invoices', 'faturas',
     'angebot', 'offer', 'proposta', 'quote',
+    'angebote', 'offers', 'propostas', 'quotes',
     'bestellung', 'order', 'pedido',
+    'bestellungen', 'orders', 'pedidos',
     # Notizen / Sonstiges
     'notiz', 'note', 'nota', 'memo',
     'protokoll', 'minutes', 'ata',
@@ -813,6 +858,9 @@ class QueryIntent:
         self.person_names = []      # Detected proper nouns
         self.raw_query = ''         # Original query text
         self.is_search = False      # True if search intent detected
+        self.max_results = None     # Optional result-count hint ("die letzten 10" -> 10)
+        self.wants_global = False   # True when user explicitly asks for global / "everywhere"
+        self.wants_deep = False     # True when user asks for detailed/thorough / /deep prefix
 
     def summary(self):
         """Human-readable summary of the search intent."""
@@ -853,6 +901,7 @@ class QueryParser:
             has_action = any(phrase in msg_lower for phrase in SEARCH_PHRASES)
 
         has_object = any(w.rstrip('.,;:!?') in SEARCH_OBJECTS for w in words)
+        has_question_intent = any(phrase in msg_lower for phrase in QUESTION_INTENT_PHRASES)
 
         # Legacy trigger
         if 'memory folder' in msg_lower or 'memory ordner' in msg_lower:
@@ -862,13 +911,42 @@ class QueryParser:
         # Detect proper nouns (capitalized words, not at sentence start)
         skip_set = SEARCH_ACTIONS | SEARCH_OBJECTS | STOPWORDS | FIELD_FROM | FIELD_TO | FIELD_ABOUT
         for i, w in enumerate(orig_words):
-            w_clean = w.rstrip('.,;:!?').rstrip("'s")
+            w_clean = w.rstrip('.,;:!?')
+            if w_clean.endswith("'s"):
+                w_clean = w_clean[:-2]
             if not w_clean or len(w_clean) < 2 or i == 0:
                 continue
             if w_clean[0].isupper() and w_clean.lower() not in skip_set:
                 intent.person_names.append(w_clean)
 
         has_proper_noun = len(intent.person_names) > 0
+        has_date = False
+        # Simple date heuristic (full parser below refines this)
+        if re.search(r'\b(\d{1,2}\.\d{1,2}\.\d{0,4}|\d{4}-\d{2}-\d{2})\b', msg_lower):
+            has_date = True
+
+        # Global / deep markers — evaluated EARLY so explicit user intent survives
+        # even when the lexical trigger is weak ("Search extended memory for thomas").
+        if any(t in msg_lower for t in GLOBAL_TRIGGERS):
+            intent.wants_global = True
+        DEEP_MARKERS_EARLY = (
+            '/deep ', '/deep_', 'ausfuehrlich', 'ausführlich', 'detailliert',
+            'in depth', 'in-depth', 'thorough', 'detailed', 'detalhado',
+        )
+        if any(m in msg_lower for m in DEEP_MARKERS_EARLY):
+            intent.wants_deep = True
+
+        # Conversational override: greetings / acknowledgements / meta should not trigger
+        stripped = msg_lower.strip()
+        is_conversational = False
+        if any(stripped == p.strip() or stripped.startswith(p) for p in NO_SEARCH_OVERRIDES):
+            is_conversational = True
+        # Very short messages with NO substantive content (no name, no object, no
+        # question-phrase) are treated as conversational. This keeps short topic
+        # queries like "ExFlow Rechnung" or "Pitch Folien" alive.
+        if (len(words) <= 2 and not has_proper_noun
+                and not has_object and not has_question_intent):
+            is_conversational = True
 
         if force_search:
             # Forced search mode (from /find, search dialog, etc.)
@@ -878,16 +956,40 @@ class QueryParser:
             has_object = True
             # In force mode: add all substantial words as person names too
             for w in orig_words:
-                w_clean = w.rstrip('.,;:!?').rstrip("'s")
+                w_clean = w.rstrip('.,;:!?')
+                if w_clean.endswith("'s"):
+                    w_clean = w_clean[:-2]
                 if w_clean and len(w_clean) >= 3 and w_clean.lower() not in STOPWORDS:
                     if w_clean not in intent.person_names:
                         intent.person_names.append(w_clean)
         else:
-            if not has_action:
+            if is_conversational:
                 intent.is_search = False
                 return intent
 
-            if not has_object and not has_proper_noun:
+            # New, more permissive trigger logic:
+            # A search is intended if there is any "query trigger" (action verb, question
+            # phrase, search phrase) AND some concrete "subject" (search object, proper
+            # noun, or explicit date). Also trigger if BOTH an object and a proper noun
+            # are present (covers imperative-free sentences like "ExFlow Rechnung").
+            has_trigger = has_action or has_question_intent
+            has_subject = has_object or has_proper_noun or has_date
+
+            trigger_with_subject = has_trigger and has_subject
+            strong_subject_only = has_object and has_proper_noun
+            # Short "topic-only" query: "ExFlow Rechnung", "Pitch Folien", "Thomas Mail"
+            # → treat as search when there is a subject and no conversational flag.
+            short_topic_query = (
+                len(words) <= 4
+                and has_subject
+                and not is_conversational
+            )
+            # Explicit global/deep intent is enough on its own — the user clearly
+            # wants a search even if the subject isn't a known SEARCH_OBJECT.
+            explicit_search_mode = intent.wants_global or intent.wants_deep
+
+            if not (trigger_with_subject or strong_subject_only
+                    or short_topic_query or explicit_search_mode):
                 intent.is_search = False
                 return intent
 
@@ -999,6 +1101,43 @@ class QueryParser:
                 seen.add(t)
                 intent.keywords.append(t)
 
+        # ── 6. Result-count hint ("die letzten 10", "top 5", "the last 20") ──
+        num_word_map = {
+            'einen': 1, 'ein': 1, 'eine': 1, 'one': 1, 'zwei': 2, 'two': 2,
+            'drei': 3, 'three': 3, 'vier': 4, 'four': 4, 'fuenf': 5, 'five': 5,
+            'fünf': 5, 'sechs': 6, 'six': 6, 'sieben': 7, 'seven': 7,
+            'acht': 8, 'eight': 8, 'neun': 9, 'nine': 9, 'zehn': 10, 'ten': 10,
+        }
+        count_triggers = {
+            'letzte', 'letzten', 'letzter', 'letztes',
+            'top', 'neueste', 'neuesten',
+            'erste', 'ersten', 'erster', 'erstes',
+            'last', 'latest', 'recent', 'first',
+            'ultimo', 'ultima', 'ultimos', 'primeiros',
+        }
+        # Only pick up a count when it's adjacent (±1 token) to a count_trigger word.
+        # Avoids false matches on dates like "20.03.2024".
+        toks = [t.rstrip('.,;:!?') for t in msg_lower.split()]
+        for i, tok in enumerate(toks):
+            if tok in count_triggers:
+                # Look at next and previous tokens
+                candidates = []
+                if i + 1 < len(toks):
+                    candidates.append(toks[i + 1])
+                if i - 1 >= 0:
+                    candidates.append(toks[i - 1])
+                for cand in candidates:
+                    if cand.isdigit():
+                        intent.max_results = max(1, min(200, int(cand)))
+                        break
+                    if cand in num_word_map:
+                        intent.max_results = num_word_map[cand]
+                        break
+                if intent.max_results:
+                    break
+
+        # (wants_global / wants_deep were already evaluated earlier so they
+        #  survive even when the lexical trigger would otherwise bail out.)
         return intent
 
 
@@ -1184,6 +1323,9 @@ class HybridSearch:
             top_candidates.extend(unscored[:20])
 
         memory_dir = os.path.join(speicher_path, 'memory')
+        # Content cache: fname -> text (read once, used for both body scoring
+        # and final result assembly).
+        content_cache = {}
         for fname, base_score in top_candidates:
             entry = candidates.get(fname)
             if not entry or entry.get('type') == 'image':
@@ -1199,6 +1341,7 @@ class HybridSearch:
             except Exception:
                 continue
 
+            content_cache[fname] = text
             text_norm = normalize_unicode(text)
             body_score = 0
 
@@ -1226,6 +1369,10 @@ class HybridSearch:
         for fname, score in final_sorted[:max_results]:
             if score <= 0:
                 break
+            if fname in content_cache:
+                # Reuse cached content from full-text step.
+                results.append({'name': fname, 'content': content_cache[fname], 'score': score})
+                continue
             entry = candidates.get(fname, {})
             fpath = entry.get('path') or os.path.join(memory_dir, fname)
             if not os.path.exists(fpath):
@@ -1466,22 +1613,91 @@ def get_recent_files(speicher_path, category=None, limit=10, per_category=False)
     return items[:limit]
 
 
-def auto_search(msg, speicher_path):
-    """Main entry point: detect search intent and execute.
-    Returns (results, feedback) where:
-      results: list of {name, content, score} or []
-      feedback: dict with search metadata or None (if no search triggered)
+def auto_search(msg, speicher_path, max_results=None, use_rag=True,
+                fast=True, enable_global=True):
+    """Unified smart auto-search entry point.
+
+    Behaviour:
+      1. Parse intent. If not a search query -> return ([], None).
+      2. If user explicitly asked for global search (intent.wants_global) and
+         enable_global is set -> route to global_rag_search.
+      3. Otherwise run hybrid_rag_search (BM25 + semantic + RRF fusion, with
+         optional query expansion + contextual compression).
+      4. Fallback to classic HybridSearch if the RAG pipeline returns empty
+         or raises.
+
+    Returns (results, feedback) where each result is {name, content, score}
+    so the existing call sites in web_server.py keep working.
     """
     intent = QueryParser.parse(msg)
-
     if not intent.is_search:
         return ([], None)
 
-    # Ensure index is up to date
-    idx = get_or_build_index(speicher_path)
-    idx.update_index()
+    effective_max = max_results or intent.max_results or 5
+    # Deep mode upgrade: /deep, "ausführlich" etc. in the message → pay for
+    # query expansion + compression.
+    effective_fast = fast and not intent.wants_deep
 
-    results, feedback = HybridSearch.search(intent, speicher_path)
+    # ── Route to global search when requested ──
+    if enable_global and intent.wants_global:
+        try:
+            return global_rag_search(msg, max_results=effective_max,
+                                     fast=effective_fast,
+                                     compress=not effective_fast)
+        except Exception as e:
+            print(f"[auto_search] global_rag_search failed: {e}")
+            # fall through to local
+
+    # ── Primary path: Hybrid RAG ──
+    rag_out = None
+    if use_rag and speicher_path:
+        try:
+            n_variants = 0 if effective_fast else 2
+            compress = not effective_fast
+            rag_out = hybrid_rag_search(
+                msg, speicher_path,
+                max_results=effective_max,
+                compress=compress,
+                n_variants=n_variants,
+            )
+        except Exception as e:
+            print(f"[auto_search] hybrid_rag_search error: {e}")
+            rag_out = None
+
+    if rag_out and rag_out.get('results'):
+        results = []
+        for r in rag_out['results']:
+            content = r.get('compressed') or r.get('snippet') or ''
+            results.append({
+                'name': r['name'],
+                'content': content,
+                'score': r.get('score', 0.0),
+            })
+        feedback = {
+            'query': ' '.join(intent.keywords) if intent.keywords else msg,
+            'keywords': intent.keywords,
+            'date_label': intent.date_label,
+            'field_label': intent.field_label,
+            'file_type': intent.file_type,
+            'found_count': len(results),
+            'index_count': 0,
+            'rag': True,
+            'semantic': rag_out.get('semantic', False),
+            'queries': rag_out.get('queries', [msg]),
+            'fallback': rag_out.get('fallback'),
+        }
+        return (results, feedback)
+
+    # ── Keyword-only fallback ──
+    try:
+        idx = get_or_build_index(speicher_path)
+        idx.update_index()
+    except Exception as e:
+        print(f"[auto_search] index update error: {e}")
+
+    results, feedback = HybridSearch.search(intent, speicher_path, max_results=effective_max)
+    if feedback is not None:
+        feedback['rag'] = False
     return (results, feedback)
 
 
@@ -1503,11 +1719,21 @@ def format_search_feedback(feedback, found_count):
     query_desc = ' | '.join(parts)
     idx_count = feedback.get('index_count', 0)
 
+    mode_tags = []
+    if feedback.get('global'):
+        mode_tags.append('global')
+    if feedback.get('rag'):
+        mode_tags.append('RAG')
+    if feedback.get('semantic'):
+        mode_tags.append('semantic')
+    mode_str = f" [{'/'.join(mode_tags)}]" if mode_tags else ''
+
     if found_count > 0:
-        return f"\U0001f50d Suche: {query_desc} | Gefunden: {found_count} Datei(en) | Index: {idx_count} Dateien"
+        idx_part = f" | Index: {idx_count} Dateien" if idx_count else ''
+        return f"\U0001f50d Suche{mode_str}: {query_desc} | Gefunden: {found_count} Datei(en){idx_part}"
     else:
-        return (f"\U0001f50d Keine Treffer fuer '{query_desc}'. "
-                f"Gesucht in: {idx_count} Dateien")
+        idx_part = f" Gesucht in: {idx_count} Dateien" if idx_count else ''
+        return f"\U0001f50d Keine Treffer{mode_str} fuer '{query_desc}'.{idx_part}"
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -1979,6 +2205,23 @@ def build_global_index_async():
     t.start()
 
 
+def _list_agent_speicher_paths():
+    """Return all agent speicher directories with a memory/ subfolder."""
+    base = DATALAKE_BASE
+    if not os.path.exists(base):
+        return []
+    paths = []
+    for item in os.listdir(base):
+        p = os.path.join(base, item)
+        if not os.path.isdir(p):
+            continue
+        if item.startswith('.') or item in ('config', 'email_inbox', 'claude_outputs'):
+            continue
+        if os.path.exists(os.path.join(p, 'memory')):
+            paths.append(p)
+    return paths
+
+
 def update_all_indexes():
     """Incremental update of all agent indexes + global index.
     Called periodically by the web server background thread."""
@@ -2062,59 +2305,95 @@ def global_search(msg, max_results=50):
             if mtime < start_ts or mtime > end_ts:
                 continue
 
-        # Type filter
-        if intent.file_type and entry.get('type') != intent.file_type:
-            continue
+        # Type filter — use source_types_effective when available so subcategories
+        # (webclip_slack, document_pdf, ...) are matched against their parent.
+        entry_type = entry.get('source_type') or entry.get('type', 'file')
+        if intent.source_types_effective:
+            if entry_type not in intent.source_types_effective:
+                continue
+        elif intent.file_type:
+            entry_parent = SOURCE_TAXONOMY.get(entry_type, {}).get('parent', entry_type)
+            if entry_type != intent.file_type and entry_parent != intent.file_type:
+                continue
 
         score = 0
         fname_norm = normalize_unicode(entry.get('filename', ''))
         fname_flat = fname_norm.replace('-', '').replace('_', '')
 
+        # Pre-ranking notification penalty (consistent with local HybridSearch).
+        if entry_type == 'notification':
+            score -= 15
+
         if intent.date_filter:
             score += 10
 
-        # Filename matching
+        # Filename matching (exact + fuzzy)
         for kw in keywords_norm:
             if kw in fname_norm or kw in fname_flat:
                 score += 4
+            else:
+                fm, fs = fuzzy_match(kw, fname_norm.replace('_', ' ').replace('-', ' '))
+                if fm:
+                    score += min(fs, 3)
 
-        # Email header matching
-        if entry.get('type') == 'email':
+        # Email header matching (exact + fuzzy)
+        if entry_type in ('email', 'notification'):
             from_norm = normalize_unicode(entry.get('from', ''))
+            to_norm = normalize_unicode(entry.get('to', ''))
             subject_norm = normalize_unicode(entry.get('subject', ''))
 
             for kw in keywords_norm:
                 if intent.field_filter == 'from' and kw in from_norm:
                     score += 5
+                elif intent.field_filter == 'to' and kw in to_norm:
+                    score += 5
+                elif intent.field_filter == 'about' and kw in subject_norm:
+                    score += 3
                 elif intent.field_filter is None:
                     if kw in from_norm:
                         score += 5
                     if kw in subject_norm:
                         score += 3
+                    if kw in to_norm:
+                        score += 2
 
             for pn in names_norm:
                 if pn in from_norm:
                     score += 8
+                elif pn in to_norm:
+                    score += 6
                 elif pn in subject_norm:
                     score += 4
                 else:
-                    for word in from_norm.split():
-                        if word.startswith(pn) or pn.startswith(word):
-                            if len(pn) >= 4 and len(word) >= 4:
-                                score += 5
-                                break
+                    fm_from, fs_from = fuzzy_match(pn, from_norm)
+                    fm_to, fs_to = fuzzy_match(pn, to_norm)
+                    fm_subj, fs_subj = fuzzy_match(pn, subject_norm)
+                    if fm_from:
+                        score += min(fs_from + 2, 6)
+                    elif fm_to:
+                        score += min(fs_to + 1, 4)
+                    elif fm_subj:
+                        score += min(fs_subj, 3)
 
-        # Non-email: person names in filename
+        # Non-email: person names in filename (exact + fuzzy)
         for pn in names_norm:
             if pn in fname_norm or pn in fname_flat:
                 score += 5
+            else:
+                fm, fs = fuzzy_match(pn, fname_norm.replace('_', ' ').replace('-', ' '))
+                if fm:
+                    score += min(fs, 4)
 
-        # Preview/keyword matching
+        # Preview/keyword matching (exact + fuzzy)
         preview_norm = normalize_unicode(entry.get('preview', ''))
         entry_keywords = entry.get('keywords', [])
         for kw in keywords_norm:
             if kw in preview_norm:
                 score += 1
+            elif len(kw) >= 4:
+                fm, fs = fuzzy_match(kw, preview_norm)
+                if fm:
+                    score += 1
             if kw in entry_keywords:
                 score += 2
 
@@ -2169,7 +2448,7 @@ def global_search(msg, max_results=50):
             'from': from_field,
             'subject': subject,
             'preview': entry.get('preview', '')[:150],
-            'score': score * 0.1 if is_notif else score,
+            'score': score,
             'from_person': from_person,
             'is_notification': is_notif,
             'agent': entry.get('agent', 'global'),
@@ -2180,6 +2459,107 @@ def global_search(msg, max_results=50):
     results.sort(key=lambda x: (not x['from_person'], x['is_notification'], -x['score']))
 
     feedback['found_count'] = len(results)
+    return (results, feedback)
+
+
+def global_rag_search(query, max_results=10, fast=True, compress=False):
+    """Cross-agent hybrid RAG: keyword (existing global index) fused with
+    semantic search over the union of per-agent embedding indexes.
+
+    This is additive — we do NOT build a separate global embedding store.
+    Instead we iterate the per-agent `.embedding_index.json` files, which
+    are kept up-to-date by `index_file_with_embedding` at add-time.
+
+    Returns (results, feedback) compatible with auto_search.
+    """
+    # ── 1. Keyword side: existing global_search ──
+    try:
+        kw_results, kw_feedback = global_search(query, max_results=50)
+    except Exception as e:
+        print(f"[global_rag_search] keyword side failed: {e}")
+        kw_results = []
+        kw_feedback = {'query': query, 'global': True, 'found_count': 0, 'index_count': 0}
+
+    kw_by_name = {r['name']: r for r in kw_results}
+    kw_ranked = [r['name'] for r in kw_results]
+
+    # ── 2. Semantic side: union of per-agent embedding indexes ──
+    semantic_lists = []
+    chunk_by_key = {}
+    first_speicher = None
+
+    api_key = _get_openai_api_key()
+    if api_key:
+        q_vecs = _call_openai_embedding([query], api_key)
+        qv = q_vecs[0] if q_vecs else None
+        if qv:
+            for speicher in _list_agent_speicher_paths():
+                try:
+                    emb_idx = get_embedding_index(speicher)
+                    emb_idx._load()
+                    if not emb_idx.entries:
+                        continue
+                    if first_speicher is None:
+                        first_speicher = speicher
+                    hits = emb_idx.search(qv, max_results=20)
+                    sem_list = []
+                    for h in hits:
+                        name = h['name']
+                        sem_list.append(name)
+                        prev = chunk_by_key.get(name)
+                        if prev is None or h['score'] > prev[1]:
+                            chunk_by_key[name] = (h['chunk'], h['score'], speicher)
+                    if sem_list:
+                        semantic_lists.append(sem_list)
+                except Exception as e:
+                    print(f"[global_rag_search] embedding search for {speicher} failed: {e}")
+
+    # ── 3. RRF fusion ──
+    fused = rrf_fuse([kw_ranked] + semantic_lists, k=_RRF_K, top_n=max_results * 2)
+
+    # ── 4. Build results ──
+    results = []
+    memory_dir_fallback = os.path.join(DATALAKE_BASE, '_unknown')
+    for item in fused[:max_results]:
+        fname = item['name']
+        kw_entry = kw_by_name.get(fname)
+
+        snippet = ''
+        speicher_for_compress = None
+        if fname in chunk_by_key:
+            snippet = chunk_by_key[fname][0]
+            speicher_for_compress = chunk_by_key[fname][2]
+        elif kw_entry and kw_entry.get('path'):
+            try:
+                with open(kw_entry['path'], 'r', encoding='utf-8', errors='replace') as f:
+                    snippet = f.read(8000)
+            except Exception:
+                snippet = kw_entry.get('preview', '')[:2000]
+
+        if compress and snippet:
+            speicher_for_compress = speicher_for_compress or first_speicher
+            if speicher_for_compress:
+                try:
+                    snippet = compress_chunk(snippet, query, speicher_for_compress)
+                except Exception:
+                    pass
+
+        results.append({
+            'name': fname,
+            'content': snippet,
+            'score': item['rrf_score'],
+            'path': (kw_entry or {}).get('path', ''),
+            'agent': (kw_entry or {}).get('agent', 'global'),
+        })
+
+    feedback = {
+        'query': query,
+        'global': True,
+        'rag': True,
+        'semantic': bool(semantic_lists),
+        'found_count': len(results),
+        'index_count': kw_feedback.get('index_count', 0) if kw_feedback else 0,
+    }
     return (results, feedback)
 
 
@@ -2270,11 +2650,30 @@ def _get_agent_llm(speicher_path):
 
 # ─── EMBEDDINGS (OpenAI text-embedding-3-small) ──────────────────────────────
 
+# Circuit-breaker state for the embedding endpoint. When OpenAI returns 429
+# or 5xx we stop calling for `_EMBEDDING_CB_COOLDOWN` seconds so the caller
+# falls back to keyword-only retrieval without log-spam.
+_EMBEDDING_CB_COOLDOWN = 600  # 10 minutes
+_embedding_cb_block_until = 0.0
+_embedding_cb_last_log = 0.0
+
+
 def _call_openai_embedding(texts, api_key):
-    """Batched embedding call. Returns list[list[float]] or None on failure."""
+    """Batched embedding call. Returns list[list[float]] or None on failure.
+    Includes a circuit breaker on HTTP 429/5xx to prevent log-spam & quota burn.
+    """
+    global _embedding_cb_block_until, _embedding_cb_last_log
     if not api_key or not texts:
         return None
-    # OpenAI accepts up to 2048 inputs per call; we chunk conservatively
+    now = time.time()
+    if now < _embedding_cb_block_until:
+        # Throttle the cooldown message to once per minute
+        if now - _embedding_cb_last_log > 60:
+            _embedding_cb_last_log = now
+            remaining = int(_embedding_cb_block_until - now)
+            print(f"[embedding] circuit-breaker active ({remaining}s left); skipping call")
+        return None
+
     batch_size = 64
     all_vecs = []
     url = "https://api.openai.com/v1/embeddings"
@@ -2299,7 +2698,13 @@ def _call_openai_embedding(texts, api_key):
             for item in data.get('data', []):
                 all_vecs.append(item.get('embedding', []))
         except urllib.error.HTTPError as e:
-            print(f"[embedding] HTTP {e.code}: quota/rate limit — fallback aktiv")
+            # Quota / rate-limit / server error -> open circuit breaker.
+            if e.code == 429 or 500 <= e.code < 600:
+                _embedding_cb_block_until = time.time() + _EMBEDDING_CB_COOLDOWN
+                print(f"[embedding] HTTP {e.code}: circuit-breaker opens for "
+                      f"{_EMBEDDING_CB_COOLDOWN}s — fallback aktiv")
+            else:
+                print(f"[embedding] HTTP {e.code}: fallback aktiv")
             return None
         except Exception as e:
             print(f"[embedding] call failed: {e}")
@@ -2689,9 +3094,9 @@ def compress_chunk(chunk_text, query, speicher_path=None, max_tokens=220):
 # ─── HYBRID RAG SEARCH (top-level orchestrator) ──────────────────────────────
 
 def hybrid_rag_search(query, speicher_path, max_results=5,
-                      fuse_top=20, compress=True):
+                      fuse_top=20, compress=True, n_variants=2):
     """Full RAG pipeline:
-        1) expand query into {original + variants}
+        1) expand query into {original + variants} (skipped if n_variants=0)
         2) parallel keyword search (existing HybridSearch) + semantic search
         3) RRF fusion -> top `fuse_top`
         4) take first `max_results`, optionally contextually compress
@@ -2706,7 +3111,10 @@ def hybrid_rag_search(query, speicher_path, max_results=5,
     if not query or not speicher_path:
         return out
 
-    queries = expand_query(query, speicher_path=speicher_path, n_variants=2)
+    if n_variants and n_variants > 0:
+        queries = expand_query(query, speicher_path=speicher_path, n_variants=n_variants)
+    else:
+        queries = [query]
     out['queries'] = queries
 
     # --- Keyword side: run existing HybridSearch per query variant ---
@@ -2778,6 +3186,29 @@ def hybrid_rag_search(query, speicher_path, max_results=5,
 
     out['results'] = results
     return out
+
+
+def reindex_embeddings_async(speicher_path, limit=None):
+    """Run `reindex_embeddings` in a background thread.
+    Safe to call on startup; no-op if OpenAI key missing.
+    """
+    def _run():
+        try:
+            res = reindex_embeddings(speicher_path, limit=limit)
+            if res.get('ok') and res.get('indexed'):
+                print(f"[embedding_index] {speicher_path}: indexed={res['indexed']} "
+                      f"skipped={res.get('skipped', 0)} failed={res.get('failed', 0)}")
+        except Exception as e:
+            print(f"[embedding_index] reindex error for {speicher_path}: {e}")
+    t = threading.Thread(target=_run, daemon=True)
+    t.start()
+
+
+def reindex_all_embeddings_async(limit_per_agent=None):
+    """Backfill semantic embeddings for every known agent in the background.
+    Each agent runs in its own thread so one slow agent doesn't block others."""
+    for p in _list_agent_speicher_paths():
+        reindex_embeddings_async(p, limit=limit_per_agent)
 
 
 def reindex_embeddings(speicher_path, limit=None):

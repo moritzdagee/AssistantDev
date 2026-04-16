@@ -6,6 +6,37 @@ Format: [Datum] Änderung | Datei | Grund
 
 ## 2026-04-16
 
+### Feat: State-of-the-Art RAG + Auto-getriggerte Agentensuche
+- **Was:** Komplette Ueberarbeitung der Memory-Suche. Auto-Search laeuft jetzt ueber den bestehenden, bisher ungenutzten `hybrid_rag_search` (BM25 + semantic embeddings + RRF-Fusion + optional Query-Expansion + optional Contextual Compression) statt nur ueber das keyword-basierte `HybridSearch`. QueryParser triggert deutlich robuster auf Alltagsfragen, ohne dabei ueber Smalltalk zu stolpern. Global-Search wird automatisch aktiviert, wenn der Nutzer "ueberall"/"extended memory"/"global"/... schreibt. Neu: `global_rag_search` fusioniert den globalen Keyword-Index mit der Union der per-Agent-Embedding-Indexe und liefert cross-agent semantische Treffer ohne separaten Global-Embedding-Store.
+- **Trigger-Verbesserungen (`QueryParser.parse`):**
+  - Neue Liste `QUESTION_INTENT_PHRASES` (DE/EN/PT) fuer "was stand / welches datum / wann war / who sent / lembra" etc. → triggert zusammen mit einem Subjekt (Object, Eigenname oder Datum) Such-Intent, auch ohne Action-Verb.
+  - Neue Liste `NO_SEARCH_OVERRIDES` fuer Smalltalk/Greetings/Meta-Fragen ("hallo", "danke", "wer bist du") → expliziter Opt-out.
+  - Short-Topic-Queries ("ExFlow Rechnung", "Pitch Folien") triggern jetzt.
+  - Bugfix: `rstrip("'s")` verstuemmelte "Mails" → "Mail", jetzt korrekte `endswith("'s")`-Pruefung.
+  - SEARCH_OBJECTS erweitert um haeufige Plurale (mails, emails, rechnungen, dateien, dokumente, ...).
+  - `QueryIntent` hat neue Felder: `max_results`, `wants_global`, `wants_deep`.
+  - `max_results` wird aus Phrasen wie "die letzten 10", "top 5", "drei neuesten" extrahiert (nur adjazent zu count-Trigger-Wort, damit Datumswerte nicht getroffen werden).
+  - `wants_global` setzt sich bei den bestehenden GLOBAL_TRIGGERS (ueberall/extended memory/global search/...) — das bisher importierte aber nie benutzte `detect_global_trigger` ist damit aktiviert.
+  - `wants_deep` setzt sich bei `/deep ` Praefix oder "ausfuehrlich/detailliert/thorough/in-depth".
+  - Global/Deep-Erkennung laeuft VOR dem Trigger-Gate, damit explizite User-Intent auch bei schwachem lexikalischem Trigger ueberlebt.
+- **Hot-Path-Integration (`auto_search`):** Neuer unified entry-point wrapper. Route-Logik:
+  1. Intent parsen, falls kein Search-Intent → ([], None).
+  2. `wants_global` → `global_rag_search`.
+  3. Sonst: `hybrid_rag_search` (fast mode: keine query-expansion, keine compression). `wants_deep` eskaliert auf deep mode (2 query-variants, contextual compression per Chunk).
+  4. Fallback auf klassisches `HybridSearch` bei Fehler oder leerem Ergebnis.
+  5. `max_results` ehrt `intent.max_results` (default 5, max 200).
+- **Cross-Agent RAG (`global_rag_search`):** Fusioniert Keyword-Seite (existierender `global_search`) mit der Union ueber alle per-Agent-`EmbeddingIndex.json`-Files via RRF. Kein separater Embedding-Store noetig — nutzt die Daten, die `index_file_with_embedding` beim Ingest sowieso anlegt. Neuer Helper `_list_agent_speicher_paths()` iteriert alle Agenten unter `DATALAKE_BASE`.
+- **Global-Search Drift beseitigt (`global_search`):** Jetzt mit Source-Taxonomy (`source_types_effective`), fuzzy-match auf filename/preview/person-names (wie `HybridSearch`), und Notifikations-Penalty pre-ranking (`-15`) statt post-hoc `score * 0.1`. Das Code-Duplikat driftet damit nicht weiter auseinander.
+- **Working-Memory-Dedup (`process_single_message`):** Auto-geladene Files werden gegen die Working-Memory-Manifeste des Agenten abgeglichen. Dateien, die bereits als WM-Pin im System-Prompt injiziert sind, werden NICHT ein zweites Mal in den kontext_items angehaengt.
+- **Performance-Fix HybridSearch:** Content-Cache zwischen Schritt 3 (Full-Text-Scoring) und Schritt 4 (Final-Return) — die Top-Candidates werden nur noch einmal von Disk gelesen statt zweimal.
+- **Background-Backfill fuer Embeddings:** Neue Funktionen `reindex_embeddings_async(speicher)` und `reindex_all_embeddings_async()`. Werden beim Serverstart und alle ~30 min (Tick 6 des periodischen Index-Update-Loops) angestossen. No-op ohne OpenAI-Key.
+- **OpenAI Circuit-Breaker:** `_call_openai_embedding` oeffnet bei HTTP 429 oder 5xx eine 10-Minuten-Sperre fuer alle Embedding-Calls. Vermeidet Quota-Burn und Log-Spam bei ausgeschoepftem Kontingent; Cooldown-Meldung wird auf 1× pro Minute gedrosselt.
+- **Feedback-Formatierung:** `format_search_feedback` tagged jetzt den Mode (`[RAG]`, `[semantic]`, `[global]`) und zeigt ihn auch bei 0 Treffern, damit der Nutzer sieht, welcher Pfad durchlief.
+- **Dateien:** `src/search_engine.py` (Trigger-Logik, auto_search, global_rag_search, reindex_*_async, Embedding-Circuit-Breaker, Global-Search-Parity, Content-Cache in HybridSearch), `src/web_server.py` (Import von `reindex_all_embeddings_async`, WM-Dedup-Block in `process_single_message`, Startup-Hook fuer Embedding-Backfill, periodischer Tick), `tests/run_tests.py` (+40 Tests in "SOTA RAG + Auto-Search 2026-04-16").
+- **Tests:** Suite 691/691 gruen.
+- **Backups:** `backups/2026-04-16_09-47-19/src/{web_server,search_engine}.py`
+- **Feature-Branch:** `feature/sota-rag-autosearch`.
+
 ### Fix: Cross-Session Pollution — Prompt-Resultate leckten zwischen Agenten/Fenstern
 - **Problem:** Konkret beobachtet: Nutzer oeffnet Agent "System-Wort", gibt Prompt ein; oeffnet dann Agent "Signicat Outbound", gibt dort Prompt ein. Das Resultat des System-Wort-Prompts erscheint im Signicat-Outbound-Fenster.
 - **Ursache 1 (sessionStorage-Sharing):** Der Init-Code speicherte die Session-ID via `sessionStorage.setItem('assistant_session_id', ...)` und las sie beim naechsten Laden zurueck. In pywebview kann `sessionStorage` jedoch zwischen mehreren Fenstern desselben Origins geteilt sein — zwei parallele Fenster landeten auf **derselben** Server-Session. Beide pollten mit der gleichen `session_id` und zeigten sich gegenseitig Responses.
