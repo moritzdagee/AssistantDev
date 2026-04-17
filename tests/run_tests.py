@@ -2983,8 +2983,12 @@ try:
          "function openChatWithMessage" in _dash_html)
     test("Dashboard HTML: auto-refresh via setInterval",
          "setInterval(softRefresh" in _dash_html)
-    test("Dashboard HTML: Sort unread-first implementiert",
-         "a.timestamp_epoch - b.timestamp_epoch" in _dash_html)
+    # Seit 2026-04-17: einheitliche chronologische Sortierung (juengste oben),
+    # plus per-Spalte Toggle 'nur ungelesen'.
+    test("Dashboard HTML: Sort juengste-zuerst implementiert",
+         "return b.timestamp_epoch - a.timestamp_epoch" in _dash_html)
+    test("Dashboard HTML: 'nur ungelesen'-Toggle pro Spalte",
+         "md-only-unread" in _dash_html and "onlyUnread" in _dash_html)
 except Exception as e:
     test("GET /messages HTTP-Aufruf", False)
 

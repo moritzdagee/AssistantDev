@@ -12400,7 +12400,11 @@ _MSG_DASHBOARD_HTML = r"""<!DOCTYPE html>
 <script>
 (function(){
   var BOARD = document.getElementById('md-board');
-  var STATE = { sources:[], messages:[], byId:{}, globalQuery:'', colQuery:{}, selectedForReply:null };
+  var STATE = { sources:[], messages:[], byId:{}, globalQuery:'', colQuery:{}, selectedForReply:null, onlyUnread:{} };
+  try {
+    var _saved = localStorage.getItem('md_only_unread');
+    if (_saved) STATE.onlyUnread = JSON.parse(_saved) || {};
+  } catch(e) {}
   var REFRESH_MS = 60000;
   var agentsCache = null;
 
@@ -12440,15 +12444,19 @@ _MSG_DASHBOARD_HTML = r"""<!DOCTYPE html>
   function filterForColumn(sourceKey){
     var q = (STATE.globalQuery || '').toLowerCase().trim();
     var qCol = (STATE.colQuery[sourceKey] || '').toLowerCase().trim();
+    // Per-Spalte Toggle 'nur ungelesen'. Per localStorage persistiert.
+    var onlyUnread = !!(STATE.onlyUnread && STATE.onlyUnread[sourceKey]);
     return STATE.messages.filter(function(m){
       if (m.source !== sourceKey) return false;
+      if (onlyUnread && m.read) return false;
       var hay = (m.sender_name + ' ' + m.subject + ' ' + m.preview + ' ' + (m.sender_address||'')).toLowerCase();
       if (q && hay.indexOf(q) === -1) return false;
       if (qCol && hay.indexOf(qCol) === -1) return false;
       return true;
     }).sort(function(a,b){
-      if (a.read !== b.read) return a.read ? 1 : -1;
-      if (!a.read) return a.timestamp_epoch - b.timestamp_epoch;
+      // Einheitliche Sortierung: juengste Nachricht oben, ungelesen UND gelesen
+      // linear chronologisch. Kein Vorrang fuer ungelesen — dafuer gibt's den
+      // Toggle 'nur ungelesen'.
       return b.timestamp_epoch - a.timestamp_epoch;
     });
   }
@@ -12516,6 +12524,7 @@ _MSG_DASHBOARD_HTML = r"""<!DOCTYPE html>
       var col = document.createElement('div');
       col.className = 'md-col';
       col.setAttribute('data-source', s.key);
+      var onlyUnreadChecked = (STATE.onlyUnread && STATE.onlyUnread[s.key]) ? ' checked' : '';
       col.innerHTML =
         '<div class="md-col-hdr">' +
           '<div class="md-col-title">' +
@@ -12524,13 +12533,27 @@ _MSG_DASHBOARD_HTML = r"""<!DOCTYPE html>
             '<span class="md-col-unread" style="display:none"></span>' +
             '<span class="md-col-count">0 gesamt</span>' +
           '</div>' +
-          '<input class="md-col-search" type="text" placeholder="In dieser Spalte..." autocomplete="off">' +
+          '<div class="md-col-controls" style="display:flex;gap:8px;align-items:center;margin-top:6px">' +
+            '<input class="md-col-search" type="text" placeholder="In dieser Spalte..." autocomplete="off" style="flex:1">' +
+            '<label class="md-col-toggle" style="display:flex;align-items:center;gap:4px;font-size:11px;color:#aaa;cursor:pointer;white-space:nowrap">' +
+              '<input type="checkbox" class="md-only-unread"' + onlyUnreadChecked + '>' +
+              '<span>nur ungelesen</span>' +
+            '</label>' +
+          '</div>' +
         '</div>' +
         '<div class="md-col-body"></div>';
       var inp = col.querySelector('.md-col-search');
       inp.addEventListener('input', function(){
         STATE.colQuery[s.key] = inp.value;
         renderColumnCards(col, s.key);
+      });
+      var unreadChk = col.querySelector('.md-only-unread');
+      unreadChk.addEventListener('change', function(){
+        if (!STATE.onlyUnread) STATE.onlyUnread = {};
+        STATE.onlyUnread[s.key] = unreadChk.checked;
+        try { localStorage.setItem('md_only_unread', JSON.stringify(STATE.onlyUnread)); } catch(e){}
+        renderColumnCards(col, s.key);
+        updateColumnHeaderCounts();
       });
       BOARD.appendChild(col);
       renderColumnCards(col, s.key);
