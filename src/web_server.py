@@ -7411,9 +7411,20 @@ def api_access_control_post():
         for fname in os.listdir(AGENTS_DIR):
             if fname.endswith('.txt') and '.backup_' not in fname:
                 valid_agents.add(fname[:-4])
-    for agent in data['agents'].keys():
-        if agent not in valid_agents:
-            return jsonify({'success': False, 'error': f'Unbekannter Agent: {agent}'}), 400
+    # Stale Agents (z.B. umbenannte oder geloeschte) werden stumm weggelassen,
+    # statt das gesamte Save zu blockieren. Das verhindert, dass historische
+    # Eintraege in access_control.json das Speichern verhindern.
+    stale_agents = [a for a in list(data['agents'].keys()) if a not in valid_agents]
+    for a in stale_agents:
+        data['agents'].pop(a, None)
+        print(f'[ACCESS-CONTROL] Stale Agent entfernt beim Save: {a}')
+    # Auch Referenzen auf stale Agents aus cross_agent_read-Listen purgen.
+    for agent_cfg in data['agents'].values():
+        if not isinstance(agent_cfg, dict):
+            continue
+        cr = agent_cfg.get('cross_agent_read')
+        if isinstance(cr, list):
+            agent_cfg['cross_agent_read'] = [a for a in cr if a in valid_agents]
     # Custom-Sources erhalten: wenn der Client sie nicht mitschickt, aus
     # existierender Datei uebernehmen (Frontend re-schickt sie aber auch).
     if 'custom_sources' not in data:

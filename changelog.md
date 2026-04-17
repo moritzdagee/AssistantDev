@@ -6,6 +6,15 @@ Format: [Datum] Änderung | Datei | Grund
 
 ## 2026-04-16
 
+### Bug-Fix: Access-Control Save blockte bei stale Agents (signicat_powerpoint)
+- **Was der Nutzer beobachtete:** "Speichern" in Access Control gab "Fehler: Unbekannter Agent: signicat_powerpoint" zurueck — das komplette Save war blockiert.
+- **Ursache:** `signicat_powerpoint.txt` existiert nicht mehr in `config/agents/` (nur noch Backup-Dateien `.backup_*`), aber der Eintrag war noch in `access_control.json.agents`. Der POST-Validator verwarf die ganze Anfrage, weil ein historischer Agent in den Daten steckte.
+- **Fix in `src/web_server.py` `api_access_control_post`:**
+  - Stale Agents werden stumm aus `data['agents']` entfernt und in der Console geloggt (`[ACCESS-CONTROL] Stale Agent entfernt beim Save: <name>`), statt das Save zu blockieren.
+  - Zusaetzlich werden Referenzen auf stale Agents aus allen `cross_agent_read`-Listen der verbliebenen Agents entfernt — sonst haette man dead references, die Frontend-Checkboxen auf Geister-Agents rendern wuerden.
+- **Verifiziert:** Save-Roundtrip mit `signicat_powerpoint` im Payload liefert jetzt HTTP 200; nach dem Save ist der Eintrag aus `access_control.json` weg, Server-Log hat `[ACCESS-CONTROL] Stale Agent entfernt beim Save: signicat_powerpoint`.
+- **Feature-Branch:** `feature/fix-ac-stale-agents`.
+
 ### Bug-Fix: Custom-Source Path mit trailing Apostroph akzeptiert (Copy-Paste)
 - **Was der Nutzer beobachtete:** In Access Control "Ordner hinzufuegen" schlug fehl mit "Pfad ist kein Ordner oder existiert nicht" — der Fehler-Pfad endete auf `31_Signicat'` (trailing Apostroph). Typisches Copy-Paste-Artefakt (z.B. aus `pbcopy` mit Shell-Quoting oder Kontext-Menue "Als Pfadname kopieren").
 - **Fix in `src/web_server.py`:**
