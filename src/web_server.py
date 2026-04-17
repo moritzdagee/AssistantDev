@@ -11683,7 +11683,8 @@ _MSG_SOURCES = [
     # Spalte ausgeblendet (vorher sichtbar mit 0 gesamt).
     {"key": "whatsapp",             "label": "WhatsApp",                        "agent": None,             "icon": "\U0001F4F1", "type": "whatsapp", "group": "Messaging"},
     {"key": "imessage",             "label": "iMessage",                        "agent": "privat",         "icon": "\U0001F4AC", "type": "imessage", "group": "Messaging"},
-    {"key": "chat",                 "label": "Chat-Verlauf",                    "agent": None,             "icon": "\U0001F4AC", "type": "chat",     "group": "Messaging"},
+    # "Chat-Verlauf" war interne Agent-Konversations-History (konversation_*.txt),
+    # kein Inflow-Channel — raus aus dem Dashboard.
 ]
 
 # Mapping Source -> empfohlener Agent fuer "Antworten"-Workflow
@@ -11695,7 +11696,6 @@ _MSG_SOURCE_TO_AGENT = {
     "email_systemward": "system ward",
     "whatsapp": "privat",
     "imessage": "privat",
-    "chat": "standard",
 }
 
 _MSG_EMAIL_FIELD_RE = _msgd_re.compile(
@@ -12500,7 +12500,7 @@ def api_messages_sources():
         items = by_src.get(src["key"], [])
         count = len(items)
         unread = sum(1 for m in items if not m["read"])
-        out.append({
+        entry = {
             "key": src["key"],
             "label": src["label"],
             "icon": src["icon"],
@@ -12510,7 +12510,14 @@ def api_messages_sources():
             "count": count,
             "unread": unread,
             "recommended_agent": _MSG_SOURCE_TO_AGENT.get(src["key"]),
-        })
+        }
+        # iMessage: FDA-Status mitgeben, damit das Frontend eine klare
+        # Fehlermeldung zeigen kann, wenn die Permission fehlt.
+        if src["type"] == "imessage":
+            probe = _imsg_probe_access()
+            entry["access_ok"] = probe.get("ok", False)
+            entry["access_error"] = probe.get("reason") if not probe.get("ok") else None
+        out.append(entry)
     return jsonify({"ok": True, "sources": out})
 
 
@@ -12847,6 +12854,16 @@ _MSG_DASHBOARD_HTML = r"""<!DOCTYPE html>
             '<span>auch Archiv</span>' +
           '</label>'
         : '';
+      // iMessage: wenn FDA fehlt, Warnbanner im Header anzeigen.
+      var accessBanner = '';
+      if (s.type === 'imessage' && s.access_ok === false) {
+        accessBanner =
+          '<div class="md-col-warning" style="background:#4a1f1f;border:1px solid #8a4a4a;color:#d09090;padding:8px 10px;border-radius:5px;margin:6px 0;font-size:11px;line-height:1.5">' +
+          '<strong>&#9888; Kein Zugriff auf Messages-App</strong><br>' +
+          'Der Server-Prozess hat keinen Full-Disk-Access. Gehe zu <em>Systemeinstellungen &rarr; Datenschutz &amp; Sicherheit &rarr; Festplattenvollzugriff</em> und aktiviere <code>/usr/bin/python3</code>. ' +
+          '<span style="color:#c06060">Detail: ' + esc(s.access_error || '') + '</span>' +
+          '</div>';
+      }
       col.innerHTML =
         '<div class="md-col-hdr">' +
           '<div class="md-col-title">' +
@@ -12855,6 +12872,7 @@ _MSG_DASHBOARD_HTML = r"""<!DOCTYPE html>
             '<span class="md-col-unread" style="display:none"></span>' +
             '<span class="md-col-count">0 gesamt</span>' +
           '</div>' +
+          accessBanner +
           '<div class="md-col-controls" style="display:flex;gap:10px;align-items:center;margin-top:6px;flex-wrap:wrap">' +
             '<input class="md-col-search" type="text" placeholder="In dieser Spalte..." autocomplete="off" style="flex:1;min-width:120px">' +
             '<label class="md-col-toggle" style="display:flex;align-items:center;gap:4px;font-size:11px;color:#aaa;cursor:pointer;white-space:nowrap">' +

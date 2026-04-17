@@ -2905,8 +2905,10 @@ try:
          "email_privat" in _src_keys)
     test("/api/messages/sources enthaelt whatsapp",
          "whatsapp" in _src_keys)
-    test("/api/messages/sources enthaelt chat",
-         "chat" in _src_keys)
+    # Seit 2026-04-17: 'chat' (interne Agent-Konversations-History) ist kein
+    # eigener Inflow-Channel mehr. Dafuer 'imessage' als echte Message-Quelle.
+    test("/api/messages/sources enthaelt imessage",
+         "imessage" in _src_keys)
     test("/api/messages/sources liefert recommended_agent",
          all("recommended_agent" in s for s in _msg_src_json.get("sources", [])))
     test("/api/messages/sources liefert count + unread Felder",
