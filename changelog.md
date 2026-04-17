@@ -6,6 +6,26 @@ Format: [Datum] Änderung | Datei | Grund
 
 ## 2026-04-16
 
+### Feature/Fix: Shared-Data-Quellen — echte Zahlen + klare Beschriftung + Dashboard-Link
+- **Was der Nutzer beobachtete:**
+  1. "Webclips: 0 Dateien" — obwohl Chrome-Clipper regelmaessig Clips speichert (29 tatsaechlich vorhanden).
+  2. "Kalender: 2 Dateien" — entspricht nur `calendar_events.json` + `_summary.txt`, die JSON enthaelt aber 1338 Events.
+  3. "Slack Messages" — irrefuehrend, weil keine Slack-API-Integration auf Lese-Seite existiert. Die `slack_*.txt` sind Web-Clips aus dem Chrome-Extension-Export.
+  4. Message Dashboard nicht auffindbar in der Haupt-UI.
+- **Fix in `src/web_server.py` `_source_status(key)`:**
+  - `webclips`: aggregiert alle `<agent>/memory/web_*` ueber alle Agent-Ordner (der globale `webclips/`-Ordner ist ein historischer Spiegel und meist leer). **29 Clips** live.
+  - `calendar`: parsed `calendar_events.json` und liefert `count = len(events)` + `unit='Events'` statt Datei-Zaehlung. **1338 Events** live.
+  - Die Access-Control-Matrix-UI zeigt jetzt die richtige Einheit (`status.unit`), z.B. "1338 Events" statt "2 Eintraege".
+- **Slack-Umbenennung `/admin/permissions`:**
+  - "Slack Messages" -> **"Slack Web-Clips"** mit Zusatz: "Web-Clip-Export via Chrome-Extension, keine Slack-API". So ist fuer den Nutzer sofort klar, woher die Daten kommen.
+- **Message-Dashboard im Haupt-Nav:**
+  - Neuer Menupunkt "📬 Message Dashboard" in der Haupt-Sidebar unter "Posteingang" (ueber "Administration"). Oeffnet `/messages`.
+- **Kalender-Access fuer alle Agenten:**
+  - `access_control.json` aktualisiert: `calendar` in `shared_memory` fuer alle 8 Agenten (privat, signicat, signicat_lamp, signicat_meddpicc, signicat_outbound, system ward, trustedcarrier, trustedcarrier_instagramm). So kann jeder Agent den Kalender lesen — wie vom Nutzer gewuenscht.
+- **Tests:** Einen bestehenden Test angepasst (`"Slack Messages"` -> `"Slack Web-Clips"`). Suite **849/849 gruen**.
+- **Nicht geaendert (bewusst):** kChat-Label bleibt "kChat Messages" — weil es dort tatsaechlich eine API-Integration gibt (`kchat_watcher.py`), auch wenn der Token aktuell ungueltig ist.
+- **Feature-Branch:** `feature/fix-shared-sources-counts`.
+
 ### Bug-Fix: Access-Control Save blockte bei stale Agents (signicat_powerpoint)
 - **Was der Nutzer beobachtete:** "Speichern" in Access Control gab "Fehler: Unbekannter Agent: signicat_powerpoint" zurueck — das komplette Save war blockiert.
 - **Ursache:** `signicat_powerpoint.txt` existiert nicht mehr in `config/agents/` (nur noch Backup-Dateien `.backup_*`), aber der Eintrag war noch in `access_control.json.agents`. Der POST-Validator verwarf die ganze Anfrage, weil ein historischer Agent in den Daten steckte.

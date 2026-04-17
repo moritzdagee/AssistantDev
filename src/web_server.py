@@ -3722,6 +3722,9 @@ HTML = """<!DOCTYPE html>
       <div class="nav-menu-section">Services</div>
       <div id="svc-list"><div class="svc-row" style="color:#666;">Lade...</div></div>
       <div class="nav-menu-divider"></div>
+      <div class="nav-menu-section">Posteingang</div>
+      <a class="nav-menu-item" onclick="navigateTo('/messages')"><span class="nav-icon">&#128236;</span><span class="nav-label">Message Dashboard</span><span class="nav-hint">Kanban E-Mail / WhatsApp / Chat</span></a>
+      <div class="nav-menu-divider"></div>
       <div class="nav-menu-section">Administration</div>
       <a class="nav-menu-item" onclick="navigateTo('/admin')"><span class="nav-icon">&#9881;</span><span class="nav-label">Admin Panel</span><span class="nav-hint">Status &amp; Uebersicht</span></a>
       <a class="nav-menu-item" onclick="navigateTo('/admin/access-control')"><span class="nav-icon">&#128274;</span><span class="nav-label">Access Control</span><span class="nav-hint">Matrix</span></a>
@@ -7305,6 +7308,43 @@ def _source_status(path: str, key: str = "") -> dict:
         except OSError:
             return {"exists": False, "count": 0}
         return {"exists": total > 0, "count": total}
+    if key == "webclips":
+        # Der Chrome-Clipper speichert Clips als <agent>/memory/web_*.
+        # Der globale `webclips/`-Ordner ist ein historischer Spiegel und
+        # meistens leer — wir zaehlen die echten Clips in den Agent-Memorys.
+        total = 0
+        try:
+            for entry in os.listdir(BASE):
+                mem = os.path.join(BASE, entry, "memory")
+                if not os.path.isdir(mem):
+                    continue
+                try:
+                    for f in os.listdir(mem):
+                        if f.startswith('web_'):
+                            total += 1
+                except OSError:
+                    continue
+        except OSError:
+            return {"exists": False, "count": 0}
+        return {"exists": total > 0, "count": total}
+    if key == "calendar":
+        # Kalender-Ordner hat 2 Dateien (calendar_events.json + _summary.txt),
+        # interessanter ist aber die Anzahl der Events in der JSON.
+        ev_file = os.path.join(BASE, 'calendar', 'calendar_events.json')
+        if not os.path.isfile(ev_file):
+            return {"exists": False, "count": 0}
+        try:
+            with open(ev_file, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+            if isinstance(data, dict) and isinstance(data.get('events'), list):
+                cnt = len(data['events'])
+            elif isinstance(data, list):
+                cnt = len(data)
+            else:
+                cnt = 0
+            return {"exists": True, "count": cnt, "unit": "Events"}
+        except Exception:
+            return {"exists": True, "count": 0}
     if not path:
         return {"exists": False, "count": 0}
     try:
@@ -7325,8 +7365,8 @@ def api_access_control_get():
     for src in BUILTIN_SHARED_SOURCES:
         entry = dict(src)
         entry['builtin'] = True
-        if src['key'] == 'email_inbox':
-            entry['status'] = _source_status(src['path'], key='email_inbox')
+        if src['key'] in ('email_inbox', 'webclips', 'calendar'):
+            entry['status'] = _source_status(src['path'], key=src['key'])
         elif src['path']:
             entry['status'] = _source_status(src['path'])
         else:
@@ -7620,7 +7660,8 @@ function renderMatrix(){
     if(src.path){
       var st = src.status || {exists:false, count:0};
       var cls = st.exists ? '' : ' missing';
-      var cnt2 = st.exists ? ('<span class="source-count"> &middot; '+st.count+' Eintr&auml;ge</span>') : ' &middot; nicht gefunden';
+      var unit = (st.unit || 'Eintr\u00e4ge');
+      var cnt2 = st.exists ? ('<span class="source-count"> &middot; '+st.count+' '+escH(unit)+'</span>') : ' &middot; nicht gefunden';
       pathHtml = '<div class="source-path'+cls+'"><code>'+escH(src.path)+'</code>'+cnt2+'</div>';
     } else if(src.key === 'working_memory'){
       pathHtml = '<div class="source-path">&lt;agent&gt;/working_memory/</div>';
@@ -11077,9 +11118,15 @@ def admin_permissions():
     except OSError:
         pass
 
+    # "Slack Messages" ist missverstaendlich — es gibt KEINE direkte Slack-
+    # API-Integration auf Lese-Seite. Die `slack_*.txt`-Dateien entstehen
+    # wenn der Chrome-Clipper auf einem Slack-Kanal aktiv ist und den
+    # Channel-Inhalt exportiert. Also: Web-Clips aus Slack, keine "Messages".
+    slack_hint = (" <span style='color:#888;font-size:11px'>&middot; Web-Clip-Export "
+                  "via Chrome-Extension, keine Slack-API</span>")
     for sid, slabel, prefix, total, agents_list, hint in [
         ("kchat_*.txt pro Agent-Memory", "kChat Messages", "kchat_", kchat_total, kchat_agents, kchat_hint),
-        ("slack_*.txt pro Agent-Memory", "Slack Messages", "slack_", slack_total, slack_agents, ""),
+        ("slack_*.txt pro Agent-Memory", "Slack Web-Clips", "slack_", slack_total, slack_agents, slack_hint),
     ]:
         if total > 0:
             details = ", ".join(agents_list)

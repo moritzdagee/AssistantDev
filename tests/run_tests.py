@@ -3129,7 +3129,7 @@ try:
     test("/admin/permissions enthaelt kChat-Zeile",
          "kChat Messages" in _perm_page)
     test("/admin/permissions enthaelt Slack-Zeile",
-         "Slack Messages" in _perm_page)
+         "Slack Web-Clips" in _perm_page)
     test("/admin/permissions weist Slack-Dateien pro Agent aus",
          "slack_*.txt" in _perm_page)
 except Exception as e:
