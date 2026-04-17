@@ -11609,15 +11609,17 @@ _MSG_OWN_EMAILS = {
     "moritz@casiopayaconsulting.io", "moritz@tangerina.com",
 }
 
-# Quellen — eine pro Spalte im Dashboard
+# Quellen — eine pro Spalte im Dashboard.
+# `group`: visuelle Gruppierung im Header (Inflow-Channel).
+# `label`: sichtbar in der Spalte. Fuer E-Mails: eigene Adresse (eindeutig).
 _MSG_SOURCES = [
-    {"key": "email_signicat",       "label": "Signicat",       "agent": "signicat",       "icon": "\U0001F4E7", "type": "email"},
-    {"key": "email_privat",         "label": "Privat",         "agent": "privat",         "icon": "\U0001F4E7", "type": "email"},
-    {"key": "email_trustedcarrier", "label": "TrustedCarrier", "agent": "trustedcarrier", "icon": "\U0001F4E7", "type": "email"},
-    {"key": "email_standard",       "label": "Standard",       "agent": "standard",       "icon": "\U0001F4E7", "type": "email"},
-    {"key": "email_systemward",     "label": "System Ward",    "agent": "system ward",    "icon": "\U0001F4E7", "type": "email"},
-    {"key": "whatsapp",             "label": "WhatsApp",       "agent": None,             "icon": "\U0001F4F1", "type": "whatsapp"},
-    {"key": "chat",                 "label": "Chat-Verlauf",   "agent": None,             "icon": "\U0001F4AC", "type": "chat"},
+    {"key": "email_privat",         "label": "moritz.cremer@me.com",            "agent": "privat",         "icon": "\u2709", "type": "email", "group": "E-Mail"},
+    {"key": "email_signicat",       "label": "moritz.cremer@signicat.com",      "agent": "signicat",       "icon": "\u2709", "type": "email", "group": "E-Mail"},
+    {"key": "email_trustedcarrier", "label": "moritz.cremer@trustedcarrier.net","agent": "trustedcarrier", "icon": "\u2709", "type": "email", "group": "E-Mail"},
+    {"key": "email_standard",       "label": "Standard / uebrige E-Mails",      "agent": "standard",       "icon": "\u2709", "type": "email", "group": "E-Mail"},
+    {"key": "email_systemward",     "label": "System Ward",                     "agent": "system ward",    "icon": "\u2709", "type": "email", "group": "E-Mail"},
+    {"key": "whatsapp",             "label": "WhatsApp",                        "agent": None,             "icon": "\U0001F4F1", "type": "whatsapp", "group": "Messaging"},
+    {"key": "chat",                 "label": "Chat-Verlauf",                    "agent": None,             "icon": "\U0001F4AC", "type": "chat",     "group": "Messaging"},
 ]
 
 # Mapping Source -> empfohlener Agent fuer "Antworten"-Workflow
@@ -12273,6 +12275,7 @@ def api_messages_sources():
             "label": src["label"],
             "icon": src["icon"],
             "type": src["type"],
+            "group": src.get("group", ""),
             "available": count > 0,
             "count": count,
             "unread": unread,
@@ -12373,6 +12376,9 @@ _MSG_DASHBOARD_HTML = r"""<!DOCTYPE html>
   .md-col-search:focus { border-color:#3a3a3a; }
   .md-col-search::placeholder { color:#555; }
   .md-col-body { flex:1; overflow-y:auto; padding:6px; }
+  .md-group-divider { flex:0 0 28px; display:flex; align-items:stretch; position:relative; }
+  .md-group-divider::before { content:''; position:absolute; top:24px; bottom:12px; left:13px; width:1px; background:linear-gradient(to bottom, transparent, #333 20%, #333 80%, transparent); }
+  .md-group-label { writing-mode:vertical-rl; transform:rotate(180deg); margin:auto 0; padding:20px 0; font-size:10px; color:#888; letter-spacing:3px; text-transform:uppercase; font-weight:700; text-align:center; white-space:nowrap; z-index:1; background:#0f0f1e; }
   .md-col-empty { padding:24px 12px; text-align:center; color:#555; font-size:11px; }
   .md-card { background:#1d1d1d; border:1px solid #242424; border-radius:8px; padding:9px 11px; margin-bottom:6px; cursor:pointer; transition:border-color .12s, background .12s; position:relative; }
   .md-card:hover { border-color:#3a3a3a; background:#222; }
@@ -12576,7 +12582,17 @@ _MSG_DASHBOARD_HTML = r"""<!DOCTYPE html>
 
   function renderBoard(){
     BOARD.innerHTML = '';
+    var lastGroup = null;
     STATE.sources.forEach(function(s){
+      // Neuer Channel-Group: Divider zeichnen
+      var g = s.group || '';
+      if (g && g !== lastGroup) {
+        var divider = document.createElement('div');
+        divider.className = 'md-group-divider';
+        divider.innerHTML = '<div class="md-group-label">' + esc(g) + '</div>';
+        BOARD.appendChild(divider);
+        lastGroup = g;
+      }
       var col = document.createElement('div');
       col.className = 'md-col';
       col.setAttribute('data-source', s.key);
