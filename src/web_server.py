@@ -3890,6 +3890,15 @@ function switchToTab(tabId) {
       cur.agentName = getAgentName();
       var lbl = document.getElementById('agent-label');
       cur.label = lbl ? lbl.textContent : cur.agentName;
+      // Aktuell gewaehlten Provider/Model merken, damit Rueckwechsel den
+      // Dropdown auf den tatsaechlich aktiven Stand dieses Tabs zurueckholt.
+      var psCur = document.getElementById('provider-select');
+      var msCur = document.getElementById('model-select');
+      if (psCur && msCur && psCur.value) {
+        cur.provider = psCur.value;
+        cur.model_id = msCur.value;
+        cur.model_name = (msCur.selectedOptions[0] && msCur.selectedOptions[0].textContent) || msCur.value;
+      }
     }
   }
   // Activate new tab
@@ -3910,6 +3919,11 @@ function switchToTab(tabId) {
     document.getElementById('send-btn').disabled = false;
     document.getElementById('msg-input').placeholder = 'Nachricht an ' + (tab.label || tab.agentName) + '...';
     loadHistory(tab.agentName);
+    // Provider/Model-Dropdown auf den Stand des Tabs zurueckholen + Backend
+    // neu synchronisieren, damit UI und state['provider'] nicht divergieren.
+    if (tab.provider && tab.model_id) {
+      restoreTabProvider(tab);
+    }
   }
   // Per-Tab Processing-State ins DOM spiegeln (typing-indicator, stop-btn,
   // queue-display) und im Hintergrund gesammelte Responses einfliessen lassen
@@ -4170,8 +4184,40 @@ async function onModelChange() {
   if (data.ok) {
     currentModel = {provider: pv, model_id: mv, model_name: mt};
     localStorage.setItem('claude_model', JSON.stringify(currentModel));
+    // Aktuellen Tab aktualisieren — so wird die Auswahl beim Tab-Switch
+    // wiederhergestellt und bleibt in sync mit dem Backend.
+    if (typeof _activeTabId !== 'undefined' && _activeTabId && typeof _tabs !== 'undefined') {
+      var curTab = _tabs.find(function(t){ return t.id === _activeTabId; });
+      if (curTab) { curTab.provider = pv; curTab.model_id = mv; curTab.model_name = mt; }
+    }
     var agName = document.getElementById('agent-label').dataset.agentName; if (agName) fetch('/api/agent-model-preference', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({agent:agName, provider:pv, model:mv})});
   }
+}
+
+// Stellt Provider/Model-Dropdown auf den Stand eines Tabs + synchronisiert
+// den Backend-State der zugehoerigen Session. Verhindert, dass UI-Auswahl
+// und state['provider'] divergieren.
+async function restoreTabProvider(tab) {
+  if (!tab || !tab.provider || !tab.model_id) return;
+  try {
+    var ps = document.getElementById('provider-select');
+    var ms = document.getElementById('model-select');
+    if (!ps || !ms) return;
+    ps.value = tab.provider;
+    var mdata = await fetch('/models').then(function(r){ return r.json(); });
+    var pd = mdata.find(function(p){ return p.provider === tab.provider; });
+    if (pd) {
+      populateModels(pd);
+      ms.value = tab.model_id;
+    }
+    // Backend fuer diese Session auf denselben Stand bringen, damit
+    // der naechste /chat-Request tatsaechlich diesen Provider nutzt.
+    await fetch('/select_model', {method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({provider: tab.provider, model_id: tab.model_id,
+                             model_name: tab.model_name || tab.model_id,
+                             session_id: SESSION_ID})});
+    currentModel = {provider: tab.provider, model_id: tab.model_id, model_name: tab.model_name || tab.model_id};
+  } catch(e) { console.log('restoreTabProvider error:', e); }
 }
 
 // ─── AGENTS ────────────────────────────────────────────────────────────────────

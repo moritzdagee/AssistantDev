@@ -6,6 +6,21 @@ Format: [Datum] Änderung | Datei | Grund
 
 ## 2026-04-16
 
+### Bug-Fix: Provider-/Model-Auswahl divergierte zwischen UI und Backend (Tab-Switch)
+- **Was der Nutzer beobachtete:** Dropdown oben rechts zeigt "Anthropic / Claude Sonnet 4.6", aber die Chat-Antwort im `privat`-Tab kam von "Google / Gemini 3 Flash". Ergebnis: der Nutzer hat einen anderen Provider bekommen als er ausgewaehlt hatte.
+- **Ursachen (zwei, beide korrigiert):**
+  1. **`agent_model_preferences.json` fuer `privat` stand auf `gemini/gemini-3-flash-preview`** (vermutlich historisch gesetzt, als der Nutzer Gemini mal getestet hat). Beim `/select_agent` setzt das Backend automatisch diesen Provider in `state` — auch wenn der UI-Dropdown was anderes zeigt.
+  2. **`switchToTab()` stellte Provider/Model-Dropdown NICHT wieder her.** Bei Tab-Wechsel wurde `SESSION_ID` zwar auf den Tab gesetzt, aber die beiden Selects behielten die Werte vom vorherigen Tab. Frontend zeigte Anthropic, Backend-`state` der `privat`-Session war Gemini → Chat-Request landete bei Gemini, Antwort-Footer sagte "Google / Gemini".
+- **Fix in `src/web_server.py` (JS-Teil):**
+  - `switchToTab`: beim Wegschalten des aktuellen Tabs werden `tab.provider / tab.model_id / tab.model_name` gespeichert. Beim Aktivieren des neuen Tabs ruft `restoreTabProvider(tab)` die Dropdowns zurueck auf den Stand des Tabs **und** schickt `/select_model` fuer die jetzige `SESSION_ID`, damit Backend-`state` und UI wieder matchen.
+  - `onModelChange`: updated zusaetzlich `_tabs[active].provider/model_id/model_name`, sodass die Tab-Auswahl jederzeit mit dem aktuellen UI-Zustand in sync bleibt.
+  - Neue Helper-Funktion `restoreTabProvider(tab)` kapselt die Dropdown-Wiederherstellung + Backend-Sync.
+- **Daten-Korrektur:** `config/agent_model_preferences.json` → `privat` von `gemini/gemini-3-flash-preview` auf `anthropic/claude-sonnet-4-6` zurueckgesetzt (der Nutzer hat explizit gesagt, er will Claude fuer privat).
+- **Duplicate-Block:** Der JS-Bereich ist nicht dupliziert (Duplikate betreffen nur das Python-Backend); eine Kopie reicht.
+- **Tests:** Suite 827/832 — 5 Fails sind alle reine HTTP-Timing-Fehler (Server-Last 99% CPU durch Background-Indexing von iCloud-Datalake nach Deploy, nicht durch diesen Fix verursacht). Betroffene Tests: `POST /search_preview`, `Session-Isolation`, `Parent Agent History API`, `GET /api/messages/sources`, `GET /admin/permissions`. Einzelaufrufe via curl gegen die gleichen Endpoints liefern HTTP 200. Mein JS-Fix testet nichts von diesen Endpoints.
+- **Backup:** `backups/2026-04-16_22-58-29/src/web_server.py`.
+- **Feature-Branch:** `feature/fix-tab-provider-sync`.
+
 ### Bug-Fix: Agent-Auswahl blockiert durch korrupte _index.json (HTTP 500)
 - **Was der Nutzer beobachtete:** Modal zur Agent-Auswahl erscheint beim Start, aber Klick auf "signicat" bewirkte nichts — Modal blieb offen.
 - **Ursache:** `signicat/_index.json` war korrupt (`JSONDecodeError: Extra data: line 302 column 2 (char 17898)`, vermutlich iCloud-Sync-Konflikt, zwei Versionen aneinandergeklebt). `POST /select_agent` ruft `migrate_old_conversations()` → `load_index()` → `json.load()` → **unhandled Exception** → Flask HTTP 500 → Frontend hat keinen Error-Branch → Modal schlaegt still fehl.
