@@ -3009,8 +3009,8 @@ test("Main HTML: preload Banner wird eingefuegt",
 
 # app.py Menu-Eintrag
 _app_src = open(os.path.expanduser("~/AssistantDev/src/app.py")).read()
-test("app.py: Messages-Menueintrag vorhanden",
-     "Messages" in _app_src and "_open_messages" in _app_src)
+test("app.py: Posteingang-Menueintrag vorhanden",
+     "Posteingang" in _app_src and "_open_messages" in _app_src)
 test("app.py: _open_messages oeffnet /messages",
      '_open_native_window("/messages")' in _app_src)
 

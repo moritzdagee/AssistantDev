@@ -3766,7 +3766,7 @@ HTML = """<!DOCTYPE html>
   <button id="prompt-btn" onclick="toggleSidebar()">☰ Prompt <span class="shortcut-label">[P]</span></button>
   <div id="header-spacer" style="flex:1;"></div><!-- AGENT_BTN_V1 -->
   <button class="hdr-btn" onclick="newSession()" style="background:#2a3a2a;border-color:#4a6a4a;color:#a0d090;">+ Neu <span class="shortcut-label">[N]</span></button>
-  <button class="hdr-btn" onclick="openMessageDashboard()" style="background:#2a2a4a;border-color:#4a4a6a;color:#a0a0d0;" title="Message Dashboard (E-Mail / WhatsApp / Chat)">&#128236; Posteingang</button>
+  <button class="hdr-btn" onclick="openMessageDashboard()" style="background:#2a2a4a;border-color:#4a4a6a;color:#a0a0d0;" title="Posteingang (E-Mail / WhatsApp / iMessage)">&#128236; Posteingang</button>
   <button id="agent-btn" class="hdr-btn" data-tooltip-kind="agent" onclick="showAgentModal()"><span id="agent-label">Kein Agent</span> <span class="shortcut-label">[A]</span></button>
   <select id="provider-select" class="hdr-select" onchange="onProviderChange()">
     <option>Anthropic</option>
@@ -3789,7 +3789,7 @@ HTML = """<!DOCTYPE html>
       <div id="svc-list"><div class="svc-row" style="color:#666;">Lade...</div></div>
       <div class="nav-menu-divider"></div>
       <div class="nav-menu-section">Posteingang</div>
-      <a class="nav-menu-item" onclick="navigateTo('/messages')"><span class="nav-icon">&#128236;</span><span class="nav-label">Message Dashboard</span><span class="nav-hint">Kanban E-Mail / WhatsApp / Chat</span></a>
+      <a class="nav-menu-item" onclick="navigateTo('/messages')"><span class="nav-icon">&#128236;</span><span class="nav-label">Posteingang</span><span class="nav-hint">E-Mail / WhatsApp / iMessage</span></a>
       <div class="nav-menu-divider"></div>
       <div class="nav-menu-section">Administration</div>
       <a class="nav-menu-item" onclick="navigateTo('/admin')"><span class="nav-icon">&#9881;</span><span class="nav-label">Admin Panel</span><span class="nav-hint">Status &amp; Uebersicht</span></a>
@@ -12586,7 +12586,7 @@ _MSG_DASHBOARD_HTML = r"""<!DOCTYPE html>
 <html lang="de">
 <head>
 <meta charset="UTF-8">
-<title>📬 AssistantDev — Messages</title>
+<title>📬 AssistantDev — Posteingang</title>
 <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='6' fill='%23111'/%3E%3Ctext x='16' y='24' text-anchor='middle' font-family='system-ui' font-weight='700' font-size='22' fill='%23f0c060'%3EM%3C/text%3E%3C/svg%3E">
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
@@ -12629,6 +12629,11 @@ _MSG_DASHBOARD_HTML = r"""<!DOCTYPE html>
   .md-card-sender { flex:1; font-size:12px; color:#fafafa; overflow:hidden; white-space:nowrap; text-overflow:ellipsis; }
   .md-card.unread .md-card-sender { font-weight:700; }
   .md-card-time { font-size:10px; color:#666; flex-shrink:0; }
+  .md-card-quickread { background:transparent; border:none; color:#555; cursor:pointer; padding:0 2px; font-size:13px; line-height:1; border-radius:3px; flex-shrink:0; transition:color .12s, background .12s; }
+  .md-card-quickread:hover { color:#f0c060; background:rgba(240,192,96,0.08); }
+  .md-card.unread .md-card-quickread { color:#f0c060; }
+  .md-card.keyboard-active { box-shadow:0 0 0 2px #4a8aca; }
+  .md-card.keyboard-active.unread { box-shadow:0 0 0 2px #f0c060; }
   .md-card-subject { font-size:11.5px; color:#c9c9c9; margin-bottom:3px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
   .md-card.unread .md-card-subject { color:#e8e8e8; font-weight:600; }
   .md-card-preview { font-size:10.5px; color:#777; line-height:1.45; display:-webkit-box; -webkit-line-clamp:2; -webkit-box-orient:vertical; overflow:hidden; }
@@ -12670,7 +12675,7 @@ _MSG_DASHBOARD_HTML = r"""<!DOCTYPE html>
 </head>
 <body>
 <div id="md-header">
-  <h1>📬 Messages</h1>
+  <h1>📬 Posteingang</h1>
   <input id="md-search" type="text" placeholder="Alle Spalten durchsuchen..." autocomplete="off">
   <span class="md-hdr-stat" id="md-stat-text">Lade...</span>
   <button class="md-hdr-btn" id="md-btn-refresh">Aktualisieren</button>
@@ -12779,11 +12784,16 @@ _MSG_DASHBOARD_HTML = r"""<!DOCTYPE html>
       var card = document.createElement('div');
       card.className = 'md-card' + (m.read ? '' : ' unread');
       card.setAttribute('data-id', m.id);
+      // Quick-Unread-Toggle-Button in der Card: 1 Klick = read<->unread
+      // ohne Expand. Tooltip abhaengig vom aktuellen Status.
+      var qrBtnTitle = m.read ? 'Als ungelesen markieren' : 'Als gelesen markieren';
+      var qrBtnIcon = m.read ? '\u25CB' : '\u25CF'; // hohl vs. gefuellt
       card.innerHTML =
         '<div class="md-card-top">' +
           '<span class="md-dot ' + (m.read ? '' : 'unread') + '"></span>' +
           '<span class="md-card-sender">' + esc(m.sender_name) + '</span>' +
           '<span class="md-card-time">' + esc(fmtTime(m.timestamp)) + '</span>' +
+          '<button class="md-card-quickread" title="' + qrBtnTitle + '">' + qrBtnIcon + '</button>' +
         '</div>' +
         '<div class="md-card-subject">' + esc(m.subject || '(kein Betreff)') + '</div>' +
         '<div class="md-card-preview">' + esc(m.preview || '') + '</div>' +
@@ -12797,6 +12807,12 @@ _MSG_DASHBOARD_HTML = r"""<!DOCTYPE html>
         card._dblClicked = true;
         setTimeout(function(){ card._dblClicked = false; }, 400);
         openAgentModal(m);
+      });
+      // Quick-Read-Toggle: stoppt Event-Propagation, damit Card nicht auch
+      // noch expandiert.
+      card.querySelector('.md-card-quickread').addEventListener('click', function(ev){
+        ev.stopPropagation();
+        toggleRead(m);
       });
       body.appendChild(card);
     });
@@ -13077,6 +13093,83 @@ _MSG_DASHBOARD_HTML = r"""<!DOCTYPE html>
   });
   document.getElementById('md-agent-modal').addEventListener('click', function(e){
     if (e.target.id === 'md-agent-modal') mdCloseAgentModal();
+  });
+
+  // ─── Keyboard-Navigation innerhalb einer Spalte ───────────────────────────
+  // ArrowDown/Up + J/K verhalten sich wie Mausklicks: vorige Card zuklappen,
+  // naechste expandieren + als gelesen markieren. Navigation bleibt in der
+  // zuletzt aktiven Spalte.
+  var _activeColSourceKey = null;
+  function _activeCardEl(){
+    return document.querySelector('.md-card.keyboard-active');
+  }
+  function _allCardsInCol(sourceKey){
+    var col = BOARD.querySelector('[data-source="' + sourceKey + '"]');
+    return col ? Array.from(col.querySelectorAll('.md-card')) : [];
+  }
+  function _setKeyboardActive(sourceKey, idx){
+    _activeColSourceKey = sourceKey;
+    var cards = _allCardsInCol(sourceKey);
+    if (!cards.length) return;
+    if (idx < 0) idx = 0;
+    if (idx >= cards.length) idx = cards.length - 1;
+    // Alle anderen "keyboard-active" entfernen, auch ueber Spalten hinweg.
+    document.querySelectorAll('.md-card.keyboard-active').forEach(function(c){
+      c.classList.remove('keyboard-active');
+    });
+    var card = cards[idx];
+    card.classList.add('keyboard-active');
+    // In den sichtbaren Bereich scrollen
+    try { card.scrollIntoView({block:'nearest', behavior:'smooth'}); } catch(e){}
+    // Wie ein Mausklick: vorige Card in der Spalte zuklappen, diese expandieren.
+    var col = card.closest('.md-col');
+    col.querySelectorAll('.md-card.expanded').forEach(function(c){
+      if (c !== card) c.classList.remove('expanded');
+    });
+    var msg = STATE.byId[card.getAttribute('data-id')];
+    if (msg && !card.classList.contains('expanded')) {
+      onCardSingleClick(card, msg);
+    }
+  }
+
+  document.addEventListener('keydown', function(e){
+    // Nur wenn kein Input-Feld den Fokus hat
+    var tag = (e.target && e.target.tagName || '').toLowerCase();
+    if (tag === 'input' || tag === 'textarea' || e.target.isContentEditable) return;
+
+    var key = e.key;
+    var isDown = (key === 'ArrowDown' || key === 'j');
+    var isUp = (key === 'ArrowUp' || key === 'k');
+    if (!isDown && !isUp) return;
+    e.preventDefault();
+
+    var activeCard = _activeCardEl();
+    if (!activeCard || !_activeColSourceKey) {
+      // Keine aktive Spalte? — nehme erste sichtbare Spalte mit Karten.
+      for (var i = 0; i < STATE.sources.length; i++) {
+        var sk = STATE.sources[i].key;
+        if (_allCardsInCol(sk).length) { _setKeyboardActive(sk, 0); return; }
+      }
+      return;
+    }
+    var cards = _allCardsInCol(_activeColSourceKey);
+    var curIdx = cards.indexOf(activeCard);
+    _setKeyboardActive(_activeColSourceKey, curIdx + (isDown ? 1 : -1));
+  });
+
+  // Klick auf eine Card aktiviert auch Keyboard-Nav-State — so weiss das
+  // System, wo der Nutzer weiternavigieren will.
+  BOARD.addEventListener('click', function(e){
+    var card = e.target.closest('.md-card');
+    if (!card) return;
+    var col = card.closest('.md-col');
+    if (!col) return;
+    var sk = col.getAttribute('data-source');
+    _activeColSourceKey = sk;
+    document.querySelectorAll('.md-card.keyboard-active').forEach(function(c){
+      c.classList.remove('keyboard-active');
+    });
+    card.classList.add('keyboard-active');
   });
 
   fullReload(false);

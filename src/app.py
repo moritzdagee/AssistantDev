@@ -153,7 +153,7 @@ class AssistantDevApp(rumps.App):
             callback=self._open_dashboard,
         ))
         open_menu.add(rumps.MenuItem(
-            "\U0001F4EC Messages",
+            "\U0001F4EC Posteingang",
             callback=self._open_messages,
         ))
         open_menu.add(rumps.MenuItem(
