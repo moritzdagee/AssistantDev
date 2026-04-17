@@ -6,6 +6,26 @@ Format: [Datum] Änderung | Datei | Grund
 
 ## 2026-04-16
 
+### Feature/UX: Dashboard Sidebar ausblenden + System Ward raus + WhatsApp Archiv-Flag
+- **Was der Nutzer wollte:**
+  1. Wenn Dashboard-Tab aktiv ist: System-Prompt-Sidebar (links) und Chat-History sollen weg — im Posteingang braucht man das nicht, Dashboard soll volle Breite haben.
+  2. Spalte "System Ward" (0 Nachrichten) komplett entfernen.
+  3. Archivierte WhatsApp-Chats erkennen und per Toggle filtern.
+  4. iMessage-Integration pruefen/umsetzen.
+- **Fix 1 — Sidebar beim Dashboard-Tab aus:**
+  - `switchToTab`: wenn `tab.type === 'dashboard'`, werden zusaetzlich zum `chat-area` auch `#sidebar` auf `display:none` gesetzt; beim Zurueckwechsel auf Chat-Tab wieder auf sichtbar.
+- **Fix 2 — System Ward-Spalte entfernt:**
+  - `_MSG_SOURCES`: Eintrag `email_systemward` geloescht. Dashboard zeigt nur noch die Spalten mit echtem Mail-Inflow (privat, signicat, trustedcarrier, standard + WhatsApp + Chat).
+- **Fix 3 — WhatsApp Archiv-Flag aus App-DB:**
+  - Neuer Helper `_msg_whatsapp_archived_names()` liest `ZARCHIVED=1 FROM ZWACHATSESSION` aus `~/Library/Group Containers/group.net.whatsapp.WhatsApp.shared/ChatStorage.sqlite` im read-only-Mode (mit `immutable=1`, damit wir keine Sperre setzen). Cache 60s.
+  - `_msg_normalize_whatsapp_file` setzt `is_archived` basierend auf Partnername-Match gegen die Archiv-Set.
+  - Frontend: neues Toggle `auch Archiv` pro WhatsApp-Spalte (nur fuer `type=='whatsapp'`). Default aus. localStorage-persistiert.
+  - Live-Check: **79 archivierte Chats** in der DB; **2 davon** haben importierte Memory-Dateien (Ⓜ️ Mc Floripa, +55 48 98423-8000) und werden jetzt korrekt ausgeblendet bis Toggle gesetzt wird.
+- **Junk-Toggle nur fuer E-Mail:** Eingeschraenkt auf `type=='email'`, weil WhatsApp/Chat die Heuristik nicht brauchen.
+- **Nicht umgesetzt — iMessage:** `~/Library/Messages/chat.db` ist zwar vorhanden, Read-Zugriff wird aber mit `authorization denied` verweigert. macOS erfordert dafuer **Full Disk Access** (FDA) fuer den Python-Prozess. Das kann ich nicht programmatisch aktivieren — du musst `Systemeinstellungen → Datenschutz & Sicherheit → Festplattenvollzugriff` oeffnen und den Eintrag `python3` bzw. `AssistantDev.app` hinzufuegen. Danach kann ich einen analog zum WhatsApp-DB-Importer bauen (Tables: `chat`, `message`, `handle`; Archive-Flag: `chat.is_archived`). Sag Bescheid wenn du die Permission gesetzt hast.
+- **Tests:** Suite 850/850 gruen.
+- **Feature-Branch:** `feature/dashboard-ux-fixes-plus-whatsapp-archive`.
+
 ### Feature: Message Dashboard komplett ueberarbeitet (Phasen 1-4)
 - **Was der Nutzer wollte:** Dashboard als erster Tab beim App-Start, Channel-basierte Gruppierung statt Agent-Zuordnung, Junk/Archiv-Filter mit Toggle, Sortierung juengste-zuerst, Toggle "nur ungelesen".
 - **Phase 1 — Sortierung + Unread-Toggle:**

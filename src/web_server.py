@@ -3973,21 +3973,25 @@ function switchToTab(tabId) {
   if (!tab) return;
   SESSION_ID = tab.sessionId;
 
-  // Dashboard-Tab: iframe einblenden, Chat-UI ausblenden. Iframe wird
-  // erst beim ersten Aktivieren geladen (lazy).
+  // Dashboard-Tab: iframe einblenden, Chat-UI + Sidebar ausblenden.
+  // Im Dashboard braucht der User keinen System-Prompt und keine
+  // Konversations-History — daher komplett volle Breite fuers Dashboard.
   var dashFrame = document.getElementById('dashboard-frame');
   var chatArea = document.getElementById('chat-area');
+  var sidebar = document.getElementById('sidebar');
   if (tab.type === 'dashboard') {
     if (dashFrame && dashFrame.getAttribute('src') !== '/messages') {
       dashFrame.setAttribute('src', '/messages');
     }
     if (dashFrame) dashFrame.style.display = 'flex';
     if (chatArea) chatArea.style.display = 'none';
+    if (sidebar) sidebar.style.display = 'none';
     renderTabs();
     return;
   } else {
     if (dashFrame) dashFrame.style.display = 'none';
     if (chatArea) chatArea.style.display = '';
+    if (sidebar) sidebar.style.display = '';
   }
 
   // Restore DOM
@@ -11669,7 +11673,8 @@ _MSG_SOURCES = [
     {"key": "email_signicat",       "label": "moritz.cremer@signicat.com",      "agent": "signicat",       "icon": "\u2709", "type": "email", "group": "E-Mail"},
     {"key": "email_trustedcarrier", "label": "moritz.cremer@trustedcarrier.net","agent": "trustedcarrier", "icon": "\u2709", "type": "email", "group": "E-Mail"},
     {"key": "email_standard",       "label": "Standard / uebrige E-Mails",      "agent": "standard",       "icon": "\u2709", "type": "email", "group": "E-Mail"},
-    {"key": "email_systemward",     "label": "System Ward",                     "agent": "system ward",    "icon": "\u2709", "type": "email", "group": "E-Mail"},
+    # "System Ward" existiert als Agent, hat aber keinen eigenen Mail-Inflow —
+    # Spalte ausgeblendet (vorher sichtbar mit 0 gesamt).
     {"key": "whatsapp",             "label": "WhatsApp",                        "agent": None,             "icon": "\U0001F4F1", "type": "whatsapp", "group": "Messaging"},
     {"key": "chat",                 "label": "Chat-Verlauf",                    "agent": None,             "icon": "\U0001F4AC", "type": "chat",     "group": "Messaging"},
 ]
@@ -11712,6 +11717,39 @@ _MSG_JUNK_BODY_SIGNALS = (
     'click here to unsubscribe', 'to unsubscribe', 'abmelden', 'update your preferences',
     'view in browser', 'in deinem browser anzeigen', 'view email in browser',
 )
+
+
+# WhatsApp: archivierte Chats live aus der App-DB (ChatStorage.sqlite)
+# lesen. Cache 60s.
+_WA_DB_PATH = os.path.expanduser(
+    "~/Library/Group Containers/group.net.whatsapp.WhatsApp.shared/ChatStorage.sqlite"
+)
+_WA_ARCHIVED_CACHE = {"set": set(), "ts": 0.0}
+
+
+def _msg_whatsapp_archived_names() -> set:
+    """Liefert die Menge der Partnernamen, deren WhatsApp-Chat archiviert ist.
+    Read-only-Query auf die WhatsApp-App-SQLite-DB; Cache 60s."""
+    import time as _t
+    if (_t.time() - _WA_ARCHIVED_CACHE["ts"]) < 60 and _WA_ARCHIVED_CACHE["set"]:
+        return _WA_ARCHIVED_CACHE["set"]
+    if not os.path.isfile(_WA_DB_PATH):
+        return set()
+    try:
+        import sqlite3 as _sq
+        # URI mode read-only + immutable, damit wir keine Locks setzen
+        uri = f"file:{_WA_DB_PATH}?mode=ro&immutable=1"
+        conn = _sq.connect(uri, uri=True, timeout=2)
+        cur = conn.cursor()
+        cur.execute("SELECT ZPARTNERNAME FROM ZWACHATSESSION WHERE ZARCHIVED=1")
+        names = {(r[0] or '').strip() for r in cur.fetchall() if r[0]}
+        conn.close()
+        _WA_ARCHIVED_CACHE["set"] = names
+        _WA_ARCHIVED_CACHE["ts"] = _t.time()
+        return names
+    except Exception as e:
+        print(f"[WA] archiv-query fehlgeschlagen: {e}")
+        return set()
 
 
 def _msg_is_junk(sender_email: str, subject: str, body_preview: str) -> bool:
@@ -11919,6 +11957,7 @@ def _msg_normalize_email_content(fpath, fname, source_key, agent_name, only_head
         "message_id": fields.get("message-id", ""),
         "type": "email",
         "is_junk": _msg_is_junk(sender_email, subject, preview),
+        "is_archived": False,
     }
 
 
@@ -12007,6 +12046,7 @@ def _msg_normalize_whatsapp_file(fpath, fname, source_key, agent_name, only_head
         "message_id": "",
         "type": "whatsapp",
         "is_junk": False,
+        "is_archived": contact.strip() in _msg_whatsapp_archived_names() if contact else False,
     }
 
 
@@ -12059,6 +12099,7 @@ def _msg_normalize_chat_file(fpath, fname, source_key, agent_name, only_header=T
         "message_id": "",
         "type": "chat",
         "is_junk": False,
+        "is_archived": False,
     }
 
 
@@ -12510,12 +12551,14 @@ _MSG_DASHBOARD_HTML = r"""<!DOCTYPE html>
 <script>
 (function(){
   var BOARD = document.getElementById('md-board');
-  var STATE = { sources:[], messages:[], byId:{}, globalQuery:'', colQuery:{}, selectedForReply:null, onlyUnread:{}, showJunk:{} };
+  var STATE = { sources:[], messages:[], byId:{}, globalQuery:'', colQuery:{}, selectedForReply:null, onlyUnread:{}, showJunk:{}, showArchived:{} };
   try {
     var _saved = localStorage.getItem('md_only_unread');
     if (_saved) STATE.onlyUnread = JSON.parse(_saved) || {};
     var _junk = localStorage.getItem('md_show_junk');
     if (_junk) STATE.showJunk = JSON.parse(_junk) || {};
+    var _arch = localStorage.getItem('md_show_archived');
+    if (_arch) STATE.showArchived = JSON.parse(_arch) || {};
   } catch(e) {}
   var REFRESH_MS = 60000;
   var agentsCache = null;
@@ -12559,10 +12602,12 @@ _MSG_DASHBOARD_HTML = r"""<!DOCTYPE html>
     // Per-Spalte Toggles. Per localStorage persistiert.
     var onlyUnread = !!(STATE.onlyUnread && STATE.onlyUnread[sourceKey]);
     var showJunk = !!(STATE.showJunk && STATE.showJunk[sourceKey]);
+    var showArchived = !!(STATE.showArchived && STATE.showArchived[sourceKey]);
     return STATE.messages.filter(function(m){
       if (m.source !== sourceKey) return false;
       if (onlyUnread && m.read) return false;
       if (!showJunk && m.is_junk) return false;
+      if (!showArchived && m.is_archived) return false;
       var hay = (m.sender_name + ' ' + m.subject + ' ' + m.preview + ' ' + (m.sender_address||'')).toLowerCase();
       if (q && hay.indexOf(q) === -1) return false;
       if (qCol && hay.indexOf(qCol) === -1) return false;
@@ -12650,6 +12695,21 @@ _MSG_DASHBOARD_HTML = r"""<!DOCTYPE html>
       col.setAttribute('data-source', s.key);
       var onlyUnreadChecked = (STATE.onlyUnread && STATE.onlyUnread[s.key]) ? ' checked' : '';
       var showJunkChecked = (STATE.showJunk && STATE.showJunk[s.key]) ? ' checked' : '';
+      var showArchivedChecked = (STATE.showArchived && STATE.showArchived[s.key]) ? ' checked' : '';
+      // Toggle 'auch Junk' nur fuer E-Mail-Spalten. Toggle 'auch Archiv'
+      // nur fuer WhatsApp (dort gibt's echtes ZARCHIVED-Flag aus der App-DB).
+      var junkToggleHtml = s.type === 'email'
+        ? '<label class="md-col-toggle" style="display:flex;align-items:center;gap:4px;font-size:11px;color:#aaa;cursor:pointer;white-space:nowrap" title="Newsletter, automatische Mails, Bounces etc.">' +
+            '<input type="checkbox" class="md-show-junk"' + showJunkChecked + '>' +
+            '<span>auch Junk</span>' +
+          '</label>'
+        : '';
+      var archivedToggleHtml = s.type === 'whatsapp'
+        ? '<label class="md-col-toggle" style="display:flex;align-items:center;gap:4px;font-size:11px;color:#aaa;cursor:pointer;white-space:nowrap" title="Archivierte Chats aus WhatsApp (ZARCHIVED=1)">' +
+            '<input type="checkbox" class="md-show-archived"' + showArchivedChecked + '>' +
+            '<span>auch Archiv</span>' +
+          '</label>'
+        : '';
       col.innerHTML =
         '<div class="md-col-hdr">' +
           '<div class="md-col-title">' +
@@ -12664,10 +12724,8 @@ _MSG_DASHBOARD_HTML = r"""<!DOCTYPE html>
               '<input type="checkbox" class="md-only-unread"' + onlyUnreadChecked + '>' +
               '<span>nur ungelesen</span>' +
             '</label>' +
-            '<label class="md-col-toggle" style="display:flex;align-items:center;gap:4px;font-size:11px;color:#aaa;cursor:pointer;white-space:nowrap" title="Newsletter, automatische Mails, Bounces etc.">' +
-              '<input type="checkbox" class="md-show-junk"' + showJunkChecked + '>' +
-              '<span>auch Junk</span>' +
-            '</label>' +
+            junkToggleHtml +
+            archivedToggleHtml +
           '</div>' +
         '</div>' +
         '<div class="md-col-body"></div>';
@@ -12685,10 +12743,18 @@ _MSG_DASHBOARD_HTML = r"""<!DOCTYPE html>
         updateColumnHeaderCounts();
       });
       var junkChk = col.querySelector('.md-show-junk');
-      junkChk.addEventListener('change', function(){
+      if (junkChk) junkChk.addEventListener('change', function(){
         if (!STATE.showJunk) STATE.showJunk = {};
         STATE.showJunk[s.key] = junkChk.checked;
         try { localStorage.setItem('md_show_junk', JSON.stringify(STATE.showJunk)); } catch(e){}
+        renderColumnCards(col, s.key);
+        updateColumnHeaderCounts();
+      });
+      var archivedChk = col.querySelector('.md-show-archived');
+      if (archivedChk) archivedChk.addEventListener('change', function(){
+        if (!STATE.showArchived) STATE.showArchived = {};
+        STATE.showArchived[s.key] = archivedChk.checked;
+        try { localStorage.setItem('md_show_archived', JSON.stringify(STATE.showArchived)); } catch(e){}
         renderColumnCards(col, s.key);
         updateColumnHeaderCounts();
       });
