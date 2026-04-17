@@ -6,6 +6,14 @@ Format: [Datum] Änderung | Datei | Grund
 
 ## 2026-04-16
 
+### Bug-Fix: Custom-Source Path mit trailing Apostroph akzeptiert (Copy-Paste)
+- **Was der Nutzer beobachtete:** In Access Control "Ordner hinzufuegen" schlug fehl mit "Pfad ist kein Ordner oder existiert nicht" — der Fehler-Pfad endete auf `31_Signicat'` (trailing Apostroph). Typisches Copy-Paste-Artefakt (z.B. aus `pbcopy` mit Shell-Quoting oder Kontext-Menue "Als Pfadname kopieren").
+- **Fix in `src/web_server.py`:**
+  - Backend (`api_access_control_add_custom_source`): Pfad wird vor `os.path.isdir()` bereinigt — `strip()` + umgebende einfache/doppelte Anfuehrungszeichen entfernt (`strip('"').strip("'")`), Shell-Escapes `\ ` zu echten Leerzeichen.
+  - Frontend (`submitAddSource`): Pfad wird direkt im Modal bereinigt (umgebende Quotes, `\ `-Escapes), sodass der Nutzer nicht zweimal probieren muss.
+- **Verifiziert:** `POST /api/access-control/custom-sources` mit Pfad-String endend auf `/31_Signicat'` liefert jetzt HTTP 200 mit `success: true`.
+- **Feature-Branch:** `feature/fix-custom-source-path-quoting`.
+
 ### Bug-Fix: Provider-/Model-Auswahl divergierte zwischen UI und Backend (Tab-Switch)
 - **Was der Nutzer beobachtete:** Dropdown oben rechts zeigt "Anthropic / Claude Sonnet 4.6", aber die Chat-Antwort im `privat`-Tab kam von "Google / Gemini 3 Flash". Ergebnis: der Nutzer hat einen anderen Provider bekommen als er ausgewaehlt hatte.
 - **Ursachen (zwei, beide korrigiert):**

@@ -7352,6 +7352,13 @@ def api_access_control_add_custom_source():
         return jsonify({'success': False, 'error': 'Label fehlt'}), 400
     if not path:
         return jsonify({'success': False, 'error': 'Pfad fehlt'}), 400
+    # Copy-Paste-Artefakte saeubern: umgebende Quotes (auch nur einseitige
+    # trailing Quotes aus Terminal-Kopien), geschuetzte Spaces / Escapes.
+    path = path.strip().strip('"').strip("'").strip()
+    # Finder-Drag-Pfade kommen mit `\ ` fuer Leerzeichen — ausserhalb von
+    # Shell-Kontext unnoetig.
+    if '\\' in path and '\\ ' in path:
+        path = path.replace('\\ ', ' ').replace('\\\t', '\t')
     # Expand ~ und pruefen
     path = os.path.expanduser(path)
     if not os.path.isdir(path):
@@ -7730,6 +7737,11 @@ async function submitAddSource(){
   err.textContent = '';
   if(!label){ err.textContent = 'Bitte Anzeigename eingeben.'; return; }
   if(!path){ err.textContent = 'Bitte Pfad eingeben.'; return; }
+  // Copy-Paste-Artefakte saeubern: Anfuehrungszeichen, einseitige Quotes,
+  // umgebende Whitespace. Backend sanitized zusaetzlich, aber UI-seitig
+  // bekommt der Nutzer direktes Feedback durch bereinigten Wert.
+  path = path.replace(/^['"]+|['"]+$/g, '').trim();
+  if (path.indexOf('\\ ') !== -1) { path = path.replace(/\\ /g, ' '); }
   // Zuerst aktuelle Matrix-Checkboxen ins Modell uebernehmen, damit unsave
   // Aenderungen beim Reload nicht verloren gehen.
   collectFromDOM();
