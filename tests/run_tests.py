@@ -2232,8 +2232,8 @@ test("Permissions: working_memory Pfade angezeigt",
 test("Permissions: Shared Data Sources Sektion vorhanden",
      "Shared Data Sources" in _perm2)
 
-test("Permissions: E-Mail Inbox in Shared Sources",
-     "E-Mail Inbox" in _perm2)
+test("Permissions: E-Mail Archive in Shared Sources",
+     "E-Mail Archive" in _perm2)
 
 test("Permissions: Webclips in Shared Sources",
      "Webclips" in _perm2)

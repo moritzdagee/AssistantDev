@@ -7191,8 +7191,32 @@ def _slugify_source_key(label: str, existing: set) -> str:
     return key
 
 
-def _source_status(path: str) -> dict:
-    """Gibt {exists, count} fuer einen Ordner-Pfad zurueck."""
+def _source_status(path: str, key: str = "") -> dict:
+    """Gibt {exists, count} fuer einen Ordner-Pfad zurueck.
+
+    Spezial-Behandlung fuer Quellen, deren Dateien nicht in einem zentralen
+    Ordner liegen, sondern ueber alle Agent-Memorys verteilt sind:
+    - email_inbox: summiert IN_/OUT_-Dateien in <agent>/memory/ ueber alle
+      Agent-Ordner (der Staging-Ordner `email_inbox/` ist fast immer leer,
+      weil der Email-Watcher verarbeitet und wegraeumt).
+    - whatsapp: wenn der per-Agent-Pfad leer ist, Fallback auf globalen Count.
+    """
+    if key == "email_inbox":
+        total = 0
+        try:
+            for entry in os.listdir(BASE):
+                mem = os.path.join(BASE, entry, "memory")
+                if not os.path.isdir(mem):
+                    continue
+                try:
+                    for f in os.listdir(mem):
+                        if f.endswith('.txt') and ('_IN_' in f or '_OUT_' in f):
+                            total += 1
+                except OSError:
+                    continue
+        except OSError:
+            return {"exists": False, "count": 0}
+        return {"exists": total > 0, "count": total}
     if not path:
         return {"exists": False, "count": 0}
     try:
@@ -7213,7 +7237,12 @@ def api_access_control_get():
     for src in BUILTIN_SHARED_SOURCES:
         entry = dict(src)
         entry['builtin'] = True
-        entry['status'] = _source_status(src['path']) if src['path'] else {"exists": True, "count": 0}
+        if src['key'] == 'email_inbox':
+            entry['status'] = _source_status(src['path'], key='email_inbox')
+        elif src['path']:
+            entry['status'] = _source_status(src['path'])
+        else:
+            entry['status'] = {"exists": True, "count": 0}
         shared.append(entry)
     for src in data.get('custom_sources', []):
         entry = dict(src)
@@ -10829,7 +10858,6 @@ def admin_permissions():
     # Shared Data Sources
     # Ordner-basierte Quellen (eigener Pfad)
     folder_sources = [
-        ("email_inbox", "E-Mail Inbox", os.path.join(_ADMIN_DATALAKE, "email_inbox")),
         ("webclips", "Webclips", os.path.join(_ADMIN_DATALAKE, "webclips")),
         ("calendar", "Kalender", os.path.join(_ADMIN_DATALAKE, "calendar")),
         ("whatsapp (privat)", "WhatsApp Chats", os.path.join(_ADMIN_DATALAKE, "privat", "memory", "whatsapp")),
@@ -10857,16 +10885,76 @@ def admin_permissions():
     kchat_total, kchat_agents = _count_prefix("kchat_")
     slack_total, slack_agents = _count_prefix("slack_")
 
+    # E-Mails: IN_/OUT_ ueber alle Agent-Memorys aggregieren (nicht den
+    # Staging-Ordner email_inbox/, der fast immer leer ist, weil der
+    # Email-Watcher verarbeitet und wegraeumt).
+    def _count_emails():
+        total = 0
+        per_agent = []
+        try:
+            for entry in os.listdir(_ADMIN_DATALAKE):
+                mem = os.path.join(_ADMIN_DATALAKE, entry, "memory")
+                if not os.path.isdir(mem):
+                    continue
+                try:
+                    matches = [f for f in os.listdir(mem)
+                               if f.endswith('.txt') and ('_IN_' in f or '_OUT_' in f)]
+                except OSError:
+                    continue
+                if matches:
+                    total += len(matches)
+                    per_agent.append(f"{entry} ({len(matches)})")
+        except OSError:
+            pass
+        return total, per_agent
+
+    email_total, email_agents = _count_emails()
+    staging_path = os.path.join(_ADMIN_DATALAKE, "email_inbox")
+    staging_count = 0
+    try:
+        if os.path.isdir(staging_path):
+            staging_count = sum(1 for x in os.listdir(staging_path) if x != 'processed')
+    except OSError:
+        pass
+
     shared_html = "<h2>Shared Data Sources</h2><table><tr><th>Quelle</th><th>Pfad</th><th>Status</th></tr>"
+    # E-Mail-Zeile: Aggregat ueber alle Agent-Memorys
+    email_details = ", ".join(email_agents)
+    email_status = (
+        f"<span class='status-ok'>● {email_total} Dateien</span>"
+        f" <span style='color:#888;font-size:11px'>({_html_lib.escape(email_details)})</span>"
+        f" <span style='color:#888;font-size:11px'>· Staging: {staging_count}</span>"
+    ) if email_total else (
+        "<span class='status-bad'>○ keine Dateien</span>"
+    )
+    shared_html += (f"<tr><td><strong>E-Mail Archive (IN_/OUT_)</strong></td>"
+                    f"<td><code>&lt;agent&gt;/memory/*_IN_*.txt, *_OUT_*.txt</code></td>"
+                    f"<td>{email_status}</td></tr>")
+
     for sid, slabel, spath in folder_sources:
         exists = os.path.isdir(spath)
         fcount = len(os.listdir(spath)) if exists else 0
         status = f"<span class='status-ok'>● {fcount} Dateien</span>" if exists else "<span class='status-bad'>○ nicht gefunden</span>"
         shared_html += f"<tr><td><strong>{_html_lib.escape(slabel)}</strong></td><td><code>{_html_lib.escape(sid)}/</code></td><td>{status}</td></tr>"
 
-    for sid, slabel, prefix, total, agents_list in [
-        ("kchat_*.txt pro Agent-Memory", "kChat Messages", "kchat_", kchat_total, kchat_agents),
-        ("slack_*.txt pro Agent-Memory", "Slack Messages", "slack_", slack_total, slack_agents),
+    # kChat-Log checken: Token-Fehler im UI sichtbar machen
+    kchat_hint = ""
+    try:
+        with open("/tmp/kchat_watcher.log", "r", encoding="utf-8", errors="ignore") as _kl:
+            _kl.seek(0, 2)
+            _sz = _kl.tell()
+            _kl.seek(max(0, _sz - 2000))
+            _tail = _kl.read()
+        if "401" in _tail or "ungueltig" in _tail.lower() or "unauthorized" in _tail.lower():
+            kchat_hint = (" <span style='color:#d09090;font-size:11px'>"
+                          "⚠ Watcher-Log zeigt Token-401: neuen Token in "
+                          "<code>config/models.json</code> → <code>kchat.auth_token</code> eintragen</span>")
+    except OSError:
+        pass
+
+    for sid, slabel, prefix, total, agents_list, hint in [
+        ("kchat_*.txt pro Agent-Memory", "kChat Messages", "kchat_", kchat_total, kchat_agents, kchat_hint),
+        ("slack_*.txt pro Agent-Memory", "Slack Messages", "slack_", slack_total, slack_agents, ""),
     ]:
         if total > 0:
             details = ", ".join(agents_list)
@@ -10876,7 +10964,7 @@ def admin_permissions():
             status = "<span class='status-bad'>○ keine Dateien</span>"
         shared_html += (f"<tr><td><strong>{_html_lib.escape(slabel)}</strong></td>"
                         f"<td><code>{_html_lib.escape(sid)}</code></td>"
-                        f"<td>{status}</td></tr>")
+                        f"<td>{status}{hint}</td></tr>")
     shared_html += "</table>"
     body = (
         "<h1>🔐 Memory-Berechtigungen</h1>"

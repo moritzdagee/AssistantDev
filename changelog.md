@@ -6,6 +6,24 @@ Format: [Datum] Änderung | Datei | Grund
 
 ## 2026-04-16
 
+### Bug-Fix: E-Mail-Inbox-Zaehlung zeigte Staging-Ordner statt tatsaechliche Archive
+- **Was der Nutzer beobachtete:** `/admin/permissions` und Access-Control-Matrix zeigten "E-Mail Inbox: 1 Datei", obwohl tausende E-Mails in den Agent-Memorys liegen. Gleichzeitig stand kChat auf 0 trotz laufender App.
+- **Ursachen:**
+  1. `_source_status()` hat fuer `email_inbox` den Staging-Ordner `<datalake>/email_inbox/` gezaehlt. Der Email-Watcher verarbeitet Dateien und verschiebt sie in `email_inbox/processed/` (und indexiert in die Agent-Memorys als `<date>_IN_/_OUT_*.txt`) — der Staging-Ordner ist also fast immer leer. Das war kein echtes "0 E-Mails", sondern eine falsche Metrik.
+  2. kChat: Watcher laeuft korrekt als LaunchAgent, aber der `auth_token` in `config/models.json → kchat.auth_token` ist nur 16 Zeichen lang (`[REDACTED_KCHAT_TOKEN]`) und nicht valid — Mattermost-API liefert 401. `/tmp/kchat_watcher.log` zeigt `Token weiterhin ungueltig (401)` im 5-Minuten-Takt seit Stunden.
+- **Fix in `src/web_server.py`:**
+  - `_source_status(path, key="")` behandelt `key="email_inbox"` special: scannt `<agent>/memory/` ueber alle Agent-Ordner und zaehlt Dateien mit `_IN_` oder `_OUT_` im Namen.
+  - `/admin/permissions`: "E-Mail Inbox"-Zeile durch "E-Mail Archive (IN_/OUT_)" ersetzt. Zeigt Gesamt + Per-Agent-Breakdown + Staging-Count als Zusatz.
+  - kChat-Zeile prueft die letzten 2 KB von `/tmp/kchat_watcher.log` auf `401`/`unauthorized`/`ungueltig` und blendet einen roten Hinweis ein: "⚠ Watcher-Log zeigt Token-401: neuen Token in `config/models.json` → `kchat.auth_token` eintragen".
+- **Live-Verifikation (nach Deploy):**
+  - `E-Mail Archive (IN_/OUT_): **25.811 Dateien**` — privat 21.778, signicat 3.186, trustedcarrier 549, standard 298, system ward 0. Staging: 0.
+  - `kChat Messages: 0 Dateien` — mit rotem Token-401-Hinweis.
+  - `Slack Messages: 10 Dateien (signicat)`.
+- **Tests:** ein bestehender Test ("E-Mail Inbox in Shared Sources") umbenannt auf "E-Mail Archive in Shared Sources". Suite: **849/849 gruen**.
+- **Backup:** `backups/2026-04-16_21-25-17/src/web_server.py`.
+- **Feature-Branch:** `feature/fix-email-inbox-count`.
+- **Nicht umgesetzt (ausserhalb Code-Scope):** kChat-Token-Erneuerung. Der Nutzer muss selbst einen gueltigen Personal Access Token oder Session-Token in `config/models.json → kchat.auth_token` eintragen.
+
 ### Feature: Access-Control Custom-Sources + Pfad-Anzeige + kChat/Slack in Shared-Data
 - **Was der Nutzer wollte:**
   1. In der Access-Control-Matrix (`/admin/access-control`) soll jede Shared-Source-Zeile den **konkreten Ordner-Pfad** + Status zeigen.
