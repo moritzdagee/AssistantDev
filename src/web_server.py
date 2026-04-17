@@ -12260,12 +12260,20 @@ def _msg_normalize_whatsapp_file(fpath, fname, source_key, agent_name, only_head
     # Letzte eingehende Nachricht finden (nicht "Ich:")
     last_in_line = ""
     last_ts = None
+    # kChat/Mattermost-User-IDs haben base64-haften Format wie
+    # "CKD+h88GIABIAZABAPABAg==" — die landen manchmal in WhatsApp-Files
+    # wegen gemischter Clipping-Pipelines. Solche Zeilen werden uebersprungen,
+    # damit die WhatsApp-Preview nur echte WhatsApp-Absender zeigt.
+    _is_kchat_sender = _msgd_re.compile(r'^[A-Za-z0-9+/=]{20,}:\s')
     for line in reversed(body.splitlines()):
         if line.startswith("[") and "]" in line:
             try:
                 ts_str = line[1:line.index("]")]
                 rest = line[line.index("]")+1:].strip()
                 if rest.startswith("Ich:"):
+                    continue
+                # Nicht-WhatsApp-Muster (kChat-UserID-Hash) ignorieren.
+                if _is_kchat_sender.match(rest):
                     continue
                 last_in_line = rest
                 try:
@@ -12285,7 +12293,20 @@ def _msg_normalize_whatsapp_file(fpath, fname, source_key, agent_name, only_head
         except Exception:
             last_ts = datetime.datetime.now()
 
-    preview = " ".join(last_in_line[:_MSG_PREVIEW_LEN].split()) if last_in_line else (body[:_MSG_PREVIEW_LEN].strip())
+    if last_in_line:
+        preview = " ".join(last_in_line[:_MSG_PREVIEW_LEN].split())
+    else:
+        # Fallback: body ohne kChat-Sender-Zeilen (die vermischten Imports).
+        fallback_lines = []
+        for line in body.splitlines():
+            # Zeilen mit kChat-Hash-Sender rauswerfen
+            if line.startswith('[') and ']' in line:
+                rest = line[line.index(']') + 1:].strip()
+                if _is_kchat_sender.match(rest):
+                    continue
+            fallback_lines.append(line)
+        cleaned = "\n".join(fallback_lines).strip()
+        preview = cleaned[:_MSG_PREVIEW_LEN].strip()
     if not preview:
         preview = f"{msg_count} Nachrichten" if msg_count else "(WhatsApp Chat)"
 
