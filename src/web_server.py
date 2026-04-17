@@ -7144,22 +7144,140 @@ def new_conversation():
 # ─── ACCESS CONTROL ───────────────────────────────────────────────────────
 ACCESS_CONTROL_FILE = os.path.join(BASE, "config", "access_control.json")
 
+# Built-in shared sources (nicht entfernbar). Pfade relativ zu BASE, soweit
+# sinnvoll — whatsapp haengt als ordnerbasierte Quelle im privat-Memory.
+BUILTIN_SHARED_SOURCES = [
+    {"key": "email_inbox",    "label": "E-Mail Inbox",    "icon": "\u2709",      "path": os.path.join(BASE, "email_inbox")},
+    {"key": "webclips",       "label": "Webclips",        "icon": "\U0001F310",  "path": os.path.join(BASE, "webclips")},
+    {"key": "calendar",       "label": "Kalender",        "icon": "\U0001F4C5",  "path": os.path.join(BASE, "calendar")},
+    {"key": "working_memory", "label": "Working Memory",  "icon": "\U0001F9E0",  "path": ""},   # pro Agent, kein globaler Pfad
+    {"key": "whatsapp",       "label": "WhatsApp Chats",  "icon": "\U0001F4AC",  "path": os.path.join(BASE, "privat", "memory", "whatsapp")},
+]
+
+
 def _load_access_control():
     try:
         with open(ACCESS_CONTROL_FILE, 'r') as f:
-            return json.load(f)
+            data = json.load(f)
     except Exception:
-        return {"agents": {}, "last_modified": "", "version": "1.0"}
+        data = {"agents": {}, "last_modified": "", "version": "1.0"}
+    data.setdefault("agents", {})
+    data.setdefault("custom_sources", [])
+    return data
+
+
+def _save_access_control(data):
+    import datetime as _dt
+    data['last_modified'] = _dt.datetime.now().isoformat()
+    data.setdefault('version', '1.0')
+    os.makedirs(os.path.dirname(ACCESS_CONTROL_FILE), exist_ok=True)
+    with open(ACCESS_CONTROL_FILE, 'w') as f:
+        json.dump(data, f, indent=2, ensure_ascii=False)
+
+
+def _slugify_source_key(label: str, existing: set) -> str:
+    """Erzeugt einen stabilen Key fuer eine Custom-Source aus dem Label.
+    Nur Kleinbuchstaben, Zahlen, Unterstriche; erzwingt Eindeutigkeit."""
+    import re as _re
+    base = _re.sub(r'[^a-z0-9]+', '_', (label or '').lower()).strip('_')
+    if not base:
+        base = 'custom'
+    base = 'custom_' + base
+    key = base
+    i = 2
+    while key in existing:
+        key = f"{base}_{i}"
+        i += 1
+    return key
+
+
+def _source_status(path: str) -> dict:
+    """Gibt {exists, count} fuer einen Ordner-Pfad zurueck."""
+    if not path:
+        return {"exists": False, "count": 0}
+    try:
+        if not os.path.isdir(path):
+            return {"exists": False, "count": 0}
+        cnt = sum(1 for _ in os.listdir(path))
+        return {"exists": True, "count": cnt}
+    except Exception:
+        return {"exists": False, "count": 0}
 
 
 @app.route('/api/access-control', methods=['GET'])
 def api_access_control_get():
-    return jsonify(_load_access_control())
+    data = _load_access_control()
+    # Enrich: fuege statische Shared-Source-Metadaten (Pfad, Status) bei,
+    # damit das Frontend keine Pfade kennen muss.
+    shared = []
+    for src in BUILTIN_SHARED_SOURCES:
+        entry = dict(src)
+        entry['builtin'] = True
+        entry['status'] = _source_status(src['path']) if src['path'] else {"exists": True, "count": 0}
+        shared.append(entry)
+    for src in data.get('custom_sources', []):
+        entry = dict(src)
+        entry['builtin'] = False
+        entry['status'] = _source_status(src.get('path', ''))
+        shared.append(entry)
+    data['shared_sources'] = shared
+    return jsonify(data)
+
+
+@app.route('/api/access-control/custom-sources', methods=['POST'])
+def api_access_control_add_custom_source():
+    """Body: {label: str, path: str, icon?: str}. Pfad muss existieren."""
+    payload = request.get_json(silent=True) or {}
+    label = (payload.get('label') or '').strip()
+    path = (payload.get('path') or '').strip()
+    icon = (payload.get('icon') or '').strip() or "\U0001F4C1"
+    if not label:
+        return jsonify({'success': False, 'error': 'Label fehlt'}), 400
+    if not path:
+        return jsonify({'success': False, 'error': 'Pfad fehlt'}), 400
+    # Expand ~ und pruefen
+    path = os.path.expanduser(path)
+    if not os.path.isdir(path):
+        return jsonify({'success': False, 'error': f'Pfad ist kein Ordner oder existiert nicht: {path}'}), 400
+
+    data = _load_access_control()
+    existing_keys = {s['key'] for s in data.get('custom_sources', [])}
+    existing_keys |= {s['key'] for s in BUILTIN_SHARED_SOURCES}
+    key = _slugify_source_key(label, existing_keys)
+    data.setdefault('custom_sources', []).append({
+        'key': key,
+        'label': label,
+        'path': path,
+        'icon': icon,
+    })
+    try:
+        _save_access_control(data)
+    except Exception as e:
+        return jsonify({'success': False, 'error': str(e)}), 500
+    return jsonify({'success': True, 'key': key, 'saved_at': data['last_modified']})
+
+
+@app.route('/api/access-control/custom-sources/<key>', methods=['DELETE'])
+def api_access_control_remove_custom_source(key):
+    data = _load_access_control()
+    sources = data.get('custom_sources', [])
+    new_sources = [s for s in sources if s.get('key') != key]
+    if len(new_sources) == len(sources):
+        return jsonify({'success': False, 'error': f'Custom-Source nicht gefunden: {key}'}), 404
+    data['custom_sources'] = new_sources
+    # Referenzen aus allen Agents entfernen
+    for agent_cfg in data.get('agents', {}).values():
+        if isinstance(agent_cfg, dict) and key in (agent_cfg.get('shared_memory') or []):
+            agent_cfg['shared_memory'] = [k for k in agent_cfg['shared_memory'] if k != key]
+    try:
+        _save_access_control(data)
+    except Exception as e:
+        return jsonify({'success': False, 'error': str(e)}), 500
+    return jsonify({'success': True, 'saved_at': data['last_modified']})
 
 
 @app.route('/api/access-control', methods=['POST'])
 def api_access_control_post():
-    import datetime as _dt
     data = request.get_json(silent=True)
     if not data or 'agents' not in data:
         return jsonify({'success': False, 'error': 'Ungueltige Eingabe: agents fehlt'}), 400
@@ -7172,13 +7290,15 @@ def api_access_control_post():
     for agent in data['agents'].keys():
         if agent not in valid_agents:
             return jsonify({'success': False, 'error': f'Unbekannter Agent: {agent}'}), 400
-    # Write
-    data['last_modified'] = _dt.datetime.now().isoformat()
-    data.setdefault('version', '1.0')
+    # Custom-Sources erhalten: wenn der Client sie nicht mitschickt, aus
+    # existierender Datei uebernehmen (Frontend re-schickt sie aber auch).
+    if 'custom_sources' not in data:
+        existing = _load_access_control()
+        data['custom_sources'] = existing.get('custom_sources', [])
+    # Enriched 'shared_sources' aus GET nicht persistieren
+    data.pop('shared_sources', None)
     try:
-        os.makedirs(os.path.dirname(ACCESS_CONTROL_FILE), exist_ok=True)
-        with open(ACCESS_CONTROL_FILE, 'w') as f:
-            json.dump(data, f, indent=2, ensure_ascii=False)
+        _save_access_control(data)
         return jsonify({'success': True, 'saved_at': data['last_modified']})
     except Exception as e:
         return jsonify({'success': False, 'error': str(e)}), 500
@@ -7209,12 +7329,19 @@ h1 { color:#f0c060; font-size:24px; margin:8px 0 4px; }
 .matrix-table thead th.corner { z-index:30; left:0; min-width:260px; width:260px; background:#1e1e40; }
 .agent-header { writing-mode:vertical-rl; transform:rotate(180deg); padding:12px 6px 8px; font-size:12px; font-weight:600; color:#c0c0d0; white-space:nowrap; text-align:left; min-height:80px; letter-spacing:0.3px; }
 .matrix-table td.source-cell, .matrix-table th.corner { position:sticky; left:0; z-index:10; background:#1a1a34; }
-.matrix-table td.source-cell { min-width:260px; width:260px; padding:8px 14px; border-right:1px solid #334; font-size:13px; white-space:nowrap; }
-.source-icon { margin-right:8px; font-size:15px; display:inline; }
+.matrix-table td.source-cell { min-width:300px; width:300px; padding:8px 14px; border-right:1px solid #334; font-size:13px; }
+.source-top { display:flex; align-items:center; white-space:nowrap; }
+.source-icon { margin-right:8px; font-size:15px; display:inline-block; }
 .source-name { font-weight:500; color:#d0d0e0; }
 .source-badge { display:inline-block; font-size:10px; padding:1px 7px; border-radius:8px; margin-left:8px; font-weight:600; vertical-align:middle; }
+.source-path { margin-top:3px; margin-left:23px; font-size:10px; color:#6a6a80; font-family:ui-monospace,Menlo,monospace; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; max-width:270px; }
+.source-path.missing { color:#c07070; }
+.source-count { color:#5a7a9a; }
+.source-remove { background:transparent; border:1px solid #6a3a3a; color:#c08080; border-radius:4px; font-size:11px; line-height:1; padding:2px 6px; margin-left:8px; cursor:pointer; }
+.source-remove:hover { background:#4a1f1f; color:#fff; border-color:#a04040; }
 .badge-shared { background:#2a4a6a; color:#7ab8f5; }
 .badge-exclusive { background:#3a2a5a; color:#b08ae0; }
+.badge-custom { background:#3a4a2a; color:#a0d070; }
 .section-row td { background:#12122a !important; color:#888; font-size:11px; font-weight:700; text-transform:uppercase; letter-spacing:1.5px; padding:10px 14px !important; border-bottom:1px solid #334; }
 .section-row td.source-cell { background:#12122a !important; }
 .matrix-table td.data-cell { text-align:center; padding:6px 4px; border-bottom:1px solid #222240; border-right:1px solid #222240; min-width:44px; }
@@ -7230,6 +7357,18 @@ h1 { color:#f0c060; font-size:24px; margin:8px 0 4px; }
 .btn-secondary:hover { background:#444; }
 .last-mod { color:#666; font-size:11px; margin-left:auto; }
 .loading { text-align:center; padding:60px; color:#888; font-size:14px; }
+.modal-back { display:none; position:fixed; inset:0; background:rgba(0,0,0,0.6); z-index:100; align-items:center; justify-content:center; }
+.modal-back.open { display:flex; }
+.modal { background:#1e1e3a; border:1px solid #445; border-radius:10px; padding:24px; min-width:460px; max-width:620px; }
+.modal h2 { color:#f0c060; font-size:17px; margin:0 0 14px; }
+.modal label { display:block; color:#aaa; font-size:12px; margin:10px 0 4px; }
+.modal input[type=text] { width:100%; padding:8px 10px; background:#11112a; border:1px solid #445; border-radius:5px; color:#e0e0e0; font-size:13px; font-family:inherit; }
+.modal input[type=text]:focus { outline:none; border-color:#4a8aca; }
+.modal .hint { color:#666; font-size:11px; margin-top:4px; }
+.modal .btn-row { border-top:none; padding-top:16px; margin-top:16px; }
+.btn-ghost { background:transparent; color:#aaa; border:1px solid #445; padding:10px 28px; border-radius:6px; cursor:pointer; font-size:14px; font-weight:600; font-family:inherit; }
+.btn-ghost:hover { background:#22224a; color:#fff; }
+.modal-err { color:#d09090; font-size:12px; margin-top:8px; min-height:16px; }
 </style></head><body>
 <div class="container">
 <div class="admin-topbar">
@@ -7247,19 +7386,31 @@ h1 { color:#f0c060; font-size:24px; margin:8px 0 4px; }
 <div class="btn-row">
   <button class="btn btn-primary" onclick="saveMatrix()">&#128190; Speichern</button>
   <button class="btn btn-secondary" onclick="loadMatrix()">Verwerfen</button>
+  <button class="btn btn-ghost" onclick="openAddSourceModal()">&#128193; Ordner hinzufuegen</button>
   <span class="last-mod" id="last-mod"></span>
 </div>
 </div>
+
+<div id="add-source-modal" class="modal-back" onclick="if(event.target===this)closeAddSourceModal()">
+  <div class="modal">
+    <h2>&#128193; Neue Datenquelle hinzufuegen</h2>
+    <label>Anzeigename</label>
+    <input type="text" id="new-src-label" placeholder="z.B. Slack Export 2026">
+    <label>Ordner-Pfad (absolut oder mit ~)</label>
+    <input type="text" id="new-src-path" placeholder="/Users/.../Downloads/slack-export oder ~/Documents/...">
+    <div class="hint">Der Ordner muss existieren. Nach dem Hinzufuegen kannst du ihn pro Agent per Checkbox freigeben.</div>
+    <div class="modal-err" id="add-src-err"></div>
+    <div class="btn-row">
+      <button class="btn btn-primary" onclick="submitAddSource()">Hinzufuegen</button>
+      <button class="btn btn-ghost" onclick="closeAddSourceModal()">Abbrechen</button>
+    </div>
+  </div>
+</div>
+
 <script>
 var _acData = null;
 var _agents = [];
-var SHARED_SOURCES = [
-  {key:'webclips',       icon:'&#127760;', label:'Webclips'},
-  {key:'email_inbox',    icon:'&#9993;',   label:'E-Mail Inbox'},
-  {key:'calendar',       icon:'&#128197;', label:'Kalender'},
-  {key:'working_memory', icon:'&#129504;', label:'Working Memory'},
-  {key:'whatsapp',       icon:'&#128172;', label:'WhatsApp Chats'}
-];
+var _sharedSources = [];
 
 function escH(s){ return String(s||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;'); }
 
@@ -7278,6 +7429,7 @@ async function loadMatrix(){
   _agents.forEach(function(n){
     if(!_acData.agents[n]) _acData.agents[n] = {own_memory:true, shared_memory:[], cross_agent_read:[], description:''};
   });
+  _sharedSources = _acData.shared_sources || [];
   renderMatrix();
   var lm = document.getElementById('last-mod');
   lm.textContent = _acData.last_modified ? 'Zuletzt gespeichert: '+_acData.last_modified : '';
@@ -7327,9 +7479,25 @@ function renderMatrix(){
     h += '</tr>';
   });
   h += '<tr class="section-row"><td class="source-cell" colspan="'+(_agents.length+1)+'">&#128279; Shared Memory</td></tr>';
-  SHARED_SOURCES.forEach(function(src){
+  _sharedSources.forEach(function(src){
     var cnt = countAccess('shared', src.key);
-    h += '<tr><td class="source-cell"><span class="source-icon">'+src.icon+'</span><span class="source-name">'+escH(src.label)+'</span>'+badgeHtml(cnt)+'</td>';
+    var pathHtml = '';
+    if(src.path){
+      var st = src.status || {exists:false, count:0};
+      var cls = st.exists ? '' : ' missing';
+      var cnt2 = st.exists ? ('<span class="source-count"> &middot; '+st.count+' Eintr&auml;ge</span>') : ' &middot; nicht gefunden';
+      pathHtml = '<div class="source-path'+cls+'"><code>'+escH(src.path)+'</code>'+cnt2+'</div>';
+    } else if(src.key === 'working_memory'){
+      pathHtml = '<div class="source-path">&lt;agent&gt;/working_memory/</div>';
+    }
+    var removeBtn = src.builtin ? '' :
+      '<button class="source-remove" title="Quelle entfernen" onclick="removeCustomSource('+"'"+escH(src.key)+"'"+',event)">&times;</button>';
+    var customBadge = src.builtin ? '' : '<span class="source-badge badge-custom">Custom</span>';
+    h += '<tr><td class="source-cell">' +
+         '<div class="source-top"><span class="source-icon">'+(src.icon||'&#128193;')+'</span>' +
+         '<span class="source-name">'+escH(src.label)+'</span>'+customBadge+badgeHtml(cnt)+removeBtn+'</div>' +
+         pathHtml +
+         '</td>';
     _agents.forEach(function(ag){
       var a = _acData.agents[ag];
       var chk = (a && (a.shared_memory||[]).indexOf(src.key)>=0) ? ' checked' : '';
@@ -7426,6 +7594,73 @@ async function saveMatrix(){
     msg.style.display='block';
   }
   setTimeout(function(){ msg.style.display='none'; }, 5000);
+}
+
+function openAddSourceModal(){
+  document.getElementById('new-src-label').value = '';
+  document.getElementById('new-src-path').value = '';
+  document.getElementById('add-src-err').textContent = '';
+  document.getElementById('add-source-modal').classList.add('open');
+  document.getElementById('new-src-label').focus();
+}
+function closeAddSourceModal(){
+  document.getElementById('add-source-modal').classList.remove('open');
+}
+async function submitAddSource(){
+  var label = document.getElementById('new-src-label').value.trim();
+  var path = document.getElementById('new-src-path').value.trim();
+  var err = document.getElementById('add-src-err');
+  err.textContent = '';
+  if(!label){ err.textContent = 'Bitte Anzeigename eingeben.'; return; }
+  if(!path){ err.textContent = 'Bitte Pfad eingeben.'; return; }
+  // Zuerst aktuelle Matrix-Checkboxen ins Modell uebernehmen, damit unsave
+  // Aenderungen beim Reload nicht verloren gehen.
+  collectFromDOM();
+  try {
+    await fetch('/api/access-control', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify(_acData)});
+  } catch(e){ /* best effort */ }
+  try {
+    var r = await fetch('/api/access-control/custom-sources', {
+      method:'POST', headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({label:label, path:path})
+    });
+    var d = await r.json();
+    if(!d.success){ err.textContent = d.error || 'Fehler'; return; }
+    closeAddSourceModal();
+    await loadMatrix();
+    var msg = document.getElementById('msg');
+    msg.className='msg success';
+    msg.textContent='Quelle hinzugefuegt: '+label;
+    msg.style.display='block';
+    setTimeout(function(){ msg.style.display='none'; }, 4000);
+  } catch(e){
+    err.textContent = 'Netzwerk-Fehler: '+e.message;
+  }
+}
+async function removeCustomSource(key, ev){
+  if(ev){ ev.stopPropagation(); ev.preventDefault(); }
+  if(!confirm('Quelle "'+key+'" wirklich entfernen? Zugriffsrechte werden aus allen Agents entfernt.')) return;
+  collectFromDOM();
+  try {
+    await fetch('/api/access-control', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify(_acData)});
+  } catch(e){ /* best effort */ }
+  try {
+    var r = await fetch('/api/access-control/custom-sources/'+encodeURIComponent(key), {method:'DELETE'});
+    var d = await r.json();
+    var msg = document.getElementById('msg');
+    if(d.success){
+      await loadMatrix();
+      msg.className='msg success';
+      msg.textContent='Quelle entfernt.';
+    } else {
+      msg.className='msg error';
+      msg.textContent='Fehler: '+(d.error||'unbekannt');
+    }
+    msg.style.display='block';
+    setTimeout(function(){ msg.style.display='none'; }, 4000);
+  } catch(e){
+    alert('Netzwerk-Fehler: '+e.message);
+  }
 }
 
 loadMatrix();
@@ -10592,18 +10827,56 @@ def admin_permissions():
     n_parents = sum(1 for r in rows if r["kind"] == "Parent")
     n_subs = sum(1 for r in rows if r["kind"] == "Sub-Agent")
     # Shared Data Sources
-    shared_sources = [
-        ("email_inbox", "E-Mail Inbox", os.path.join(BASE, "email_inbox")),
-        ("webclips", "Webclips", os.path.join(BASE, "webclips")),
-        ("calendar", "Kalender", os.path.join(BASE, "calendar")),
-        ("whatsapp (privat)", "WhatsApp Chats", os.path.join(BASE, "privat", "memory", "whatsapp")),
+    # Ordner-basierte Quellen (eigener Pfad)
+    folder_sources = [
+        ("email_inbox", "E-Mail Inbox", os.path.join(_ADMIN_DATALAKE, "email_inbox")),
+        ("webclips", "Webclips", os.path.join(_ADMIN_DATALAKE, "webclips")),
+        ("calendar", "Kalender", os.path.join(_ADMIN_DATALAKE, "calendar")),
+        ("whatsapp (privat)", "WhatsApp Chats", os.path.join(_ADMIN_DATALAKE, "privat", "memory", "whatsapp")),
     ]
+    # Prefix-basierte Quellen (liegen verstreut in <agent>/memory/<prefix>_*.txt)
+    def _count_prefix(prefix):
+        total = 0
+        agents_with = []
+        try:
+            for entry in os.listdir(_ADMIN_DATALAKE):
+                mem = os.path.join(_ADMIN_DATALAKE, entry, "memory")
+                if not os.path.isdir(mem):
+                    continue
+                try:
+                    matches = [f for f in os.listdir(mem) if f.startswith(prefix) and f.endswith('.txt')]
+                except OSError:
+                    continue
+                if matches:
+                    total += len(matches)
+                    agents_with.append(f"{entry} ({len(matches)})")
+        except OSError:
+            pass
+        return total, agents_with
+
+    kchat_total, kchat_agents = _count_prefix("kchat_")
+    slack_total, slack_agents = _count_prefix("slack_")
+
     shared_html = "<h2>Shared Data Sources</h2><table><tr><th>Quelle</th><th>Pfad</th><th>Status</th></tr>"
-    for sid, slabel, spath in shared_sources:
+    for sid, slabel, spath in folder_sources:
         exists = os.path.isdir(spath)
         fcount = len(os.listdir(spath)) if exists else 0
         status = f"<span class='status-ok'>● {fcount} Dateien</span>" if exists else "<span class='status-bad'>○ nicht gefunden</span>"
         shared_html += f"<tr><td><strong>{_html_lib.escape(slabel)}</strong></td><td><code>{_html_lib.escape(sid)}/</code></td><td>{status}</td></tr>"
+
+    for sid, slabel, prefix, total, agents_list in [
+        ("kchat_*.txt pro Agent-Memory", "kChat Messages", "kchat_", kchat_total, kchat_agents),
+        ("slack_*.txt pro Agent-Memory", "Slack Messages", "slack_", slack_total, slack_agents),
+    ]:
+        if total > 0:
+            details = ", ".join(agents_list)
+            status = (f"<span class='status-ok'>● {total} Dateien</span>"
+                      f" <span style='color:#888;font-size:11px'>({_html_lib.escape(details)})</span>")
+        else:
+            status = "<span class='status-bad'>○ keine Dateien</span>"
+        shared_html += (f"<tr><td><strong>{_html_lib.escape(slabel)}</strong></td>"
+                        f"<td><code>{_html_lib.escape(sid)}</code></td>"
+                        f"<td>{status}</td></tr>")
     shared_html += "</table>"
     body = (
         "<h1>🔐 Memory-Berechtigungen</h1>"

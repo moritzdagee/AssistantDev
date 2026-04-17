@@ -6,6 +6,34 @@ Format: [Datum] Änderung | Datei | Grund
 
 ## 2026-04-16
 
+### Feature: Access-Control Custom-Sources + Pfad-Anzeige + kChat/Slack in Shared-Data
+- **Was der Nutzer wollte:**
+  1. In der Access-Control-Matrix (`/admin/access-control`) soll jede Shared-Source-Zeile den **konkreten Ordner-Pfad** + Status zeigen.
+  2. Moeglichkeit, **beliebige Ordner** als neue Quelle zur Matrix **hinzuzufuegen** (Label + Pfad), pro Agent/Sub-Agent freigeben, wieder **entfernen**.
+  3. In den Memory-Berechtigungen (`/admin/permissions`) fehlten **kChat** und **Slack** unter "Shared Data Sources" — nachziehen.
+- **Was umgesetzt wurde:**
+  - **Schema-Erweiterung `access_control.json`:** neue Top-Level-Liste `custom_sources` mit `{key, label, path, icon}`. `key` wird aus dem Label slugifiziert (`custom_<slug>`, Kollision → Suffix).
+  - **API:**
+    - `GET /api/access-control` liefert jetzt zusaetzlich `shared_sources`: built-in + custom gemergt, mit `path` und `status: {exists, count}` (Ordner-Scan). Frontend braucht keine Pfade mehr hart-codiert.
+    - `POST /api/access-control/custom-sources` (Body `{label, path, icon?}`): validiert Pfad (muss existierender Ordner sein, `~` wird expandiert), vergibt unique key, persistiert.
+    - `DELETE /api/access-control/custom-sources/<key>`: entfernt Quelle aus `custom_sources` und strippt den key aus `shared_memory` aller Agents.
+    - Bestehender `POST /api/access-control` preserviert `custom_sources` (Re-Save ohne Matrix-Tab-Focus laesst Custom-Zeilen unangetastet) und droppt enrichte `shared_sources` vor dem Write.
+  - **UI `/admin/access-control`:**
+    - Neue CSS-Klassen `.source-top`, `.source-path`, `.source-remove`, `.badge-custom` + Modal-Styles.
+    - Matrix-JS liest Sources ausschliesslich aus `_acData.shared_sources` (kein hart-codiertes `SHARED_SOURCES`-Array mehr).
+    - Jede Zeile zeigt Icon, Label, Badge (Exklusiv/Geteilt-von-N/Custom), Status-Zeile mit Pfad + Eintragszahl. Fehlende Pfade werden rot ("nicht gefunden") dargestellt.
+    - "📁 Ordner hinzufuegen"-Button oeffnet Modal mit Label- und Pfad-Input, validiert server-seitig, reloaded die Matrix.
+    - Custom-Zeilen haben einen "×"-Button zum Entfernen (mit `confirm()`-Dialog, persistiert nicht-gespeicherte Checkbox-Aenderungen vorher).
+  - **Memory-Berechtigungen `/admin/permissions`:**
+    - Shared-Data-Sources-Sektion um zwei Prefix-basierte Quellen erweitert: **kChat Messages** (scannt `<agent>/memory/kchat_*.txt` ueber alle Agenten) und **Slack Messages** (analog `slack_*.txt`). Bei Treffern wird pro Agent die Datei-Anzahl in Klammern angegeben.
+    - Live-Zahlen: kChat 0 (Watcher hat noch nie importiert), Slack 10 (signicat).
+- **Bestehende Tests nachgezogen:** Drei Tests, die noch gegen den alten JS-Array `SHARED_SOURCES` geprueft haben ("webclips"/"email_inbox"/"calendar" in HTML, "WhatsApp Chats in HTML", "Working Memory Label in HTML"), lesen jetzt den enrichten `shared_sources`-Array aus `/api/access-control`.
+- **Neue Tests:** Section `Access Control Custom Sources 2026-04-16` mit 23 Tests — GET-Enrichment, POST-Validierung (fehlendes Label, nicht-existenter Pfad), End-to-End Add+Verify+Delete, unique Key bei Dublikat-Label, 404 bei DELETE unbekannter key, UI-Elemente (Modal, Button, CSS, JS-Funktion), Memory-Berechtigungen zeigt kChat- und Slack-Zeile mit Agent-Breakdown.
+- **Dateien:** `src/web_server.py` (+~190 Zeilen: Backend-API, HTML/CSS, Modal, JS), `tests/run_tests.py` (+~110 Zeilen in neuer Section, 3 bestehende Tests adaptiert).
+- **Tests:** Suite **849/849 gruen** (vorher 826).
+- **Backup:** `backups/2026-04-16_21-10-29/src/web_server.py`.
+- **Feature-Branch:** `feature/access-control-custom-sources`.
+
 ### Feature: Dynamic Capabilities Injection — Agent-Prompts beim Server-Start
 - **Was:** Jeder Agent-System-Prompt in `config/agents/*.txt` wird beim Start von `web_server.py` automatisch um einen aktuellen **System-Capabilities-Block** ergaenzt/aktualisiert. Der Block dokumentiert dynamisch (aus `models.json` + Agent-Config generiert): Memory- und Working-Memory-Pfade, Datei-/Bild-/Video-Aktions-Tags, Kalender-/Canva-/Slack-Tools, aktive Provider samt Modellen, Ausgabe-Pfade, OUTPUT-Konvention. So bleiben Agents immer ueber ihre tatsaechlichen Faehigkeiten informiert, ohne dass der Nutzer Promptdateien anfassen muss.
 - **Warum:** Capabilities waren bisher statisch in jeder Agent-Datei eingetragen und veralteten — neue Provider, neue Aktions-Tags oder Pfad-Aenderungen waren pro Agent manuell nachzuziehen.

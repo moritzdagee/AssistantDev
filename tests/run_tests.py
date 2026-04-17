@@ -1943,8 +1943,11 @@ test("Access Control hat Shared Memory Sektion",
 test("Access Control hat Cross-Agent Read Sektion",
      "Cross-Agent Read" in _ac_html)
 
+# Seit 2026-04-16 kommen die Sources aus /api/access-control (shared_sources)
+_ac_api = requests.get(BASE_URL + "/api/access-control").json()
+_ac_keys = {s.get("key") for s in _ac_api.get("shared_sources", [])}
 test("Access Control hat Shared Sources: webclips, email_inbox, calendar",
-     "webclips" in _ac_html and "email_inbox" in _ac_html and "calendar" in _ac_html)
+     {"webclips", "email_inbox", "calendar"}.issubset(_ac_keys))
 
 test("Access Control hat badge-shared CSS-Klasse",
      "badge-shared" in _ac_html)
@@ -2146,14 +2149,15 @@ test("History: onHistoryClick via inline onclick statt event delegation",
 test("History: KEIN btn.onclick = () => loadConversation mehr",
      "btn.onclick = () => loadConversation" not in _fix_html)
 
-# Access Control: Working Memory als Datenquelle
+# Access Control: Working Memory als Datenquelle (seit 2026-04-16 API-basiert)
 _ac2 = requests.get(BASE_URL + "/admin/access-control").text
+_ac2_api = requests.get(BASE_URL + "/api/access-control").json()
 
 test("Access Control: working_memory in SHARED_SOURCES",
-     "working_memory" in _ac2)
+     any(s.get("key") == "working_memory" for s in _ac2_api.get("shared_sources", [])))
 
 test("Access Control: Working Memory Label vorhanden",
-     "Working Memory" in _ac2)
+     any(s.get("label") == "Working Memory" for s in _ac2_api.get("shared_sources", [])))
 
 # Deploy-Script: kein Assistant.app Pfad mehr
 _deploy_path = os.path.expanduser("~/AssistantDev/scripts/deploy.sh")
@@ -2261,10 +2265,11 @@ _wa_plist = os.path.expanduser("~/Library/LaunchAgents/com.assistantdev.whatsapp
 test("WhatsApp Import LaunchAgent plist existiert",
      os.path.exists(_wa_plist))
 
-# Access Control: WhatsApp als Shared Source
-_ac3 = requests.get(BASE_URL + "/admin/access-control").text
+# Access Control: WhatsApp als Shared Source (seit 2026-04-16 API-basiert)
+_ac3_api = requests.get(BASE_URL + "/api/access-control").json()
 test("Access Control: WhatsApp Chats in SHARED_SOURCES",
-     "whatsapp" in _ac3 and "WhatsApp" in _ac3)
+     any(s.get("key") == "whatsapp" and s.get("label") == "WhatsApp Chats"
+         for s in _ac3_api.get("shared_sources", [])))
 
 
 section("Chat-Tabs 2026-04-16")
@@ -3006,6 +3011,124 @@ test("dashboard_window.py: /messages in TITLE_MAP",
 # /open_in_finder erweitert um path-Parameter
 test("/open_in_finder akzeptiert direct_path (Datalake-sicher)",
      "direct_path" in _ws_src and "startswith(real_base" in _ws_src)
+
+
+section("Access Control Custom Sources 2026-04-16")
+
+# GET /api/access-control liefert enriched shared_sources mit Pfad + Status
+try:
+    _ac_resp = requests.get(BASE_URL + "/api/access-control", timeout=10)
+    _ac_json = _ac_resp.json()
+    test("GET /api/access-control HTTP 200", _ac_resp.status_code == 200)
+    test("Response enthaelt shared_sources-Array",
+         isinstance(_ac_json.get("shared_sources"), list) and len(_ac_json["shared_sources"]) >= 5)
+    _keys = {s.get("key") for s in _ac_json.get("shared_sources", [])}
+    test("shared_sources enthaelt builtin webclips/email_inbox/calendar/working_memory/whatsapp",
+         {"webclips","email_inbox","calendar","working_memory","whatsapp"}.issubset(_keys))
+    test("Jede Source hat path-Feld und status-Dict",
+         all("path" in s and isinstance(s.get("status"), dict) for s in _ac_json["shared_sources"]))
+    test("Builtin-Sources sind als builtin:true markiert",
+         all(s.get("builtin") is True for s in _ac_json["shared_sources"]
+             if s.get("key") in {"webclips","email_inbox","calendar","working_memory","whatsapp"}))
+    test("Response enthaelt custom_sources-Liste",
+         isinstance(_ac_json.get("custom_sources"), list))
+except Exception as e:
+    test("GET /api/access-control HTTP-Aufruf", False, details=str(e))
+
+# POST /api/access-control/custom-sources mit nicht-existierendem Pfad -> 400
+try:
+    _bad = requests.post(BASE_URL + "/api/access-control/custom-sources",
+                         json={"label": "Bad", "path": "/nonexistent/xyz/abc"}, timeout=10)
+    test("POST custom-sources lehnt nicht-existierenden Pfad ab",
+         _bad.status_code == 400 and _bad.json().get("success") is False)
+except Exception as e:
+    test("POST custom-sources (invalid) HTTP-Aufruf", False, details=str(e))
+
+# POST mit fehlendem Label -> 400
+try:
+    _empty = requests.post(BASE_URL + "/api/access-control/custom-sources",
+                           json={"path": "/tmp"}, timeout=10)
+    test("POST custom-sources lehnt fehlendes Label ab",
+         _empty.status_code == 400)
+except Exception as e:
+    test("POST custom-sources (no label) HTTP-Aufruf", False, details=str(e))
+
+# End-to-End: add + verify in shared_sources + delete
+import tempfile as _tmp
+_tmpdir = _tmp.mkdtemp()
+try:
+    with open(os.path.join(_tmpdir, "a.txt"), "w") as _f:
+        _f.write("x")
+    with open(os.path.join(_tmpdir, "b.txt"), "w") as _f:
+        _f.write("y")
+    _add = requests.post(BASE_URL + "/api/access-control/custom-sources",
+                         json={"label": "Run-Tests Temp", "path": _tmpdir}, timeout=10)
+    _add_json = _add.json()
+    test("POST custom-sources fuegt Quelle hinzu und liefert key",
+         _add.status_code == 200 and _add_json.get("success") is True and _add_json.get("key"))
+    _key = _add_json.get("key")
+
+    _ac2 = requests.get(BASE_URL + "/api/access-control", timeout=10).json()
+    _custom = [s for s in _ac2.get("shared_sources", []) if s.get("key") == _key]
+    test("Neue Quelle erscheint in shared_sources mit builtin=false",
+         len(_custom) == 1 and _custom[0].get("builtin") is False)
+    test("Neue Quelle hat korrekten Status (exists, count=2)",
+         len(_custom) == 1 and _custom[0].get("status", {}).get("exists") is True
+         and _custom[0].get("status", {}).get("count") == 2)
+    test("Custom-Source hat Pfad = Input-Pfad",
+         len(_custom) == 1 and _custom[0].get("path") == _tmpdir)
+
+    # Doppelter Add mit gleichem Label liefert unique key (custom_run_tests_temp_2)
+    _add2 = requests.post(BASE_URL + "/api/access-control/custom-sources",
+                          json={"label": "Run-Tests Temp", "path": _tmpdir}, timeout=10)
+    test("Doppelter Add mit gleichem Label liefert eindeutigen Key",
+         _add2.status_code == 200 and _add2.json().get("key") != _key)
+    _key2 = _add2.json().get("key")
+
+    # DELETE unbekannt -> 404
+    _del_bad = requests.delete(BASE_URL + "/api/access-control/custom-sources/no_such_key", timeout=10)
+    test("DELETE unbekannter Key liefert 404",
+         _del_bad.status_code == 404)
+
+    # DELETE beide keys
+    _del1 = requests.delete(BASE_URL + f"/api/access-control/custom-sources/{_key}", timeout=10)
+    _del2 = requests.delete(BASE_URL + f"/api/access-control/custom-sources/{_key2}", timeout=10)
+    test("DELETE entfernt Custom-Source erfolgreich",
+         _del1.status_code == 200 and _del1.json().get("success") is True
+         and _del2.status_code == 200)
+
+    _ac3 = requests.get(BASE_URL + "/api/access-control", timeout=10).json()
+    _remaining = [s for s in _ac3.get("custom_sources", []) if s.get("key") in (_key, _key2)]
+    test("Nach DELETE ist Custom-Source weg", len(_remaining) == 0)
+finally:
+    import shutil as _sh
+    _sh.rmtree(_tmpdir, ignore_errors=True)
+
+# UI: Admin-Seite rendert neue Elemente
+try:
+    _ac_page = requests.get(BASE_URL + "/admin/access-control", timeout=10).text
+    test("Access-Control-Seite enthaelt 'Ordner hinzufuegen'-Button",
+         "Ordner hinzufuegen" in _ac_page or "openAddSourceModal" in _ac_page)
+    test("Access-Control-Seite enthaelt add-source-modal",
+         'id="add-source-modal"' in _ac_page)
+    test("Access-Control-Seite verwendet _sharedSources aus Backend",
+         "_sharedSources = _acData.shared_sources" in _ac_page)
+    test("Access-Control-Seite hat source-path CSS + removeCustomSource JS",
+         "source-path" in _ac_page and "removeCustomSource" in _ac_page)
+except Exception as e:
+    test("GET /admin/access-control HTTP-Aufruf", False, details=str(e))
+
+# Memory-Berechtigungen: kChat + Slack in Shared Data Sources
+try:
+    _perm_page = requests.get(BASE_URL + "/admin/permissions", timeout=10).text
+    test("/admin/permissions enthaelt kChat-Zeile",
+         "kChat Messages" in _perm_page)
+    test("/admin/permissions enthaelt Slack-Zeile",
+         "Slack Messages" in _perm_page)
+    test("/admin/permissions weist Slack-Dateien pro Agent aus",
+         "slack_*.txt" in _perm_page)
+except Exception as e:
+    test("GET /admin/permissions HTTP-Aufruf", False, details=str(e))
 
 
 section("Dynamic Capabilities Injection 2026-04-16")
