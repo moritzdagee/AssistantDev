@@ -6,6 +6,16 @@ Format: [Datum] Änderung | Datei | Grund
 
 ## 2026-04-16
 
+### Bug-Fix: Agent-Auswahl blockiert durch korrupte _index.json (HTTP 500)
+- **Was der Nutzer beobachtete:** Modal zur Agent-Auswahl erscheint beim Start, aber Klick auf "signicat" bewirkte nichts — Modal blieb offen.
+- **Ursache:** `signicat/_index.json` war korrupt (`JSONDecodeError: Extra data: line 302 column 2 (char 17898)`, vermutlich iCloud-Sync-Konflikt, zwei Versionen aneinandergeklebt). `POST /select_agent` ruft `migrate_old_conversations()` → `load_index()` → `json.load()` → **unhandled Exception** → Flask HTTP 500 → Frontend hat keinen Error-Branch → Modal schlaegt still fehl.
+- **Fix in `src/web_server.py` `load_index`:** Catch `JSONDecodeError / ValueError / OSError`. Bei Defekt wird die Datei als `_index.json.corrupt-<ts>.bak` in Quarantaene verschoben und ein leerer Index zurueckgegeben. `migrate_old_conversations` rebuildet den Index danach automatisch aus den vorhandenen `konversation_*.txt`-Dateien. Verifizierte Typpruefung (muss `list` sein) zusaetzlich eingebaut.
+- **Duplicate-Block:** `load_index` ist in `web_server.py` zweimal definiert (bekannte Duplikat-Struktur laut CLAUDE.md). Beide Kopien wurden synchron aktualisiert.
+- **Live-Wiederherstellung (automatisch):** Nach Deploy erster `POST /select_agent` rename korrupte Datei → `signicat/_index.json.corrupt-20260416_*.bak`. Neuer Index rebuildet auf **186 Eintraege**. `/select_agent` liefert 200. Modal schliesst im UI-Test korrekt, 49 Sessions in History sichtbar.
+- **Backup:** `backups/2026-04-16_22-25-12/src/web_server.py`.
+- **Feature-Branch:** `feature/fix-load-index-fallback`.
+- **Tests:** Suite 849/849 gruen.
+
 ### Bug-Fix (Ergaenzung): Server-seitiger History-Filter + Titel aus echter Prompt
 - **Nach dem ersten Fix** (Cleanup-Skript + run_tests-Hook) entstanden weiterhin Test-Artefakte, weil die Auto-Save-Loop im Server noch **nach** dem Test-Cleanup-Scan Dateien schrieb (Race-Condition).
 - **Robusterer Fix in `src/web_server.py` `get_history`:** Filtert Dateien **zur Request-Zeit** aus, wenn (a) Dateigroesse ≤ 3500 Bytes UND (b) **alle** `Du:`-Zeilen exakt zu einer Test-Muster-Whitelist gehoeren (`TESTOK`, `/find test`, `TEST_OK`, `Say hello`, `TEST`, `test`). Timing-unabhaengig, wirkt auch auf existierende, nicht-aufgeraeumte Dateien.

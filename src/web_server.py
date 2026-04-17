@@ -774,12 +774,33 @@ def extract_file_content(raw, filename):
 # ─── MEMORY SYSTEM ────────────────────────────────────────────────────────────
 
 def load_index(speicher):
-    """Load session index for an agent."""
+    """Load session index for an agent.
+
+    Robust gegenueber korrupten _index.json (iCloud-Sync-Konflikte,
+    Race-Conditions beim Schreiben). Bei JSONDecodeError / unerwartetem
+    Typ: die defekte Datei wird als `.corrupt-<ts>.bak` umbenannt und
+    ein leerer Index zurueckgegeben. `migrate_old_conversations()` baut
+    den Index danach aus den vorhandenen `konversation_*.txt` neu auf.
+    """
     index_file = os.path.join(speicher, '_index.json')
-    if os.path.exists(index_file):
-        with open(index_file) as f:
-            return json.load(f)
-    return []
+    if not os.path.exists(index_file):
+        return []
+    try:
+        with open(index_file, 'r', encoding='utf-8') as f:
+            data = json.load(f)
+        if not isinstance(data, list):
+            raise ValueError(f'_index.json ist keine Liste, sondern {type(data).__name__}')
+        return data
+    except (json.JSONDecodeError, ValueError, OSError) as e:
+        import datetime as _dt
+        ts = _dt.datetime.now().strftime('%Y%m%d_%H%M%S')
+        bak = index_file + f'.corrupt-{ts}.bak'
+        try:
+            os.rename(index_file, bak)
+            print(f'[INDEX] KORRUPT: {index_file} ({e}). Umbenannt in {bak}. Rebuild leer.')
+        except OSError as _mv_err:
+            print(f'[INDEX] KORRUPT: {index_file} ({e}). Backup fehlgeschlagen: {_mv_err}')
+        return []
 
 def save_index(speicher, index):
     """Save session index."""
@@ -3214,12 +3235,33 @@ def extract_file_content(raw, filename):
 # ─── MEMORY SYSTEM ────────────────────────────────────────────────────────────
 
 def load_index(speicher):
-    """Load session index for an agent."""
+    """Load session index for an agent.
+
+    Robust gegenueber korrupten _index.json (iCloud-Sync-Konflikte,
+    Race-Conditions beim Schreiben). Bei JSONDecodeError / unerwartetem
+    Typ: die defekte Datei wird als `.corrupt-<ts>.bak` umbenannt und
+    ein leerer Index zurueckgegeben. `migrate_old_conversations()` baut
+    den Index danach aus den vorhandenen `konversation_*.txt` neu auf.
+    """
     index_file = os.path.join(speicher, '_index.json')
-    if os.path.exists(index_file):
-        with open(index_file) as f:
-            return json.load(f)
-    return []
+    if not os.path.exists(index_file):
+        return []
+    try:
+        with open(index_file, 'r', encoding='utf-8') as f:
+            data = json.load(f)
+        if not isinstance(data, list):
+            raise ValueError(f'_index.json ist keine Liste, sondern {type(data).__name__}')
+        return data
+    except (json.JSONDecodeError, ValueError, OSError) as e:
+        import datetime as _dt
+        ts = _dt.datetime.now().strftime('%Y%m%d_%H%M%S')
+        bak = index_file + f'.corrupt-{ts}.bak'
+        try:
+            os.rename(index_file, bak)
+            print(f'[INDEX] KORRUPT: {index_file} ({e}). Umbenannt in {bak}. Rebuild leer.')
+        except OSError as _mv_err:
+            print(f'[INDEX] KORRUPT: {index_file} ({e}). Backup fehlgeschlagen: {_mv_err}')
+        return []
 
 def save_index(speicher, index):
     """Save session index."""
