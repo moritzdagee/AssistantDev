@@ -11974,6 +11974,48 @@ def _apple_mail_load_read_keys() -> set:
         return _APPLE_MAIL_READ_CACHE["keys"]
 
 
+def _apple_mail_set_read_state_async(sender_email: str, subject: str, read: bool) -> None:
+    """Setzt Read-Status einer Apple-Mail-Nachricht via AppleScript.
+    Laeuft asynchron via subprocess.Popen, blockiert die UI nicht.
+
+    Matching: sender-Adresse enthaelt `sender_email`, subject ist
+    exakt `subject`. Das entspricht dem Match-Key unseres Read-Sync-
+    Lesers und sollte den gleichen Satz an Messages treffen.
+
+    WICHTIG: AppleScript ist langsam (sekundenbereich fuer iteration
+    ueber alle Mailboxes). Wird daher fire-and-forget gestartet.
+    WhatsApp/iMessage unterstuetzen keinen Write-Back — die Apps
+    managen ihren Read-State intern.
+    """
+    if not sender_email and not subject:
+        return
+    sender_safe = (sender_email or "").replace('"', '\\"')
+    subject_safe = (subject or "").replace('"', '\\"')
+    read_bool = "true" if read else "false"
+    script = f'''
+    tell application "Mail"
+        repeat with acct in accounts
+            try
+                repeat with mbx in mailboxes of acct
+                    try
+                        set found to (every message of mbx whose sender contains "{sender_safe}" and subject is "{subject_safe}")
+                        repeat with m in found
+                            set read status of m to {read_bool}
+                        end repeat
+                    end try
+                end repeat
+            end try
+        end repeat
+    end tell
+    '''
+    try:
+        import subprocess as _sp
+        _sp.Popen(['osascript', '-e', script],
+                  stdout=_sp.DEVNULL, stderr=_sp.DEVNULL, start_new_session=True)
+    except Exception as e:
+        print(f"[APPLE-MAIL-WRITEBACK] Fehler: {e}")
+
+
 def _apple_mail_envelope_probe() -> dict:
     """Testet Zugriff auf Apple Mail Envelope-Index (SQLite). Wird fuer
     die echte Read-Status-Sync-Loesung benoetigt — aktuell nur Probe."""
@@ -12894,6 +12936,15 @@ def api_messages_mark_read():
     read = bool(data.get("read", True))
     if not mid:
         return jsonify({"ok": False, "error": "message_id required"}), 400
+    # Message-Details fuer Write-Back holen (vor dem State-Update)
+    target_msg = None
+    try:
+        for m in _msg_get_all():
+            if m.get("id") == mid:
+                target_msg = m
+                break
+    except Exception:
+        pass
     with _MSG_STATE_LOCK:
         state = _msg_load_state()
         read_list = state.get("read_messages", [])
@@ -12904,6 +12955,14 @@ def api_messages_mark_read():
             read_set.discard(mid)
         state["read_messages"] = sorted(read_set)
         _msg_save_state(state)
+    # Write-Back zur Quelle: nur E-Mail (WhatsApp/iMessage haben keine
+    # Schreib-API). Fire-and-forget, blockiert nicht.
+    if target_msg and target_msg.get("type") == "email":
+        _apple_mail_set_read_state_async(
+            target_msg.get("sender_address", ""),
+            target_msg.get("subject", ""),
+            read,
+        )
     return jsonify({"ok": True, "read": read, "message_id": mid})
 
 
@@ -12997,7 +13056,68 @@ def api_messages_bulk_mark_read():
             read_set -= target_ids
         state["read_messages"] = sorted(read_set)
         _msg_save_state(state)
+
+    # Write-Back zur Quelle (nur E-Mails). Alle ausgewaehlten E-Mail-
+    # Messages bekommen einen AppleScript-Write-Back. Bei sehr vielen
+    # Messages koennte das mehrere Sekunden dauern — wir bundeln sie in
+    # einem einzigen AppleScript-Aufruf, damit nicht N Subprozesse gestartet
+    # werden.
+    try:
+        email_targets = [m for m in (messages if 'messages' in dir() else _msg_get_all())
+                         if m["id"] in target_ids and m.get("type") == "email"]
+        if email_targets:
+            _apple_mail_bulk_set_read(email_targets, read)
+    except Exception as e:
+        print(f"[APPLE-MAIL-WRITEBACK bulk] Fehler: {e}")
+
     return jsonify({"ok": True, "read": read, "count": len(target_ids)})
+
+
+def _apple_mail_bulk_set_read(email_msgs, read: bool):
+    """Bulk-Write-Back: iteriert im AppleScript ueber alle Mailboxes
+    und setzt fuer jede Kombination (sender_email, subject) den
+    read-status. Fire-and-forget."""
+    if not email_msgs:
+        return
+    # Unique (sender, subject)-Paare
+    pairs = set()
+    for m in email_msgs:
+        se = (m.get("sender_address") or "").strip().replace('"', '\\"')
+        su = (m.get("subject") or "").strip().replace('"', '\\"')
+        if se or su:
+            pairs.add((se, su))
+    if not pairs:
+        return
+    # AppleScript mit Liste — iteriert einmal pro Mailbox, filtert dann
+    # pro Pair. Fuer grosse Dashboards (z.B. 1000 Messages) langsam,
+    # aber akzeptabel als Hintergrund-Job.
+    script_lines = ['tell application "Mail"']
+    script_lines.append('  repeat with acct in accounts')
+    script_lines.append('    try')
+    script_lines.append('      repeat with mbx in mailboxes of acct')
+    script_lines.append('        try')
+    for se, su in pairs:
+        read_bool = "true" if read else "false"
+        script_lines.append(
+            f'          try\n'
+            f'            set found to (every message of mbx whose sender contains "{se}" and subject is "{su}")\n'
+            f'            repeat with m in found\n'
+            f'              set read status of m to {read_bool}\n'
+            f'            end repeat\n'
+            f'          end try'
+        )
+    script_lines.append('        end try')
+    script_lines.append('      end repeat')
+    script_lines.append('    end try')
+    script_lines.append('  end repeat')
+    script_lines.append('end tell')
+    script = "\n".join(script_lines)
+    try:
+        import subprocess as _sp
+        _sp.Popen(['osascript', '-e', script],
+                  stdout=_sp.DEVNULL, stderr=_sp.DEVNULL, start_new_session=True)
+    except Exception as e:
+        print(f"[APPLE-MAIL-WRITEBACK bulk] Popen-Fehler: {e}")
 
 
 @app.route("/messages")
