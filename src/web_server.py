@@ -12867,6 +12867,18 @@ def api_messages():
     return jsonify({"ok": True, "messages": slim, "count": len(slim)})
 
 
+@app.route("/messages/view/<msg_id>")
+def messages_view(msg_id):
+    """Separates Preview-Fenster fuer eine einzelne Nachricht. Rendert
+    den Inhalt mit (a) HTML-Strip + Markdown-aehnlicher Formatierung,
+    (b) 'Mit Agent oeffnen'-Button-Leiste oben, (c) nativer Fenster-
+    Menuleiste (wird durch window.open mit menubar=yes gesteuert)."""
+    resp = make_response(_MSG_VIEW_HTML)
+    resp.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
+    resp.headers["Content-Type"] = "text/html; charset=utf-8"
+    return resp
+
+
 @app.route("/api/messages/<msg_id>")
 def api_messages_detail(msg_id):
     msg = _msg_find_by_id(msg_id)
@@ -13225,7 +13237,12 @@ _MSG_DASHBOARD_HTML = r"""<!DOCTYPE html>
       card.addEventListener('dblclick', function(){
         card._dblClicked = true;
         setTimeout(function(){ card._dblClicked = false; }, 400);
-        openAgentModal(m);
+        // Doppelklick oeffnet jetzt die Nachricht in einem SEPARATEN Fenster
+        // (Preview mit 'Mit Agent oeffnen'-Menuleiste), statt das alte
+        // Agent-Auswahl-Modal zu zeigen.
+        window.open('/messages/view/' + encodeURIComponent(m.id),
+                    'msgview_' + m.id,
+                    'width=900,height=700,menubar=yes,toolbar=no,resizable=yes,scrollbars=yes');
       });
       // Quick-Read-Toggle: stoppt Event-Propagation, damit Card nicht auch
       // noch expandiert.
@@ -13748,6 +13765,204 @@ _MSG_DASHBOARD_HTML = r"""<!DOCTYPE html>
 </body>
 </html>
 """
+
+# ── MESSAGE VIEW (separates Fenster fuer einzelne Nachricht) ─────────────────
+_MSG_VIEW_HTML = r"""<!DOCTYPE html>
+<html lang="de">
+<head>
+<meta charset="UTF-8">
+<title>Nachricht — AssistantDev</title>
+<style>
+* { box-sizing:border-box; margin:0; padding:0; }
+body { background:#0f0f1e; color:#e0e0e0; font-family:-apple-system,Inter,sans-serif; min-height:100vh; display:flex; flex-direction:column; }
+.mv-toolbar { background:#1a1a2e; border-bottom:1px solid #334; padding:12px 20px; display:flex; align-items:center; gap:12px; flex-wrap:wrap; }
+.mv-toolbar .mv-title { font-size:13px; color:#aaa; flex:1; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+.mv-btn { background:#2a2a4a; color:#d0d0e0; border:1px solid #445; padding:8px 14px; border-radius:6px; cursor:pointer; font-size:12px; font-weight:500; font-family:inherit; }
+.mv-btn:hover { background:#3a3a5a; border-color:#5a5a7a; color:#fff; }
+.mv-btn.primary { background:#1B6FD8; border-color:#1B6FD8; color:#fff; }
+.mv-btn.primary:hover { background:#2580e8; }
+.mv-content { flex:1; padding:20px 28px; overflow-y:auto; }
+.mv-meta { background:#1a1a2e; border:1px solid #334; border-radius:8px; padding:14px 18px; margin-bottom:18px; font-size:12px; line-height:1.7; }
+.mv-meta b { color:#f0c060; font-weight:600; margin-right:6px; }
+.mv-meta .mv-addr { font-family:ui-monospace,Menlo,monospace; color:#a0a0d0; font-size:11px; }
+.mv-body { background:#12121e; border:1px solid #2a2a3e; border-radius:8px; padding:20px 24px; font-size:13.5px; line-height:1.65; color:#e8e8f0; white-space:pre-wrap; overflow-wrap:anywhere; }
+.mv-body h1, .mv-body h2, .mv-body h3 { color:#f0c060; margin:14px 0 8px; }
+.mv-body a { color:#7ab8f5; }
+.mv-body p { margin:8px 0; }
+.mv-body ul, .mv-body ol { margin:8px 0; padding-left:24px; }
+.mv-body blockquote { border-left:3px solid #445; padding-left:14px; margin:10px 0; color:#a0a0b0; }
+.mv-body pre { background:#0a0a14; padding:10px 14px; border-radius:4px; overflow-x:auto; }
+.mv-body code { background:#1a1a2e; padding:1px 5px; border-radius:3px; font-family:ui-monospace,Menlo,monospace; font-size:12px; }
+.mv-body hr { border:none; border-top:1px solid #334; margin:14px 0; }
+.mv-agent-menu { position:absolute; background:#1d1d2e; border:1px solid #334; border-radius:6px; padding:4px 0; min-width:240px; z-index:100; box-shadow:0 4px 16px rgba(0,0,0,0.5); font-size:12px; display:none; }
+.mv-agent-menu.open { display:block; }
+.mv-agent-menu-item { padding:7px 14px; cursor:pointer; color:#e0e0e0; white-space:nowrap; }
+.mv-agent-menu-item:hover { background:#2a2a4a; color:#fff; }
+.mv-loading { text-align:center; color:#888; padding:40px; font-style:italic; }
+.mv-empty { color:#666; font-style:italic; }
+</style>
+</head>
+<body>
+<div class="mv-toolbar">
+  <div class="mv-title" id="mv-title">Nachricht wird geladen...</div>
+  <button class="mv-btn primary" id="mv-btn-open-agent">\u21A9\uFE0E Mit Agent oeffnen</button>
+  <button class="mv-btn" id="mv-btn-finder">\uD83D\uDCC2 Im Finder</button>
+  <button class="mv-btn" id="mv-btn-close" onclick="window.close()">Schliessen</button>
+</div>
+<div class="mv-content" id="mv-content">
+  <div class="mv-loading">Lade...</div>
+</div>
+<div id="mv-agent-menu" class="mv-agent-menu"></div>
+<script>
+function esc(s){ return String(s||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;'); }
+
+// HTML-Sanitizer + Markdown-Light-Renderer fuer den Body.
+// Rationale: Viele E-Mails sind HTML-formatiert; die naive Anzeige
+// zeigt Tags als Text. Wir strippen Scripts/Styles/Events und rendern
+// sicher. Plaintext-Mails mit Markdown-haften Zeichen (z.B. **bold**
+// oder URLs) werden leicht formatiert.
+function renderMessageBody(raw){
+  if (!raw) return '<div class="mv-empty">(leer)</div>';
+  var isHtml = /<(html|body|div|p|br|ul|ol|li|h[1-6]|table|a |span|strong|em|b |i )/i.test(raw);
+  if (isHtml) {
+    // Parser: DOMParser isoliert — wir extrahieren nur den body-Text mit
+    // erhaltener Struktur. Scripts/Styles werden entfernt.
+    var doc;
+    try {
+      doc = new DOMParser().parseFromString(raw, 'text/html');
+    } catch(e) { return '<pre>' + esc(raw) + '</pre>'; }
+    // Scripts, Styles, Event-Handler entfernen
+    doc.querySelectorAll('script, style, link, meta, iframe, object, embed').forEach(function(n){ n.remove(); });
+    // Inline-Events nuken
+    var walker = doc.createTreeWalker(doc.body || doc, NodeFilter.SHOW_ELEMENT, null);
+    var nodes = [];
+    while (walker.nextNode()) nodes.push(walker.currentNode);
+    nodes.forEach(function(el){
+      Array.from(el.attributes).forEach(function(a){
+        if (a.name.toLowerCase().startsWith('on') || a.name.toLowerCase() === 'style') el.removeAttribute(a.name);
+      });
+      // Links: target=_blank + rel
+      if (el.tagName === 'A' && el.getAttribute('href')) {
+        el.setAttribute('target', '_blank');
+        el.setAttribute('rel', 'noopener noreferrer');
+      }
+    });
+    return (doc.body ? doc.body.innerHTML : doc.documentElement.innerHTML) || esc(raw);
+  }
+  // Plaintext mit Light-Markdown
+  var html = esc(raw);
+  // Fett/Kursiv (einfach)
+  html = html.replace(/\*\*([^\*\n]+)\*\*/g, '<strong>$1</strong>');
+  html = html.replace(/\*([^\*\n]+)\*/g, '<em>$1</em>');
+  // URLs klickbar
+  html = html.replace(/(https?:\/\/[^\s<]+)/g, '<a href="$1" target="_blank" rel="noopener">$1</a>');
+  // --- als hr
+  html = html.replace(/^(---+|___+|\*\*\*+)$/gm, '<hr>');
+  return html;
+}
+
+function fmtDate(ts){
+  if (!ts) return '';
+  try { return new Date(ts).toLocaleString('de-DE', {dateStyle:'long', timeStyle:'short'}); }
+  catch(e) { return ts; }
+}
+
+var _msg = null;
+
+async function loadMessage(){
+  var id = decodeURIComponent(location.pathname.split('/').pop());
+  try {
+    var r = await fetch('/api/messages/' + encodeURIComponent(id));
+    var d = await r.json();
+    if (!d.ok || !d.message) {
+      document.getElementById('mv-content').innerHTML =
+        '<div style="color:#c66;padding:20px">Nachricht nicht gefunden: ' + esc(d.error || 'unbekannt') + '</div>';
+      return;
+    }
+    _msg = d.message;
+    var title = (_msg.subject || '(kein Betreff)') + ' — ' + (_msg.sender_name || '');
+    document.title = title.substring(0, 80);
+    document.getElementById('mv-title').textContent = title;
+    var meta =
+      '<div><b>Von:</b> ' + esc(_msg.sender_name || '') +
+        (_msg.sender_address ? ' <span class="mv-addr">&lt;' + esc(_msg.sender_address) + '&gt;</span>' : '') + '</div>' +
+      (_msg.to ? '<div><b>An:</b> ' + esc(_msg.to) + '</div>' : '') +
+      '<div><b>Datum:</b> ' + esc(fmtDate(_msg.timestamp)) + '</div>' +
+      '<div><b>Quelle:</b> ' + esc(_msg.source) + (_msg.is_junk ? ' <span style="color:#d09090">(Junk)</span>' : '') + '</div>' +
+      (_msg.message_id ? '<div><b>Message-ID:</b> <code style="font-size:10px;color:#888">' + esc(_msg.message_id) + '</code></div>' : '');
+    document.getElementById('mv-content').innerHTML =
+      '<div class="mv-meta">' + meta + '</div>' +
+      '<div class="mv-body" id="mv-body"></div>';
+    document.getElementById('mv-body').innerHTML = renderMessageBody(_msg.full_content || _msg.preview || '');
+  } catch(e) {
+    document.getElementById('mv-content').innerHTML =
+      '<div style="color:#c66;padding:20px">Fehler: ' + esc(e.message) + '</div>';
+  }
+}
+
+// 'Mit Agent oeffnen'-Button: Agent-Dropdown oeffnen + Session starten
+var _agentMenu = document.getElementById('mv-agent-menu');
+async function openAgentMenu(anchor){
+  _agentMenu.innerHTML = '<div class="mv-agent-menu-item" style="color:#888;font-size:10px;text-transform:uppercase;letter-spacing:1px;padding:6px 14px">Agent waehlen</div>';
+  try {
+    var r = await fetch('/agents');
+    var list = await r.json();
+    list.forEach(function(a){
+      var names = [{name:a.name, label:a.label||a.name}];
+      if (a.subagents) a.subagents.forEach(function(s){ names.push({name:s.name, label:(a.label||a.name)+' \u203a '+(s.label||s.name)}); });
+      names.forEach(function(n){
+        var d = document.createElement('div');
+        d.className = 'mv-agent-menu-item';
+        d.textContent = n.label;
+        d.onclick = function(){ _agentMenu.classList.remove('open'); openInAgent(n.name); };
+        _agentMenu.appendChild(d);
+      });
+    });
+  } catch(e) { _agentMenu.innerHTML = '<div style="padding:10px;color:#c66">Fehler: '+esc(e.message)+'</div>'; }
+  var rect = anchor.getBoundingClientRect();
+  _agentMenu.style.left = rect.left + 'px';
+  _agentMenu.style.top = (rect.bottom + 6) + 'px';
+  _agentMenu.classList.add('open');
+}
+
+// Agent-Chat-Fenster oeffnen mit Message als Preload-Context (bestehender
+// ?agent=&preload_message= Query-Parameter-Mechanismus im Haupt-UI)
+function openInAgent(agentName){
+  if (!_msg) return;
+  var url = '/?agent=' + encodeURIComponent(agentName) + '&preload_message=' + encodeURIComponent(_msg.id);
+  window.open(url, '_blank');
+}
+
+document.getElementById('mv-btn-open-agent').addEventListener('click', function(e){
+  e.stopPropagation();
+  if (_agentMenu.classList.contains('open')) _agentMenu.classList.remove('open');
+  else openAgentMenu(this);
+});
+
+document.getElementById('mv-btn-finder').addEventListener('click', async function(){
+  if (!_msg || !_msg.raw_file_path) { alert('Keine Datei-Referenz'); return; }
+  try {
+    await fetch('/open_in_finder', {method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({path: _msg.raw_file_path})});
+  } catch(e) { alert('Finder-Fehler: '+e.message); }
+});
+
+document.addEventListener('click', function(e){
+  if (!_agentMenu.contains(e.target) && e.target.id !== 'mv-btn-open-agent') _agentMenu.classList.remove('open');
+});
+
+// Tastatur: Escape schliesst Fenster, Cmd/Ctrl+W auch
+document.addEventListener('keydown', function(e){
+  if (e.key === 'Escape') window.close();
+  if ((e.metaKey || e.ctrlKey) && e.key === 'w') { e.preventDefault(); window.close(); }
+});
+
+loadMessage();
+</script>
+</body>
+</html>
+"""
+
 
 # ── ENDE MESSAGE DASHBOARD ───────────────────────────────────────────────────
 
