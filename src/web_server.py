@@ -7847,19 +7847,33 @@ def get_history():
             continue
         if fsize <= 50:
             continue
-        # Auto-title: extract first user message
-        title = ''
+        # Auto-title + Test-Artefakt-Check: extrahiere ALLE User-Messages.
+        # Wenn jede User-Message ein bekanntes Test-Muster ist UND die Datei
+        # klein ist, markieren wir sie als Test-Artefakt und blenden sie aus
+        # (der Server-Auto-Save erzeugt sonst UI-Rauschen aus der Test-Suite).
+        _HISTORY_TEST_PATTERNS = {
+            "Sag nur das Wort: TESTOK", "/find test",
+            "Antworte NUR mit: TEST_OK", "Say hello", "TEST", "test",
+        }
+        all_du = []
         try:
             with open(fpath, encoding='utf-8') as f:
                 for line in f:
                     if line.startswith('Du: '):
-                        title = line[4:].strip()[:60]
-                        break
+                        all_du.append(line[4:].strip())
         except Exception:
             pass
-        # Skip if no user message (test artifacts)
-        if not title:
+        # Skip if no user message (test artifacts / empty files)
+        if not all_du:
             continue
+        # Skip wenn alle User-Messages Test-Muster sind UND Datei klein
+        if fsize <= 3500 and all(m in _HISTORY_TEST_PATTERNS for m in all_du):
+            continue
+        # Titel: erste ECHTE (nicht-Test) User-Message bevorzugen — sonst
+        # erste Du-Zeile. So erscheinen gemischte Dateien mit dem sinnvollen
+        # Prompt als Label statt mit "/find test".
+        real_msgs = [m for m in all_du if m not in _HISTORY_TEST_PATTERNS]
+        title = (real_msgs[0] if real_msgs else all_du[0])[:60]
         # Sort key: file modification time (last save = most recent activity)
         try:
             mtime = os.path.getmtime(fpath)

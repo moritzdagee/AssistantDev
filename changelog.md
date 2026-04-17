@@ -6,6 +6,12 @@ Format: [Datum] Änderung | Datei | Grund
 
 ## 2026-04-16
 
+### Bug-Fix (Ergaenzung): Server-seitiger History-Filter + Titel aus echter Prompt
+- **Nach dem ersten Fix** (Cleanup-Skript + run_tests-Hook) entstanden weiterhin Test-Artefakte, weil die Auto-Save-Loop im Server noch **nach** dem Test-Cleanup-Scan Dateien schrieb (Race-Condition).
+- **Robusterer Fix in `src/web_server.py` `get_history`:** Filtert Dateien **zur Request-Zeit** aus, wenn (a) Dateigroesse ≤ 3500 Bytes UND (b) **alle** `Du:`-Zeilen exakt zu einer Test-Muster-Whitelist gehoeren (`TESTOK`, `/find test`, `TEST_OK`, `Say hello`, `TEST`, `test`). Timing-unabhaengig, wirkt auch auf existierende, nicht-aufgeraeumte Dateien.
+- **Titel-Polish:** `get_history` liest jetzt **alle** `Du:`-Zeilen einer Konversation und waehlt als Titel die erste **nicht-Test** Message. Gemischte Dateien (z.B. `/find test` + echter User-Prompt) erscheinen mit dem sinnvollen Prompt als Label statt mit `/find test`. Siehe Top-Position in Signicat jetzt: "Bitte lege dir jetzt eine Datei in deinem Working Memory an." statt "/find test".
+- **Ergebnis:** `/get_history?agent=signicat` liefert 49 Sessions, alle Top-15-Titel sind echte Nutzer-Prompts.
+
 ### Bug-Fix: Test-Artefakte ueberschatten echte Konversationen in der History-Sidebar
 - **Was der Nutzer beobachtete:** Im Signicat-Agent wurden die "letzten Konversationen" nicht angezeigt — die History-Sidebar war voll mit "Sag nur das Wort: TESTOK" und "/find test"-Eintraegen, echte Konversationen tauchten erst ganz unten auf.
 - **Ursache:** `tests/run_tests.py` nutzte `signicat` als Chat-Smoke-Test-Agent (z.B. `/chat` mit `message='/find test'` oder kleine "TESTOK"-Prompts, jeweils mit eigener Session). Dadurch entstanden bei jedem Test-Lauf 10–20 neue `konversation_*.txt`-Dateien im echten `signicat/`-Ordner. Akkumuliert: **214 Test-Artefakte in signicat** (von 395), 9 in `system ward`. Diese tauchten in `/get_history` vor den echten Konversationen auf, weil Auto-Save die mtime permanent aktualisierte.
