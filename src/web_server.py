@@ -11635,6 +11635,55 @@ _MSG_EMAIL_FIELD_RE = _msgd_re.compile(
     r'^(Von|An|From|To|Betreff|Subject|Datum|Date|Kontakt|Richtung|Agent|Importiert|Quelle|Kanal|Cc|Kopie|Message-ID|Reply-To):\s*(.*)$',
     _msgd_re.IGNORECASE,
 )
+
+# ─── Junk-Heuristik fuer Message Dashboard ─────────────────────────────────
+# Klassifiziert typische Newsletter/Bounce/Automatisiert-Mails als "junk".
+# Nutzer kann im Dashboard pro Spalte via Toggle "auch Junk anzeigen"
+# einblenden.
+_MSG_JUNK_SENDER_PATTERNS = (
+    'noreply', 'no-reply', 'no.reply', 'donotreply', 'do-not-reply',
+    'mailer-daemon', 'postmaster', 'bounce', 'bounces',
+    'newsletter', 'news@', 'notifications@', 'notify@', 'notification@',
+    'marketing', 'campaign', 'promotions', 'promo@', 'offers',
+    'mailings', 'broadcast', 'hello@mail', 'team@mail', 'info@mail',
+    '@email.', '@mail.', '@mailer.', '@newsletter.',
+)
+_MSG_JUNK_SUBJECT_KEYWORDS = (
+    'unsubscribe', 'abmelden', 'newsletter', 'weekly digest', 'daily digest',
+    'webinar', 'your weekly', 'your daily', 'black friday', 'cyber monday',
+    'exclusive offer', 'limited time', '% off', 'save now', 'sale ends',
+    'verification code', 'one-time code', 'otp', 'confirm your email',
+)
+_MSG_JUNK_BODY_SIGNALS = (
+    'click here to unsubscribe', 'to unsubscribe', 'abmelden', 'update your preferences',
+    'view in browser', 'in deinem browser anzeigen', 'view email in browser',
+)
+
+
+def _msg_is_junk(sender_email: str, subject: str, body_preview: str) -> bool:
+    """Einfache Punkt-Heuristik: ab Score >= 2 -> junk."""
+    score = 0
+    se = (sender_email or '').lower()
+    su = (subject or '').lower()
+    bp = (body_preview or '').lower()
+    for p in _MSG_JUNK_SENDER_PATTERNS:
+        if p in se:
+            score += 2
+            break
+    for p in _MSG_JUNK_SUBJECT_KEYWORDS:
+        if p in su:
+            score += 1
+            break
+    for p in _MSG_JUNK_BODY_SIGNALS:
+        if p in bp:
+            score += 2
+            break
+    # Zahl-dominanter Local-Part ("u123456@...") deutet auf automatisierten
+    # Mailversand hin.
+    local = se.split('@', 1)[0] if '@' in se else ''
+    if local and sum(c.isdigit() for c in local) >= max(4, len(local) // 2):
+        score += 1
+    return score >= 2
 _MSG_EMAIL_ADDR_RE = _msgd_re.compile(r'[\w.+%-]+@[\w.-]+\.[a-zA-Z]{2,}')
 _MSG_EMAIL_FILE_RE = _msgd_re.compile(r'^\d{4}-\d{2}-\d{2}_\d{2}-\d{2}-\d{2}_(IN|OUT)_.*\.txt$')
 _MSG_LEGACY_EMAIL_RE = _msgd_re.compile(r'^email_.*\.txt$', _msgd_re.IGNORECASE)
@@ -11815,6 +11864,7 @@ def _msg_normalize_email_content(fpath, fname, source_key, agent_name, only_head
         "raw_file_path": fpath,
         "message_id": fields.get("message-id", ""),
         "type": "email",
+        "is_junk": _msg_is_junk(sender_email, subject, preview),
     }
 
 
@@ -11902,6 +11952,7 @@ def _msg_normalize_whatsapp_file(fpath, fname, source_key, agent_name, only_head
         "raw_file_path": fpath,
         "message_id": "",
         "type": "whatsapp",
+        "is_junk": False,
     }
 
 
@@ -11953,6 +12004,7 @@ def _msg_normalize_chat_file(fpath, fname, source_key, agent_name, only_header=T
         "raw_file_path": fpath,
         "message_id": "",
         "type": "chat",
+        "is_junk": False,
     }
 
 
@@ -12400,10 +12452,12 @@ _MSG_DASHBOARD_HTML = r"""<!DOCTYPE html>
 <script>
 (function(){
   var BOARD = document.getElementById('md-board');
-  var STATE = { sources:[], messages:[], byId:{}, globalQuery:'', colQuery:{}, selectedForReply:null, onlyUnread:{} };
+  var STATE = { sources:[], messages:[], byId:{}, globalQuery:'', colQuery:{}, selectedForReply:null, onlyUnread:{}, showJunk:{} };
   try {
     var _saved = localStorage.getItem('md_only_unread');
     if (_saved) STATE.onlyUnread = JSON.parse(_saved) || {};
+    var _junk = localStorage.getItem('md_show_junk');
+    if (_junk) STATE.showJunk = JSON.parse(_junk) || {};
   } catch(e) {}
   var REFRESH_MS = 60000;
   var agentsCache = null;
@@ -12444,11 +12498,13 @@ _MSG_DASHBOARD_HTML = r"""<!DOCTYPE html>
   function filterForColumn(sourceKey){
     var q = (STATE.globalQuery || '').toLowerCase().trim();
     var qCol = (STATE.colQuery[sourceKey] || '').toLowerCase().trim();
-    // Per-Spalte Toggle 'nur ungelesen'. Per localStorage persistiert.
+    // Per-Spalte Toggles. Per localStorage persistiert.
     var onlyUnread = !!(STATE.onlyUnread && STATE.onlyUnread[sourceKey]);
+    var showJunk = !!(STATE.showJunk && STATE.showJunk[sourceKey]);
     return STATE.messages.filter(function(m){
       if (m.source !== sourceKey) return false;
       if (onlyUnread && m.read) return false;
+      if (!showJunk && m.is_junk) return false;
       var hay = (m.sender_name + ' ' + m.subject + ' ' + m.preview + ' ' + (m.sender_address||'')).toLowerCase();
       if (q && hay.indexOf(q) === -1) return false;
       if (qCol && hay.indexOf(qCol) === -1) return false;
@@ -12525,6 +12581,7 @@ _MSG_DASHBOARD_HTML = r"""<!DOCTYPE html>
       col.className = 'md-col';
       col.setAttribute('data-source', s.key);
       var onlyUnreadChecked = (STATE.onlyUnread && STATE.onlyUnread[s.key]) ? ' checked' : '';
+      var showJunkChecked = (STATE.showJunk && STATE.showJunk[s.key]) ? ' checked' : '';
       col.innerHTML =
         '<div class="md-col-hdr">' +
           '<div class="md-col-title">' +
@@ -12533,11 +12590,15 @@ _MSG_DASHBOARD_HTML = r"""<!DOCTYPE html>
             '<span class="md-col-unread" style="display:none"></span>' +
             '<span class="md-col-count">0 gesamt</span>' +
           '</div>' +
-          '<div class="md-col-controls" style="display:flex;gap:8px;align-items:center;margin-top:6px">' +
-            '<input class="md-col-search" type="text" placeholder="In dieser Spalte..." autocomplete="off" style="flex:1">' +
+          '<div class="md-col-controls" style="display:flex;gap:10px;align-items:center;margin-top:6px;flex-wrap:wrap">' +
+            '<input class="md-col-search" type="text" placeholder="In dieser Spalte..." autocomplete="off" style="flex:1;min-width:120px">' +
             '<label class="md-col-toggle" style="display:flex;align-items:center;gap:4px;font-size:11px;color:#aaa;cursor:pointer;white-space:nowrap">' +
               '<input type="checkbox" class="md-only-unread"' + onlyUnreadChecked + '>' +
               '<span>nur ungelesen</span>' +
+            '</label>' +
+            '<label class="md-col-toggle" style="display:flex;align-items:center;gap:4px;font-size:11px;color:#aaa;cursor:pointer;white-space:nowrap" title="Newsletter, automatische Mails, Bounces etc.">' +
+              '<input type="checkbox" class="md-show-junk"' + showJunkChecked + '>' +
+              '<span>auch Junk</span>' +
             '</label>' +
           '</div>' +
         '</div>' +
@@ -12552,6 +12613,14 @@ _MSG_DASHBOARD_HTML = r"""<!DOCTYPE html>
         if (!STATE.onlyUnread) STATE.onlyUnread = {};
         STATE.onlyUnread[s.key] = unreadChk.checked;
         try { localStorage.setItem('md_only_unread', JSON.stringify(STATE.onlyUnread)); } catch(e){}
+        renderColumnCards(col, s.key);
+        updateColumnHeaderCounts();
+      });
+      var junkChk = col.querySelector('.md-show-junk');
+      junkChk.addEventListener('change', function(){
+        if (!STATE.showJunk) STATE.showJunk = {};
+        STATE.showJunk[s.key] = junkChk.checked;
+        try { localStorage.setItem('md_show_junk', JSON.stringify(STATE.showJunk)); } catch(e){}
         renderColumnCards(col, s.key);
         updateColumnHeaderCounts();
       });
