@@ -1781,7 +1781,8 @@ test("KEINE WIEDERHOLUNG erwaehnt CREATE_EMAIL_REPLY",
 # API route responds
 try:
     r = requests.post(BASE_URL + "/send_email_reply", json={
-        "message_id": "", "to": "test@example.com", "subject": "Test", "body": "Test"
+        "message_id": "", "to": "test@example.com", "subject": "Test", "body": "Test",
+        "dry_run": True,  # oeffnet KEIN Apple-Mail-Fenster
     }, timeout=10)
     d = r.json()
     test("/send_email_reply Route antwortet", "ok" in d)

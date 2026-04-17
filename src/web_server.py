@@ -8342,7 +8342,12 @@ def send_email_draft_route():
     session_id = request.json.get('session_id', 'default') if request.is_json else 'default'
     state = get_session(session_id)
     try:
-        spec = request.json
+        spec = request.json or {}
+        # dry_run: Validiert Spec, ruft aber kein AppleScript auf → kein
+        # Apple-Mail-Fenster. Wird von Tests genutzt, damit nicht tausende
+        # Draft-Fenster aufpoppen.
+        if spec.get('dry_run'):
+            return jsonify({'ok': True, 'dry_run': True, 'subject': spec.get('subject',''), 'to': spec.get('to','')})
         send_email_draft(spec)
         return jsonify({'ok': True, 'subject': spec.get('subject',''), 'to': spec.get('to','')})
     except Exception as e:
@@ -8352,7 +8357,9 @@ def send_email_draft_route():
 @app.route('/send_email_reply', methods=['POST'])
 def send_email_reply_route():
     try:
-        spec = request.json
+        spec = request.json or {}
+        if spec.get('dry_run'):
+            return jsonify({'ok': True, 'dry_run': True, 'subject': spec.get('subject',''), 'to': spec.get('to','')})
         send_email_reply(spec)
         return jsonify({'ok': True, 'subject': spec.get('subject',''), 'to': spec.get('to','')})
     except Exception as e:
