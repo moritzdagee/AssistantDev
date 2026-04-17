@@ -6,6 +6,20 @@ Format: [Datum] Änderung | Datei | Grund
 
 ## 2026-04-16
 
+### Feature: iMessage-Integration (direkter Read-Only-Zugriff auf chat.db)
+- **Was der Nutzer wollte:** Nachdem Full-Disk-Access fuer den Server-Prozess erteilt wurde — iMessage-Nachrichten im Dashboard als eigene Spalte einbinden, analog zu WhatsApp.
+- **Umsetzung in `src/web_server.py`:**
+  - Neue Helper `_imsg_probe_access()` und `_imsg_load_messages(max_messages=2000)` lesen `~/Library/Messages/chat.db` read-only (`mode=ro&immutable=1`). Cache 60s.
+  - SQL-Join ueber `message`, `chat`, `handle`, `chat_message_join`. Felder: `text`, `is_from_me`, `date` (Apple-Nanosecond-Epoch), `handle.id`, `chat.display_name`, `chat.is_archived`.
+  - Eigene Nachrichten (`is_from_me=1`) werden uebersprungen — Dashboard zeigt nur eingehende.
+  - Binary-/RBM-Artefakte (`\ufffc`, `\ufffe`, `\ufeff`) werden aus dem Text gestrippt; leere Nachrichten rausgefiltert.
+  - `is_archived` aus der DB ins Message-Dict, damit der bestehende `auch Archiv`-Toggle auch fuer iMessage greift (aktuell keine archivierten).
+- **Neue Dashboard-Spalte:** `_MSG_SOURCES` um `imessage` erweitert (Gruppe `Messaging`, Icon `\U0001F4AC`). `_msg_scan_source` dispatcht fuer `type=='imessage'` zu `_imsg_load_messages()`.
+- **Neuer Endpoint `GET /api/probe-imessage`** — Diagnose ob der Server-Prozess FDA-Zugriff hat. Liefert `{ok: true, messages, chats, archived}` oder `{ok: false, reason}`.
+- **Live-Check:** 5929 messages + 788 chats in der DB. Dashboard zeigt aktuell 52 sinnvolle iMessages (Bank-Bestaetigungen, Business-SMS, Kontakt-Verifizierungen).
+- **Tests:** Suite 850/850 gruen.
+- **Feature-Branch:** `feature/imessage-integration`.
+
 ### Feature/UX: Dashboard Sidebar ausblenden + System Ward raus + WhatsApp Archiv-Flag
 - **Was der Nutzer wollte:**
   1. Wenn Dashboard-Tab aktiv ist: System-Prompt-Sidebar (links) und Chat-History sollen weg — im Posteingang braucht man das nicht, Dashboard soll volle Breite haben.

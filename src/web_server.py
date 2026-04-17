@@ -11676,6 +11676,7 @@ _MSG_SOURCES = [
     # "System Ward" existiert als Agent, hat aber keinen eigenen Mail-Inflow —
     # Spalte ausgeblendet (vorher sichtbar mit 0 gesamt).
     {"key": "whatsapp",             "label": "WhatsApp",                        "agent": None,             "icon": "\U0001F4F1", "type": "whatsapp", "group": "Messaging"},
+    {"key": "imessage",             "label": "iMessage",                        "agent": "privat",         "icon": "\U0001F4AC", "type": "imessage", "group": "Messaging"},
     {"key": "chat",                 "label": "Chat-Verlauf",                    "agent": None,             "icon": "\U0001F4AC", "type": "chat",     "group": "Messaging"},
 ]
 
@@ -11687,6 +11688,7 @@ _MSG_SOURCE_TO_AGENT = {
     "email_standard": "standard",
     "email_systemward": "system ward",
     "whatsapp": "privat",
+    "imessage": "privat",
     "chat": "standard",
 }
 
@@ -11717,6 +11719,125 @@ _MSG_JUNK_BODY_SIGNALS = (
     'click here to unsubscribe', 'to unsubscribe', 'abmelden', 'update your preferences',
     'view in browser', 'in deinem browser anzeigen', 'view email in browser',
 )
+
+
+# iMessage: Direkter Read-Only-Zugriff auf Apples chat.db. Braucht
+# Full-Disk-Access-Permission fuer den Server-Prozess. Cache 60s.
+_IMSG_DB_PATH = os.path.expanduser("~/Library/Messages/chat.db")
+_IMSG_CACHE = {"messages": None, "archived_chat_ids": set(), "ts": 0.0, "error": None}
+# Apple Core Data epoch: 2001-01-01 (nanoseconds in chat.db.date)
+_IMSG_APPLE_EPOCH = 978307200
+
+
+def _imsg_probe_access() -> dict:
+    """Testet ob chat.db lesbar ist. Liefert Diagnose-Dict."""
+    if not os.path.isfile(_IMSG_DB_PATH):
+        return {"ok": False, "reason": "chat.db existiert nicht"}
+    try:
+        import sqlite3 as _sq
+        conn = _sq.connect(f"file:{_IMSG_DB_PATH}?mode=ro&immutable=1", uri=True, timeout=2)
+        cur = conn.cursor()
+        cur.execute("SELECT COUNT(*) FROM message")
+        msg_cnt = cur.fetchone()[0]
+        cur.execute("SELECT COUNT(*) FROM chat")
+        chat_cnt = cur.fetchone()[0]
+        cur.execute("SELECT COUNT(*) FROM chat WHERE is_archived=1")
+        arch_cnt = cur.fetchone()[0]
+        conn.close()
+        return {"ok": True, "messages": msg_cnt, "chats": chat_cnt, "archived": arch_cnt}
+    except Exception as e:
+        return {"ok": False, "reason": str(e)}
+
+
+def _imsg_load_messages(max_messages=2000):
+    """Laedt die letzten iMessage-Nachrichten aus chat.db.
+
+    Gibt Liste im gleichen Schema wie andere Dashboard-Messages zurueck
+    (id, source='imessage', sender_name, subject, preview, timestamp, ...).
+    Cached 60s, um wiederholte SQLite-Queries zu vermeiden.
+    """
+    import time as _t
+    if _IMSG_CACHE["messages"] is not None and (_t.time() - _IMSG_CACHE["ts"]) < 60:
+        return _IMSG_CACHE["messages"], _IMSG_CACHE["archived_chat_ids"]
+    if not os.path.isfile(_IMSG_DB_PATH):
+        _IMSG_CACHE["messages"] = []
+        _IMSG_CACHE["archived_chat_ids"] = set()
+        _IMSG_CACHE["error"] = "chat.db existiert nicht"
+        return [], set()
+    try:
+        import sqlite3 as _sq
+        conn = _sq.connect(f"file:{_IMSG_DB_PATH}?mode=ro&immutable=1", uri=True, timeout=3)
+        cur = conn.cursor()
+        # Alle archivierten Chats
+        cur.execute("SELECT ROWID FROM chat WHERE is_archived=1")
+        archived = {r[0] for r in cur.fetchall()}
+        # Letzte N Messages; join zu handle (Gegenueber) + chat (display_name / archive)
+        cur.execute("""
+            SELECT
+                m.ROWID, m.text, m.is_from_me, m.date, h.id AS handle_id,
+                c.ROWID AS chat_rowid, c.display_name, c.is_archived
+            FROM message m
+            LEFT JOIN handle h ON h.ROWID = m.handle_id
+            LEFT JOIN chat_message_join cmj ON cmj.message_id = m.ROWID
+            LEFT JOIN chat c ON c.ROWID = cmj.chat_id
+            WHERE m.text IS NOT NULL AND m.text != ''
+            ORDER BY m.date DESC
+            LIMIT ?
+        """, (max_messages,))
+        out = []
+        import hashlib as _hl
+        for row in cur.fetchall():
+            mid, text, is_from_me, date_raw, handle_id, chat_rowid, display, is_arch = row
+            if is_from_me:  # eigene Nachrichten uebersprungen (analog Email)
+                continue
+            # chat.db.date ist nanosekunden seit Apple-Epoch (2001-01-01)
+            try:
+                ts_sec = _IMSG_APPLE_EPOCH + (date_raw / 1_000_000_000)
+                dt = datetime.datetime.fromtimestamp(ts_sec)
+            except Exception:
+                dt = datetime.datetime.now()
+            sender = display or handle_id or "iMessage"
+            txt = (text or "").strip()
+            # Binary- / Rich-Business-Messaging-Artefakte bereinigen
+            txt = txt.replace('\ufffc', '').replace('\ufffe', '').replace('\ufeff', '').strip()
+            if not txt:
+                continue  # leere/binary-Messages skippen
+            preview = " ".join(txt[:180].split())
+            if len(txt) > 180:
+                preview += "..."
+            out.append({
+                "id": _hl.sha1(f"imsg_{mid}".encode()).hexdigest()[:16],
+                "source": "imessage",
+                "source_agent": "privat",
+                "sender_name": sender[:150],
+                "sender_address": handle_id or "",
+                "to": "",
+                "subject": preview[:80] or "(leere Nachricht)",
+                "preview": preview,
+                "full_content": txt,
+                "timestamp": dt.isoformat(),
+                "timestamp_epoch": dt.timestamp(),
+                "read": False,
+                "has_attachments": False,
+                "attachments": [],
+                "raw_file_path": "",
+                "message_id": f"imsg:{mid}",
+                "type": "imessage",
+                "is_junk": False,
+                "is_archived": bool(is_arch),
+            })
+        conn.close()
+        _IMSG_CACHE["messages"] = out
+        _IMSG_CACHE["archived_chat_ids"] = archived
+        _IMSG_CACHE["ts"] = _t.time()
+        _IMSG_CACHE["error"] = None
+        return out, archived
+    except Exception as e:
+        _IMSG_CACHE["messages"] = []
+        _IMSG_CACHE["archived_chat_ids"] = set()
+        _IMSG_CACHE["error"] = str(e)
+        print(f"[iMessage] load fehlgeschlagen: {e}")
+        return [], set()
 
 
 # WhatsApp: archivierte Chats live aus der App-DB (ChatStorage.sqlite)
@@ -12286,6 +12407,9 @@ def _msg_scan_source(source):
         return _msg_scan_whatsapp_source(source)
     if stype == "chat":
         return _msg_scan_chat_source(source)
+    if stype == "imessage":
+        msgs, _arch = _imsg_load_messages()
+        return msgs
     return []
 
 
@@ -12344,6 +12468,13 @@ def _msg_find_by_id(msg_id):
     except Exception as e:
         print(f"[MSGD] full-load error: {e}", file=sys.stderr)
     return hit
+
+
+@app.route("/api/probe-imessage")
+def api_probe_imessage():
+    """Diagnose-Endpoint: testet Zugriff auf ~/Library/Messages/chat.db.
+    Liefert Grund des Fehlschlags, wenn FDA-Permission fehlt."""
+    return jsonify(_imsg_probe_access())
 
 
 @app.route("/api/messages/sources")
