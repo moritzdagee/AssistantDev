@@ -6,6 +6,25 @@ Format: [Datum] Änderung | Datei | Grund
 
 ## 2026-04-16
 
+### Feature: Message Dashboard komplett ueberarbeitet (Phasen 1-4)
+- **Was der Nutzer wollte:** Dashboard als erster Tab beim App-Start, Channel-basierte Gruppierung statt Agent-Zuordnung, Junk/Archiv-Filter mit Toggle, Sortierung juengste-zuerst, Toggle "nur ungelesen".
+- **Phase 1 — Sortierung + Unread-Toggle:**
+  - Einheitliche chronologische Sortierung (juengste Nachricht oben), kein Vorrang fuer Ungelesene mehr. Dafuer Toggle `[x] nur ungelesen` pro Spalte, per localStorage persistiert.
+- **Phase 2 — Junk-Filter:**
+  - `_msg_is_junk(sender, subject, preview)` klassifiziert per Heuristik: Absender-Patterns (noreply, newsletter, bounce, notifications, marketing), Subject-Keywords (unsubscribe, digest, webinar, sale), Body-Signale (unsubscribe-Link, 'view in browser'), plus zahl-dominanter Local-Part. Score-basiert (Threshold=2).
+  - Jede Nachricht bekommt `is_junk: true/false`. Default: Junk wird ausgeblendet. Toggle `[x] auch Junk` pro Spalte im Header.
+  - Live-Check: ~2% der Privat-Mails werden als Junk erkannt (Newsletter von H&M, BMW-Mailings, Product-Updates).
+- **Phase 3 — Channel-basierte Gruppierung:**
+  - Spalten-Labels sind jetzt die echten eigenen E-Mail-Adressen (`moritz.cremer@me.com`, `...@signicat.com`, `...@trustedcarrier.net`) statt generischer Agent-Namen. "Standard" bleibt als "uebrige E-Mails".
+  - Neues `group`-Feld pro Source (`E-Mail` / `Messaging`). Frontend rendert vertikale Gruppen-Divider mit rotierter Gruppen-Beschriftung.
+- **Phase 4 — Dashboard als Default-Tab:**
+  - Beim App-Start werden zwei Tabs erzeugt: ein pinned `📬 Posteingang`-Tab (Dashboard, type='dashboard') links, danach der Agent-Chat-Tab. Agent-Tab ist aktiv, Dashboard liegt daneben.
+  - Dashboard laedt `/messages` lazy in einem iframe beim ersten Klick — kein Init-Overhead beim Page-Load.
+  - `switchToTab` blendet Dashboard-iframe vs. `chat-area` um. Pinned Tabs haben kein Close-Button. CSS-Stile fuer pinned Tabs (unterschiedliche Farbe/Border).
+- **Tests:** Suite **850/850 gruen** durchgaengig ueber alle 4 Phasen. Ein bestehender Test angepasst ("Sort unread-first" -> "Sort juengste-zuerst + Unread-Toggle").
+- **Feature-Branches (in Reihenfolge):** `feature/dashboard-sort-unread-toggle`, `feature/dashboard-junk-archive-filter`, `feature/dashboard-channel-grouping`, `feature/dashboard-default-first-tab`.
+- **Nicht umgesetzt (bewusst):** iMessage-Integration (User hat gesagt "nicht so wichtig"). Archiv-Erkennung fuer Apple Mail und WhatsApp — Apple Mails archivierte Items werden vom Email-Watcher nicht importiert (schon gefiltert), fuer WhatsApp-Archiv haette man Zugriff auf die App-DB `is_archived`-Flag gebraucht.
+
 ### Feature: Kalender historisch + Kontakte in Access-Matrix + Dashboard-Button
 - **Was der Nutzer wollte:**
   1. Agents sollen auf **historische** Kalender-Daten zugreifen koennen (nicht nur zukuenftige).
