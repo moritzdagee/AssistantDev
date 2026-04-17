@@ -4703,7 +4703,7 @@ async function loadHistory(agentName) {
   var h = '';
   data.sessions.forEach(function(s, i) {
     _histSessions[s.file] = s;
-    h += '<button class="history-item' + (i===0?' active':'') + '" data-file="' + escHtml(s.file) + '" onclick="onHistoryClick(this)">';
+    h += '<button class="history-item' + (i===0?' active':'') + '" data-file="' + escHtml(s.file) + '" oncontextmenu="onHistoryContextMenu(event, this); return false;" onclick="onHistoryClick(this)">';
     h += '<span class="h-date">' + escHtml(s.date) + '</span>';
     h += '<span class="h-summary">' + escHtml(s.title || s.date) + '</span>';
     h += '</button>';
@@ -4714,6 +4714,102 @@ function onHistoryClick(btn) {
   var file = btn.getAttribute('data-file');
   var session = _histSessions[file];
   if (session) loadConversation(session, btn);
+}
+
+// ─── History Kontextmenu ──────────────────────────────────────────────────
+// Rechtsklick auf Konversation: Im Finder zeigen + Mit Agent oeffnen (Submenu)
+var _histCtxMenu = null;
+function _closeHistCtxMenu() {
+  if (_histCtxMenu) { _histCtxMenu.remove(); _histCtxMenu = null; }
+}
+async function onHistoryContextMenu(ev, btn) {
+  ev.preventDefault();
+  ev.stopPropagation();
+  _closeHistCtxMenu();
+  var file = btn.getAttribute('data-file');
+  var session = _histSessions[file];
+  if (!session) return;
+
+  var menu = document.createElement('div');
+  menu.className = 'hist-ctx-menu';
+  menu.style.cssText = 'position:fixed;background:#1d1d2e;border:1px solid #334;border-radius:6px;padding:4px 0;min-width:220px;z-index:10000;box-shadow:0 4px 16px rgba(0,0,0,0.5);font-size:12px;color:#e0e0e0';
+  function item(label, handler) {
+    var d = document.createElement('div');
+    d.style.cssText = 'padding:7px 14px;cursor:pointer';
+    d.textContent = label;
+    d.addEventListener('mouseenter', function(){ d.style.background = '#2a2a4a'; });
+    d.addEventListener('mouseleave', function(){ d.style.background = 'transparent'; });
+    d.addEventListener('click', function(){ _closeHistCtxMenu(); handler(); });
+    return d;
+  }
+  menu.appendChild(item(String.fromCodePoint(0x1F4C2) + ' Im Finder zeigen', async function(){
+    try {
+      var agentName = getAgentName();
+      await fetch('/open_in_finder', {method:'POST', headers:{'Content-Type':'application/json'},
+        body: JSON.stringify({agent: agentName, filename: file, kind: 'conversation'})});
+    } catch(e) { alert('Finder-Fehler: '+e.message); }
+  }));
+
+  // Submenu-Overschrift
+  var header = document.createElement('div');
+  header.style.cssText = 'padding:6px 14px 4px;color:#888;font-size:10px;text-transform:uppercase;letter-spacing:1px;border-top:1px solid #334;margin-top:4px';
+  header.textContent = 'Oeffnen mit Agent';
+  menu.appendChild(header);
+
+  // Agenten laden + als Menupunkte rendern
+  try {
+    var r = await fetch('/agents');
+    var agentList = await r.json();
+    var all = [];
+    agentList.forEach(function(a){
+      all.push({name: a.name, label: a.label || a.name});
+      if (a.subagents) a.subagents.forEach(function(s){ all.push({name: s.name, label: (a.label||a.name) + ' \u203a ' + (s.label||s.name)}); });
+    });
+    all.forEach(function(ag){
+      menu.appendChild(item('\u2192 ' + ag.label, function(){
+        loadConversationInAgent(session, ag.name);
+      }));
+    });
+  } catch(e) {
+    var err = document.createElement('div');
+    err.style.cssText = 'padding:6px 14px;color:#c66;font-size:11px';
+    err.textContent = 'Agent-Liste fehlgeschlagen: ' + e.message;
+    menu.appendChild(err);
+  }
+
+  document.body.appendChild(menu);
+  _histCtxMenu = menu;
+  // Positionieren (Viewport-aware)
+  var x = Math.min(ev.clientX, window.innerWidth - 260);
+  var y = Math.min(ev.clientY, window.innerHeight - menu.offsetHeight - 10);
+  menu.style.left = x + 'px';
+  menu.style.top = y + 'px';
+}
+document.addEventListener('click', function(e){
+  if (_histCtxMenu && !_histCtxMenu.contains(e.target)) _closeHistCtxMenu();
+});
+document.addEventListener('keydown', function(e){ if (e.key === 'Escape') _closeHistCtxMenu(); });
+
+// Laedt eine Konversation explizit in einem anderen Agent: wechselt
+// Agent via /select_agent und laedt dann das File. Erzeugt einen neuen
+// Tab, damit die aktuelle Konversation nicht ueberschrieben wird.
+async function loadConversationInAgent(session, targetAgentName) {
+  try {
+    var newTabId = addChatTab(targetAgentName);
+    var newTab = _tabs.find(function(t){ return t.id === newTabId; });
+    if (!newTab) return;
+    await fetch('/select_agent', {method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({agent: targetAgentName, session_id: newTab.sessionId})});
+    var r = await fetch('/load_conversation', {method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({agent: targetAgentName, file: session.file, session_id: newTab.sessionId, resume: true})});
+    var data = await r.json();
+    if (data.ok) {
+      document.getElementById('messages').innerHTML = '';
+      if (data.messages) data.messages.forEach(function(m){ addMessage(m.role, m.content, m.role==='assistant'?targetAgentName:null); });
+    } else {
+      alert('Konversation laden fehlgeschlagen: ' + (data.error || 'unbekannt'));
+    }
+  } catch(e) { alert('Fehler: ' + e.message); }
 }
 
 async function loadConversation(session, btn) {
@@ -8083,7 +8179,13 @@ def open_in_finder():
     agent = body.get('agent', '')
     filename = body.get('filename', '')
     direct_path = body.get('path', '')
-    memory_dir = os.path.join(BASE, agent, 'memory') if agent else ''
+    kind = body.get('kind', 'memory')  # 'memory' | 'conversation'
+    # Konversations-Files liegen im Parent-Agent-Root, nicht im memory/
+    # Subfolder. Bei kind='conversation' nutzen wir get_agent_speicher().
+    if kind == 'conversation' and agent:
+        memory_dir = get_agent_speicher(agent)
+    else:
+        memory_dir = os.path.join(BASE, agent, 'memory') if agent else ''
     try:
         # Direkter Pfad (z.B. aus Message-Dashboard) — nur zulassen wenn er
         # innerhalb BASE liegt, damit die Route nicht zum allgemeinen
