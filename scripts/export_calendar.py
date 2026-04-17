@@ -356,8 +356,10 @@ def install_memory_links(summary_path: Path) -> list[str]:
 # ---------------------------------------------------------------------------
 def main():
     ap = argparse.ArgumentParser(description="Exportiert macOS Kalender in Data Lake")
-    ap.add_argument("--days-back", type=int, default=30)
-    ap.add_argument("--days-forward", type=int, default=180)
+    # Default: 5 Jahre rueckwaerts + 1 Jahr vorwaerts. Agents sollen historisch
+    # suchen koennen (Meetings im letzten Quartal, wer war auf Konferenz XY, ...).
+    ap.add_argument("--days-back", type=int, default=1825)
+    ap.add_argument("--days-forward", type=int, default=365)
     ap.add_argument("--calendars", default="",
                     help="Kommagetrennte Liste, default: alle")
     ap.add_argument("--output-dir", default=str(DEFAULT_OUTPUT_DIR))

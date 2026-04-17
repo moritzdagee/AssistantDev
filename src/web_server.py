@@ -2893,15 +2893,50 @@ def _parse_applescript_date(s):
     return None
 
 
-def format_calendar_context(events, max_items=15):
-    """Formatiert Events als Kontext-Block fuer den System-Prompt."""
+def format_calendar_context(events, max_items=40):
+    """Formatiert Events als Kontext-Block fuer den System-Prompt.
+
+    Priorisiert Events um 'jetzt' (letzte 14 Tage + kommende 14 Tage werden
+    komplett gelistet, weitere historische Events nur als kompakte Summary
+    mit Count), damit Agents Alltagsfragen beantworten koennen, aber auch
+    wissen, dass historische Daten per MEMORY_SEARCH auffindbar sind.
+    """
     if not events:
         return ""
-    lines = ["--- KALENDER (kommende Termine) ---"]
-    for e in events[:max_items]:
+    import datetime as _cal_dt
+    now = _cal_dt.datetime.now()
+    window_past = now - _cal_dt.timedelta(days=14)
+    window_future = now + _cal_dt.timedelta(days=14)
+
+    def _parse_start(ev):
+        s = ev.get('start', '')
+        if not s:
+            return None
+        try:
+            s2 = s.split('+')[0].split('Z')[0]
+            return _cal_dt.datetime.fromisoformat(s2)
+        except Exception:
+            return None
+
+    near, past, future = [], [], []
+    for e in events:
+        st = _parse_start(e)
+        if st is None:
+            continue
+        if window_past <= st <= window_future:
+            near.append(e)
+        elif st < window_past:
+            past.append(e)
+        else:
+            future.append(e)
+    near.sort(key=_parse_start)
+
+    lines = ["--- KALENDER ---"]
+    lines.append(f"Zeitfenster heute \u00b114 Tage ({len(near)} Events), dazu historisch: {len(past)}, zukuenftig jenseits 14 Tage: {len(future)}.")
+    for e in near[:max_items]:
         start = e.get('start', '')
         title = e.get('title', '')
-        cal = e.get('calendar_name', '')
+        cal = e.get('calendar_name') or e.get('calendar') or ''
         loc = e.get('location', '')
         ad = ' (ganztaegig)' if e.get('all_day') else ''
         line = f"[{start}] {title}{ad}"
@@ -2910,8 +2945,30 @@ def format_calendar_context(events, max_items=15):
         if loc:
             line += f" | Ort: {loc}"
         lines.append(line)
+    if len(near) > max_items:
+        lines.append(f"... {len(near) - max_items} weitere Events im Fenster. Fuer aeltere/spezifische: MEMORY_SEARCH mit Suchbegriff.")
     lines.append("--- ENDE KALENDER ---")
     return "\n".join(lines)
+
+
+def load_calendar_from_export():
+    """Liest `calendar/calendar_events.json` (vom export_calendar.py LaunchAgent
+    taeglich geschrieben). Gibt Liste von Events zurueck, oder leere Liste.
+
+    Deckt historisches Fenster komplett ab (default: 5 Jahre rueckwaerts +
+    1 Jahr vorwaerts), ohne auf AppleScript angewiesen zu sein.
+    """
+    path = os.path.join(BASE, 'calendar', 'calendar_events.json')
+    if not os.path.isfile(path):
+        return []
+    try:
+        with open(path, 'r', encoding='utf-8') as f:
+            data = json.load(f)
+        events = data.get('events') if isinstance(data, dict) else data
+        return events if isinstance(events, list) else []
+    except Exception as e:
+        print(f'[CALENDAR] export lesen fehlgeschlagen: {e}')
+        return []
 
 
 # ─── STATE (SESSION-BASED) ─────────────────────────────────────────────────────
@@ -3701,6 +3758,7 @@ HTML = """<!DOCTYPE html>
   <button id="prompt-btn" onclick="toggleSidebar()">☰ Prompt <span class="shortcut-label">[P]</span></button>
   <div id="header-spacer" style="flex:1;"></div><!-- AGENT_BTN_V1 -->
   <button class="hdr-btn" onclick="newSession()" style="background:#2a3a2a;border-color:#4a6a4a;color:#a0d090;">+ Neu <span class="shortcut-label">[N]</span></button>
+  <button class="hdr-btn" onclick="openMessageDashboard()" style="background:#2a2a4a;border-color:#4a4a6a;color:#a0a0d0;" title="Message Dashboard (E-Mail / WhatsApp / Chat)">&#128236; Posteingang</button>
   <button id="agent-btn" class="hdr-btn" data-tooltip-kind="agent" onclick="showAgentModal()"><span id="agent-label">Kein Agent</span> <span class="shortcut-label">[A]</span></button>
   <select id="provider-select" class="hdr-select" onchange="onProviderChange()">
     <option>Anthropic</option>
@@ -4462,6 +4520,18 @@ function navigateTo(path) {
   document.getElementById('nav-menu').classList.remove('open');
   document.querySelector('.nav-btn').classList.remove('active');
   window.location.href = path;
+}
+
+// Direkter Button in der Header-Leiste: oeffnet Message Dashboard als
+// native Fenster-Instanz (falls pywebview) oder in neuem Browser-Tab.
+function openMessageDashboard() {
+  try {
+    // pywebview (AssistantDev.app) oeffnet /messages in eigenem Window —
+    // bestehender Handler in app.py/dashboard_window.py kennt die Route.
+    window.open('/messages', '_blank');
+  } catch(e) {
+    window.location.href = '/messages';
+  }
 }
 async function loadServices() {
   try {
@@ -7238,10 +7308,11 @@ ACCESS_CONTROL_FILE = os.path.join(BASE, "config", "access_control.json")
 # Built-in shared sources (nicht entfernbar). Pfade relativ zu BASE, soweit
 # sinnvoll — whatsapp haengt als ordnerbasierte Quelle im privat-Memory.
 BUILTIN_SHARED_SOURCES = [
-    {"key": "email_inbox",    "label": "E-Mail Inbox",    "icon": "\u2709",      "path": os.path.join(BASE, "email_inbox")},
+    {"key": "email_inbox",    "label": "E-Mail Archiv",   "icon": "\u2709",      "path": os.path.join(BASE, "email_inbox")},
     {"key": "webclips",       "label": "Webclips",        "icon": "\U0001F310",  "path": os.path.join(BASE, "webclips")},
     {"key": "calendar",       "label": "Kalender",        "icon": "\U0001F4C5",  "path": os.path.join(BASE, "calendar")},
-    {"key": "working_memory", "label": "Working Memory",  "icon": "\U0001F9E0",  "path": ""},   # pro Agent, kein globaler Pfad
+    {"key": "contacts",       "label": "Kontakte",        "icon": "\U0001F464",  "path": os.path.join(BASE, "privat", "memory", "contacts.json")},
+    {"key": "working_memory", "label": "Working Memory",  "icon": "\U0001F9E0",  "path": ""},
     {"key": "whatsapp",       "label": "WhatsApp Chats",  "icon": "\U0001F4AC",  "path": os.path.join(BASE, "privat", "memory", "whatsapp")},
 ]
 
@@ -7345,6 +7416,33 @@ def _source_status(path: str, key: str = "") -> dict:
             return {"exists": True, "count": cnt, "unit": "Events"}
         except Exception:
             return {"exists": True, "count": 0}
+    if key == "contacts":
+        # Kontakte liegen pro Agent-Memory als contacts.json. Wir summieren
+        # eindeutige Kontakte (per E-Mail-Adresse) ueber alle Agenten, damit
+        # die Anzeige die "globale" Kontakt-Datenbank widerspiegelt.
+        seen_keys = set()
+        try:
+            for entry in os.listdir(BASE):
+                cp = os.path.join(BASE, entry, 'memory', 'contacts.json')
+                if not os.path.isfile(cp):
+                    continue
+                try:
+                    with open(cp, 'r', encoding='utf-8') as f:
+                        data = json.load(f)
+                    items = data if isinstance(data, list) else (
+                        data.get('contacts') if isinstance(data, dict) else []
+                    )
+                    for c in (items or []):
+                        if not isinstance(c, dict):
+                            continue
+                        k = (c.get('email') or c.get('name') or '').strip().lower()
+                        if k:
+                            seen_keys.add(k)
+                except Exception:
+                    continue
+        except OSError:
+            return {"exists": False, "count": 0}
+        return {"exists": bool(seen_keys), "count": len(seen_keys), "unit": "Kontakte"}
     if not path:
         return {"exists": False, "count": 0}
     try:
@@ -7365,7 +7463,7 @@ def api_access_control_get():
     for src in BUILTIN_SHARED_SOURCES:
         entry = dict(src)
         entry['builtin'] = True
-        if src['key'] in ('email_inbox', 'webclips', 'calendar'):
+        if src['key'] in ('email_inbox', 'webclips', 'calendar', 'contacts'):
             entry['status'] = _source_status(src['path'], key=src['key'])
         elif src['path']:
             entry['status'] = _source_status(src['path'])
@@ -9027,7 +9125,14 @@ def process_single_message(msg, kontext_override=None, state=None, **kwargs):
     # CALENDAR_INTEGRATION_V1: Automatisch Kalender-Daten injizieren wenn Intent erkannt
     if _has_calendar_intent(msg):
         try:
-            _cal_events, _cal_cals, _cal_err = get_calendar_events(days_back=1, days_ahead=7)
+            # Historisches Fenster: Agents sollen vergangene Termine/Meetings
+            # finden koennen. Wir lesen aus `calendar/calendar_events.json`
+            # (taeglich via LaunchAgent exportiert, 5 Jahre rueckwaerts +
+            # 1 Jahr vorwaerts) statt AppleScript bei jedem Chat-Request —
+            # das ist schnell und deckt das volle Fenster ab.
+            _cal_events = load_calendar_from_export()
+            _cal_cals = set()
+            _cal_err = None if _cal_events else 'calendar_events.json leer oder fehlt'
             if _cal_events:
                 _cal_ctx = format_calendar_context(_cal_events)
                 full_text = full_text + '\n\n' + _cal_ctx

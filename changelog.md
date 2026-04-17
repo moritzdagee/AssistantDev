@@ -6,6 +6,24 @@ Format: [Datum] Änderung | Datei | Grund
 
 ## 2026-04-16
 
+### Feature: Kalender historisch + Kontakte in Access-Matrix + Dashboard-Button
+- **Was der Nutzer wollte:**
+  1. Agents sollen auf **historische** Kalender-Daten zugreifen koennen (nicht nur zukuenftige).
+  2. **Kontakte** als neue Zeile in der Access-Matrix konfigurierbar, pro Agent freigebbar.
+  3. **Message Dashboard** direkt aus der Haupt-UI erreichbar (kleiner Button).
+- **Fix Teil 1 — Calendar historisch:**
+  - `scripts/export_calendar.py`: default `--days-back` von **30 auf 1825** Tage (5 Jahre rueckwaerts), `--days-forward` von 180 auf 365 (1 Jahr vorwaerts). Taeglicher LaunchAgent-Export deckt jetzt das volle Fenster ab.
+  - `src/web_server.py`: Auto-Inject in `process_single_message()` nutzt jetzt die **exportierte JSON** (`load_calendar_from_export()`) statt AppleScript pro Request. Vorher: `days_back=1, days_ahead=7` (nur "morgen"). Jetzt: komplettes Export-Fenster, ohne AppleScript-Roundtrip (schneller).
+  - `format_calendar_context()` umgeschrieben: priorisiert Events in "heute \u00b114 Tage"-Fenster, zeigt bis zu 40, summiert aeltere/spaetere als Count + MEMORY_SEARCH-Hinweis. Skaliert damit auf 1000+ Events sauber.
+- **Fix Teil 2 — Kontakte als Access-Control-Row:**
+  - `BUILTIN_SHARED_SOURCES` erweitert um `contacts` (Pfad: `privat/memory/contacts.json` als Referenz, Zaehlung aggregiert ueber alle Agent-contacts.json Dateien, deduped per E-Mail/Name). Status-Unit: `Kontakte`.
+  - `access_control.json`: `contacts` und `calendar` in `shared_memory` fuer **alle 8 Agenten** aktiviert.
+- **Fix Teil 3 — Dashboard-Button:**
+  - Neuer Header-Button `📬 Posteingang` (neben `+ Neu`) oeffnet `/messages` in neuem Fenster/Tab. Zusaetzlich zum bereits existierenden Nav-Menu-Eintrag, sodass der Nutzer ohne Menu-Klick zum Dashboard kommt.
+- **Re-Export getriggert:** `export_calendar.py` laeuft im Hintergrund (~30-60s) und schreibt die erweiterte JSON.
+- **Tests:** Suite **849/849 gruen**.
+- **Feature-Branch:** `feature/access-matrix-calendar-contacts`.
+
 ### Feature/Fix: Shared-Data-Quellen — echte Zahlen + klare Beschriftung + Dashboard-Link
 - **Was der Nutzer beobachtete:**
   1. "Webclips: 0 Dateien" — obwohl Chrome-Clipper regelmaessig Clips speichert (29 tatsaechlich vorhanden).
