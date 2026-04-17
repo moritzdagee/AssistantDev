@@ -11736,9 +11736,17 @@ _IMSG_APPLE_EPOCH = 978307200
 
 
 def _imsg_probe_access() -> dict:
-    """Testet ob chat.db lesbar ist. Liefert Diagnose-Dict."""
+    """Testet ob chat.db lesbar ist. Liefert erweiterte Diagnose inkl.
+    Server-Binary-Pfad, damit der Nutzer genau weiss welchen Eintrag er
+    in Systemeinstellungen -> FDA setzen muss."""
+    import sys as _sys
+    info = {
+        "binary": _sys.executable,
+        "pid": os.getpid(),
+        "ppid": os.getppid(),
+    }
     if not os.path.isfile(_IMSG_DB_PATH):
-        return {"ok": False, "reason": "chat.db existiert nicht"}
+        return dict(info, ok=False, reason="chat.db existiert nicht")
     try:
         import sqlite3 as _sq
         conn = _sq.connect(f"file:{_IMSG_DB_PATH}?mode=ro&immutable=1", uri=True, timeout=2)
@@ -11750,9 +11758,31 @@ def _imsg_probe_access() -> dict:
         cur.execute("SELECT COUNT(*) FROM chat WHERE is_archived=1")
         arch_cnt = cur.fetchone()[0]
         conn.close()
-        return {"ok": True, "messages": msg_cnt, "chats": chat_cnt, "archived": arch_cnt}
+        return dict(info, ok=True, messages=msg_cnt, chats=chat_cnt, archived=arch_cnt)
     except Exception as e:
-        return {"ok": False, "reason": str(e)}
+        return dict(info, ok=False, reason=str(e))
+
+
+def _apple_mail_envelope_probe() -> dict:
+    """Testet Zugriff auf Apple Mail Envelope-Index (SQLite). Wird fuer
+    die echte Read-Status-Sync-Loesung benoetigt — aktuell nur Probe."""
+    import glob as _gl
+    paths = sorted(_gl.glob(os.path.expanduser("~/Library/Mail/V*/MailData/Envelope Index")))
+    if not paths:
+        return {"ok": False, "reason": "Envelope-Index nicht gefunden"}
+    p = paths[-1]
+    try:
+        import sqlite3 as _sq
+        conn = _sq.connect(f"file:{p}?mode=ro&immutable=1", uri=True, timeout=2)
+        cur = conn.cursor()
+        cur.execute("SELECT COUNT(*) FROM messages")
+        total = cur.fetchone()[0]
+        cur.execute("SELECT COUNT(*) FROM messages WHERE read=0")
+        unread = cur.fetchone()[0]
+        conn.close()
+        return {"ok": True, "path": p, "messages": total, "unread": unread}
+    except Exception as e:
+        return {"ok": False, "path": p, "reason": str(e)}
 
 
 def _imsg_load_messages(max_messages=2000):
@@ -12483,6 +12513,17 @@ def api_probe_imessage():
     return jsonify(_imsg_probe_access())
 
 
+@app.route("/api/probe-fda")
+def api_probe_fda():
+    """Kombinierter FDA-Status-Check: iMessage-DB + Apple Mail Envelope-
+    Index. Zeigt exakten Binary-Pfad des Server-Prozesses, damit der
+    Nutzer den korrekten Eintrag in Systemeinstellungen setzen kann."""
+    return jsonify({
+        "imessage": _imsg_probe_access(),
+        "apple_mail": _apple_mail_envelope_probe(),
+    })
+
+
 @app.route("/api/messages/sources")
 def api_messages_sources():
     """Liefert Liste aller Quellen inkl. Counts + Unread.
@@ -12574,6 +12615,47 @@ def api_messages_mark_read():
     return jsonify({"ok": True, "read": read, "message_id": mid})
 
 
+@app.route("/api/messages/bulk-mark-read", methods=["POST"])
+def api_messages_bulk_mark_read():
+    """Markiert mehrere Messages in einem Schwung als gelesen/ungelesen.
+    Body: {ids: [str, ...], read: bool} ODER
+          {source: str, read: bool}     (ganze Spalte)
+          {all: true, read: true}        (alle Mails markieren)
+    """
+    data = request.get_json(silent=True) or {}
+    read = bool(data.get("read", True))
+    ids = data.get("ids")
+    source = data.get("source")
+    mark_all = bool(data.get("all", False))
+
+    # Ziel-Menge an Message-IDs bestimmen
+    target_ids = set()
+    if ids and isinstance(ids, list):
+        target_ids = {str(i).strip() for i in ids if i}
+    elif source or mark_all:
+        # Alle aktuellen Messages laden und filtern
+        try:
+            messages = _msg_get_all()
+        except Exception as e:
+            return jsonify({"ok": False, "error": str(e)}), 500
+        for m in messages:
+            if mark_all or m.get("source") == source:
+                target_ids.add(m["id"])
+    if not target_ids:
+        return jsonify({"ok": False, "error": "Keine IDs zum Markieren"}), 400
+
+    with _MSG_STATE_LOCK:
+        state = _msg_load_state()
+        read_set = set(state.get("read_messages", []))
+        if read:
+            read_set |= target_ids
+        else:
+            read_set -= target_ids
+        state["read_messages"] = sorted(read_set)
+        _msg_save_state(state)
+    return jsonify({"ok": True, "read": read, "count": len(target_ids)})
+
+
 @app.route("/messages")
 def messages_page():
     resp = make_response(_MSG_DASHBOARD_HTML)
@@ -12634,6 +12716,9 @@ _MSG_DASHBOARD_HTML = r"""<!DOCTYPE html>
   .md-card.unread .md-card-quickread { color:#f0c060; }
   .md-card.keyboard-active { box-shadow:0 0 0 2px #4a8aca; }
   .md-card.keyboard-active.unread { box-shadow:0 0 0 2px #f0c060; }
+  .md-card.selected { background:#1e2a4a; border-color:#4a8aca; }
+  .md-card.selected.unread { background:#2a2a4a; border-color:#6a9ada; }
+  .md-card.selected::before { content:'\2713'; position:absolute; top:8px; right:10px; color:#4a8aca; font-weight:700; font-size:14px; }
   .md-card-subject { font-size:11.5px; color:#c9c9c9; margin-bottom:3px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
   .md-card.unread .md-card-subject { color:#e8e8e8; font-weight:600; }
   .md-card-preview { font-size:10.5px; color:#777; line-height:1.45; display:-webkit-box; -webkit-line-clamp:2; -webkit-box-orient:vertical; overflow:hidden; }
@@ -12678,6 +12763,7 @@ _MSG_DASHBOARD_HTML = r"""<!DOCTYPE html>
   <h1>📬 Posteingang</h1>
   <input id="md-search" type="text" placeholder="Alle Spalten durchsuchen..." autocomplete="off">
   <span class="md-hdr-stat" id="md-stat-text">Lade...</span>
+  <button class="md-hdr-btn" id="md-btn-mark-all-read" title="Alle sichtbaren Nachrichten in allen Spalten als gelesen markieren">\u2713 Alle gelesen</button>
   <button class="md-hdr-btn" id="md-btn-refresh">Aktualisieren</button>
   <button class="md-hdr-btn" onclick="location.href='/'">&larr; Chat</button>
 </div>
@@ -13132,8 +13218,36 @@ _MSG_DASHBOARD_HTML = r"""<!DOCTYPE html>
     }
   }
 
+  // ─── Multi-Select-State ─────────────────────────────────────────────────
+  // STATE.selectedIds: Set der markierten Message-IDs (pro Session).
+  // Shift+Arrow erweitert die Selektion um die nachsten Cards.
+  STATE.selectedIds = new Set();
+
+  function _syncSelectionClasses(){
+    document.querySelectorAll('.md-card.selected').forEach(function(c){
+      if (!STATE.selectedIds.has(c.getAttribute('data-id'))) c.classList.remove('selected');
+    });
+    STATE.selectedIds.forEach(function(id){
+      var card = document.querySelector('.md-card[data-id="' + CSS.escape(id) + '"]');
+      if (card) card.classList.add('selected');
+    });
+  }
+
+  function _clearSelection(){
+    STATE.selectedIds.clear();
+    document.querySelectorAll('.md-card.selected').forEach(function(c){
+      c.classList.remove('selected');
+    });
+  }
+
+  function _toggleSelect(card){
+    var id = card.getAttribute('data-id');
+    if (!id) return;
+    if (STATE.selectedIds.has(id)) { STATE.selectedIds.delete(id); card.classList.remove('selected'); }
+    else { STATE.selectedIds.add(id); card.classList.add('selected'); }
+  }
+
   document.addEventListener('keydown', function(e){
-    // Nur wenn kein Input-Feld den Fokus hat
     var tag = (e.target && e.target.tagName || '').toLowerCase();
     if (tag === 'input' || tag === 'textarea' || e.target.isContentEditable) return;
 
@@ -13145,7 +13259,6 @@ _MSG_DASHBOARD_HTML = r"""<!DOCTYPE html>
 
     var activeCard = _activeCardEl();
     if (!activeCard || !_activeColSourceKey) {
-      // Keine aktive Spalte? — nehme erste sichtbare Spalte mit Karten.
       for (var i = 0; i < STATE.sources.length; i++) {
         var sk = STATE.sources[i].key;
         if (_allCardsInCol(sk).length) { _setKeyboardActive(sk, 0); return; }
@@ -13154,11 +13267,29 @@ _MSG_DASHBOARD_HTML = r"""<!DOCTYPE html>
     }
     var cards = _allCardsInCol(_activeColSourceKey);
     var curIdx = cards.indexOf(activeCard);
-    _setKeyboardActive(_activeColSourceKey, curIdx + (isDown ? 1 : -1));
+    var newIdx = curIdx + (isDown ? 1 : -1);
+    if (newIdx < 0 || newIdx >= cards.length) return;
+
+    if (e.shiftKey) {
+      // Shift+Arrow: Selektion erweitern. Die aktuelle Card wird
+      // selektiert (falls noch nicht), dann auch die naechste.
+      STATE.selectedIds.add(activeCard.getAttribute('data-id'));
+      activeCard.classList.add('selected');
+      var target = cards[newIdx];
+      STATE.selectedIds.add(target.getAttribute('data-id'));
+      target.classList.add('selected');
+      // Keyboard-active setzen OHNE expand (wuerde Multi-Select-Flow stoeren)
+      document.querySelectorAll('.md-card.keyboard-active').forEach(function(c){ c.classList.remove('keyboard-active'); });
+      target.classList.add('keyboard-active');
+      try { target.scrollIntoView({block:'nearest', behavior:'smooth'}); } catch(err){}
+    } else {
+      // Ohne Shift: normale Navigation mit Expand + mark-read, Selektion leeren.
+      if (STATE.selectedIds.size) _clearSelection();
+      _setKeyboardActive(_activeColSourceKey, newIdx);
+    }
   });
 
-  // Klick auf eine Card aktiviert auch Keyboard-Nav-State — so weiss das
-  // System, wo der Nutzer weiternavigieren will.
+  // Klick auf Card setzt aktive Spalte. Shift+Klick fuer Multi-Select.
   BOARD.addEventListener('click', function(e){
     var card = e.target.closest('.md-card');
     if (!card) return;
@@ -13166,10 +13297,94 @@ _MSG_DASHBOARD_HTML = r"""<!DOCTYPE html>
     if (!col) return;
     var sk = col.getAttribute('data-source');
     _activeColSourceKey = sk;
-    document.querySelectorAll('.md-card.keyboard-active').forEach(function(c){
-      c.classList.remove('keyboard-active');
-    });
+
+    // Klicks auf Quick-Read-Button oder innerhalb der Expand-View NICHT
+    // als Multi-Select-Trigger interpretieren.
+    if (e.target.closest('.md-card-quickread') || e.target.closest('.md-card-expand-actions')) return;
+
+    if (e.shiftKey) {
+      e.preventDefault();
+      _toggleSelect(card);
+      return;
+    }
+    // Normal-Klick: Selektion leeren + active setzen
+    if (STATE.selectedIds.size) _clearSelection();
+    document.querySelectorAll('.md-card.keyboard-active').forEach(function(c){ c.classList.remove('keyboard-active'); });
     card.classList.add('keyboard-active');
+  });
+
+  // ─── Rechtsklick-Kontextmenu ────────────────────────────────────────────
+  var _ctxMenu = document.createElement('div');
+  _ctxMenu.id = 'md-ctx-menu';
+  _ctxMenu.style.cssText = 'position:fixed;display:none;background:#1d1d2e;border:1px solid #334;border-radius:6px;padding:4px 0;min-width:220px;z-index:1000;box-shadow:0 4px 16px rgba(0,0,0,0.5);font-size:12px;color:#e0e0e0';
+  document.body.appendChild(_ctxMenu);
+
+  function _hideCtxMenu(){ _ctxMenu.style.display = 'none'; }
+  function _ctxItem(label, handler){
+    var item = document.createElement('div');
+    item.className = 'md-ctx-item';
+    item.style.cssText = 'padding:7px 14px;cursor:pointer';
+    item.textContent = label;
+    item.addEventListener('mouseenter', function(){ item.style.background = '#2a2a4a'; });
+    item.addEventListener('mouseleave', function(){ item.style.background = 'transparent'; });
+    item.addEventListener('click', function(){ _hideCtxMenu(); handler(); });
+    return item;
+  }
+
+  document.addEventListener('click', function(e){
+    if (!_ctxMenu.contains(e.target)) _hideCtxMenu();
+  });
+  document.addEventListener('keydown', function(e){ if (e.key === 'Escape') { _hideCtxMenu(); _clearSelection(); }});
+
+  BOARD.addEventListener('contextmenu', function(e){
+    var card = e.target.closest('.md-card');
+    if (!card) return;
+    e.preventDefault();
+    var id = card.getAttribute('data-id');
+    // Wenn die Card nicht in der Selektion ist, wird sie allein ausgewaehlt.
+    if (!STATE.selectedIds.has(id)) {
+      _clearSelection();
+      STATE.selectedIds.add(id);
+      card.classList.add('selected');
+    }
+    var targetIds = Array.from(STATE.selectedIds);
+    _ctxMenu.innerHTML = '';
+    var header = document.createElement('div');
+    header.style.cssText = 'padding:5px 14px;color:#888;font-size:10px;text-transform:uppercase;letter-spacing:1px';
+    header.textContent = targetIds.length + ' Nachricht' + (targetIds.length > 1 ? 'en' : '') + ' ausgewaehlt';
+    _ctxMenu.appendChild(header);
+    _ctxMenu.appendChild(_ctxItem('\u2713 Als gelesen markieren', function(){ _bulkMarkRead(targetIds, true); }));
+    _ctxMenu.appendChild(_ctxItem('\u25CF Als ungelesen markieren', function(){ _bulkMarkRead(targetIds, false); }));
+    _ctxMenu.appendChild(_ctxItem('\u2716 Auswahl aufheben', function(){ _clearSelection(); }));
+    _ctxMenu.style.display = 'block';
+    _ctxMenu.style.left = Math.min(e.clientX, window.innerWidth - 240) + 'px';
+    _ctxMenu.style.top = Math.min(e.clientY, window.innerHeight - _ctxMenu.offsetHeight - 10) + 'px';
+  });
+
+  async function _bulkMarkRead(ids, read){
+    try {
+      var r = await fetch('/api/messages/bulk-mark-read', {
+        method:'POST', headers:{'Content-Type':'application/json'},
+        body:JSON.stringify({ids: ids, read: !!read})
+      });
+      var d = await r.json();
+      if (!d.ok) { showToast('Fehler: ' + (d.error || 'unbekannt')); return; }
+      // Lokalen STATE anpassen, damit UI sofort reagiert (ohne Refresh)
+      var idSet = new Set(ids);
+      STATE.messages.forEach(function(m){ if (idSet.has(m.id)) m.read = read; });
+      _clearSelection();
+      renderAllColumns();
+      showToast(d.count + ' als ' + (read ? 'gelesen' : 'ungelesen') + ' markiert');
+    } catch(e){ showToast('Netzwerk-Fehler: ' + e.message); }
+  }
+
+  // ─── Mass-Mark-Read-Button ──────────────────────────────────────────────
+  var massBtn = document.getElementById('md-btn-mark-all-read');
+  if (massBtn) massBtn.addEventListener('click', async function(){
+    var visible = STATE.messages.filter(function(m){ return !m.read; });
+    if (!visible.length) { showToast('Keine ungelesenen Nachrichten.'); return; }
+    if (!confirm(visible.length + ' ungelesene Nachrichten in allen Spalten als gelesen markieren?')) return;
+    _bulkMarkRead(visible.map(function(m){ return m.id; }), true);
   });
 
   fullReload(false);
