@@ -1718,6 +1718,12 @@ def detect_delegation(msg, current_agent):
     if not subs:
         return None
 
+    # Sich selbst nicht vorschlagen: wenn der Nutzer bereits im Sub-Agent
+    # ist, ergibt ein "weiterleiten an outbound" keinen Sinn.
+    subs = [s for s in subs if s['full_name'] != current_agent]
+    if not subs:
+        return None
+
     kw_map = _load_subagent_keywords()
     best_match = None
     best_score = 0
