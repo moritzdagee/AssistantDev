@@ -3454,6 +3454,8 @@ HTML = """<!DOCTYPE html>
   .chat-tab { display:flex; align-items:center; gap:6px; padding:5px 12px; background:none; border:none; border-bottom:2px solid transparent; color:#888; font-size:11px; font-family:Inter,sans-serif; cursor:pointer; white-space:nowrap; transition:all .15s; max-width:180px; }
   .chat-tab:hover { color:#ccc; background:#1a1a1a; }
   .chat-tab.active { color:#f0c060; border-bottom-color:#f0c060; background:#1a1a1a; }
+  .chat-tab.pinned { color:#a0a0d0; font-weight:500; background:#14142a; border-left:1px solid #334; border-right:1px solid #334; }
+  .chat-tab.pinned.active { color:#f0c060; background:#1a1a34; }
   .chat-tab .tab-name { overflow:hidden; text-overflow:ellipsis; }
   .chat-tab .tab-close { font-size:13px; color:#555; padding:0 2px; line-height:1; cursor:pointer; border:none; background:none; }
   .chat-tab .tab-close:hover { color:#f87171; }
@@ -3824,6 +3826,9 @@ HTML = """<!DOCTYPE html>
     </div>
   </div>
 
+  <!-- Dashboard-Tab: iframe, wird beim Tab-Switch ein-/ausgeblendet. -->
+  <iframe id="dashboard-frame" src="about:blank" style="display:none;flex:1;border:none;background:#0f0f1e" title="Message Dashboard"></iframe>
+
   <div id="chat-area">
     <div id="ctx-bar">
       <span class="ctx-label">Kontext</span>
@@ -3942,10 +3947,10 @@ function addChatTab(agentName) {
 }
 
 function switchToTab(tabId) {
-  // Save current tab state
+  // Save current tab state (nur fuer Chat-Tabs; Dashboard hat keinen State)
   if (_activeTabId) {
     var cur = _tabs.find(function(t){ return t.id === _activeTabId; });
-    if (cur) {
+    if (cur && cur.type !== 'dashboard') {
       cur.messagesHtml = document.getElementById('messages').innerHTML;
       cur.ctxHtml = document.getElementById('ctx-items').innerHTML;
       cur.agentName = getAgentName();
@@ -3967,6 +3972,24 @@ function switchToTab(tabId) {
   var tab = _tabs.find(function(t){ return t.id === tabId; });
   if (!tab) return;
   SESSION_ID = tab.sessionId;
+
+  // Dashboard-Tab: iframe einblenden, Chat-UI ausblenden. Iframe wird
+  // erst beim ersten Aktivieren geladen (lazy).
+  var dashFrame = document.getElementById('dashboard-frame');
+  var chatArea = document.getElementById('chat-area');
+  if (tab.type === 'dashboard') {
+    if (dashFrame && dashFrame.getAttribute('src') !== '/messages') {
+      dashFrame.setAttribute('src', '/messages');
+    }
+    if (dashFrame) dashFrame.style.display = 'flex';
+    if (chatArea) chatArea.style.display = 'none';
+    renderTabs();
+    return;
+  } else {
+    if (dashFrame) dashFrame.style.display = 'none';
+    if (chatArea) chatArea.style.display = '';
+  }
+
   // Restore DOM
   document.getElementById('messages').innerHTML = tab.messagesHtml || '';
   document.getElementById('ctx-items').innerHTML = tab.ctxHtml || '';
@@ -3994,7 +4017,12 @@ function switchToTab(tabId) {
 
 function closeTab(tabId, evt) {
   if (evt) { evt.stopPropagation(); evt.preventDefault(); }
-  if (_tabs.length <= 1) return; // mindestens 1 Tab
+  // Dashboard-Tab (pinned) kann nicht geschlossen werden
+  var tabToClose = _tabs.find(function(t){ return t.id === tabId; });
+  if (tabToClose && tabToClose.pinned) return;
+  // Mindestens 1 nicht-pinned Tab muss uebrig bleiben
+  var nonPinned = _tabs.filter(function(t){ return !t.pinned; });
+  if (nonPinned.length <= 1) return;
   var idx = _tabs.findIndex(function(t){ return t.id === tabId; });
   if (idx < 0) return;
   var closingTab = _tabs[idx];
@@ -4023,10 +4051,12 @@ function renderTabs() {
   // Add tabs before + button
   _tabs.forEach(function(tab) {
     var el = document.createElement('button');
-    el.className = 'chat-tab' + (tab.id === _activeTabId ? ' active' : '');
+    el.className = 'chat-tab' + (tab.id === _activeTabId ? ' active' : '') + (tab.pinned ? ' pinned' : '');
     el.onclick = function(){ switchToTab(tab.id); };
     var nameSpan = '<span class="tab-name">' + escHtml(tab.label || 'Neuer Chat') + '</span>';
-    var closeSpan = _tabs.length > 1 ? '<span class="tab-close" onclick="closeTab(\\'' + tab.id + '\\', event)">&times;</span>' : '';
+    // Dashboard/pinned Tabs koennen nicht geschlossen werden.
+    var canClose = !tab.pinned && _tabs.filter(function(t){return !t.pinned;}).length > 1;
+    var closeSpan = canClose ? '<span class="tab-close" onclick="closeTab(\\'' + tab.id + '\\', event)">&times;</span>' : '';
     el.innerHTML = nameSpan + closeSpan;
     bar.insertBefore(el, addBtn);
   });
@@ -4041,20 +4071,42 @@ function updateActiveTabLabel(name, displayName) {
   }
 }
 
-// Init first tab
+// Init first tabs:
+// - Erster Tab: Message Dashboard (immer da, nicht schliessbar).
+// - Zweiter Tab: Agent-Chat (frisch oder letzter aktiver Agent).
+// Der Dashboard-Tab ist per Default NICHT aktiv — der User beginnt im
+// Agent-Chat, sieht aber das Dashboard als Pseudo-Tab und kann jederzeit
+// reinklicken.
 (function() {
-  // WICHTIG: Session-ID wird bewusst NICHT mehr in sessionStorage persistiert.
-  // In pywebview kann sessionStorage zwischen Fenstern desselben Origins geteilt
-  // werden — zwei Fenster wuerden dann dieselbe Server-Session teilen, und
-  // Responses eines Fensters taucht im anderen auf (cross-window pollution).
-  // Jede Seiten-Ladung bekommt daher eine komplett frische Session-ID.
-  var sessId = makeSessionId();
+  // Session-ID wird pro Seitenladung frisch erzeugt (siehe Kommentar
+  // ueber cross-window pollution).
   var savedAgent = localStorage.getItem('last_active_agent');
-  var tab = {id: 'tab_init', sessionId: sessId, agentName: savedAgent || '', label: savedAgent || 'Neuer Chat', messagesHtml: '', ctxHtml: ''};
-  _tabs.push(tab);
+
+  var dashTab = {
+    id: 'tab_dashboard',
+    sessionId: makeSessionId(),
+    agentName: '',
+    label: String.fromCodePoint(0x1F4EC) + ' Posteingang',
+    messagesHtml: '',
+    ctxHtml: '',
+    type: 'dashboard',
+    pinned: true,
+  };
+  _tabs.push(dashTab);
+
+  var sessId = makeSessionId();
+  var chatTab = {
+    id: 'tab_init',
+    sessionId: sessId,
+    agentName: savedAgent || '',
+    label: savedAgent || 'Neuer Chat',
+    messagesHtml: '',
+    ctxHtml: '',
+  };
+  _tabs.push(chatTab);
+
   _activeTabId = 'tab_init';
   SESSION_ID = sessId;
-  // Alten, ggf. geteilten Wert in sessionStorage aufraeumen
   try { sessionStorage.removeItem('assistant_session_id'); } catch(e) {}
   renderTabs();
 })();
