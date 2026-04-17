@@ -11770,6 +11770,76 @@ def _imsg_probe_access() -> dict:
         return dict(info, ok=False, reason=str(e))
 
 
+# Apple Mail Envelope-Index: Cache des "read"-Sets. Wird pro Request
+# max. alle 90s neu aufgebaut — SQLite-Query ist schnell (~100ms), aber
+# 115k+ Messages durchzugehen kostet doch was.
+_APPLE_MAIL_READ_CACHE = {"keys": set(), "ts": 0.0, "error": None}
+_APPLE_MAIL_READ_TTL = 90
+
+
+def _apple_mail_match_key(sender_email: str, subject: str) -> str:
+    """Stabiler Match-Key Subject+Absender. Case-insensitive, Whitespace
+    normalisiert, 'Re:' / 'Fwd:' Prefix gestrippt — so matchen auch
+    Thread-Antworten."""
+    import re as _re_mmk
+    se = (sender_email or "").strip().lower()
+    su = (subject or "").strip().lower()
+    # Re:/Fwd:/AW: wiederholt strippen
+    for _ in range(5):
+        new = _re_mmk.sub(r'^(re|fwd|fw|aw|wg)\s*:\s*', '', su, flags=_re_mmk.IGNORECASE)
+        if new == su:
+            break
+        su = new
+    su = _re_mmk.sub(r'\s+', ' ', su).strip()
+    return f"{se}|{su}"
+
+
+def _apple_mail_load_read_keys() -> set:
+    """Liefert ein Set von Match-Keys fuer alle Apple-Mail-Mails, die
+    read=1 sind. Cache TTL 90s."""
+    import time as _t_am
+    now = _t_am.time()
+    if _APPLE_MAIL_READ_CACHE["keys"] and (now - _APPLE_MAIL_READ_CACHE["ts"]) < _APPLE_MAIL_READ_TTL:
+        return _APPLE_MAIL_READ_CACHE["keys"]
+    import glob as _gl
+    paths = sorted(_gl.glob(os.path.expanduser("~/Library/Mail/V*/MailData/Envelope Index")))
+    if not paths:
+        _APPLE_MAIL_READ_CACHE["error"] = "Envelope-Index nicht gefunden"
+        return set()
+    p = paths[-1]
+    try:
+        import sqlite3 as _sq
+        conn = _sq.connect(f"file:{p}?mode=ro&immutable=1", uri=True, timeout=3)
+        cur = conn.cursor()
+        # Join: messages -> subjects (subject-Text) + sender_addresses (E-Mail-Adresse).
+        # Schema: messages.subject FK -> subjects.ROWID; messages.sender FK ->
+        # senders.ROWID -> addresses.ROWID; ODER direkt senders.address.
+        # Wir versuchen das robusteste: join ueber beide moeglichen Wege.
+        # Nur `read=1` und nicht `deleted`.
+        cur.execute("""
+            SELECT subj.subject, s.address
+            FROM messages m
+            LEFT JOIN subjects subj ON subj.ROWID = m.subject
+            LEFT JOIN addresses s ON s.ROWID = m.sender
+            WHERE m.read = 1 AND (m.deleted IS NULL OR m.deleted = 0)
+        """)
+        keys = set()
+        for row in cur.fetchall():
+            subj, addr = row
+            if not subj and not addr:
+                continue
+            keys.add(_apple_mail_match_key(addr or '', subj or ''))
+        conn.close()
+        _APPLE_MAIL_READ_CACHE["keys"] = keys
+        _APPLE_MAIL_READ_CACHE["ts"] = now
+        _APPLE_MAIL_READ_CACHE["error"] = None
+        return keys
+    except Exception as e:
+        _APPLE_MAIL_READ_CACHE["error"] = str(e)
+        print(f"[APPLE-MAIL-SYNC] Fehler: {e}")
+        return _APPLE_MAIL_READ_CACHE["keys"]
+
+
 def _apple_mail_envelope_probe() -> dict:
     """Testet Zugriff auf Apple Mail Envelope-Index (SQLite). Wird fuer
     die echte Read-Status-Sync-Loesung benoetigt — aktuell nur Probe."""
@@ -12475,11 +12545,21 @@ def _msg_get_all(force=False):
             _MSG_CACHE["ts"] = now
         state = _msg_load_state()
         read_set = set(state.get("read_messages", []))
+        # Apple-Mail-Read-State dazu holen (Cache 90s). Greift nur fuer
+        # E-Mail-Nachrichten. Match-Key = sender_email + normalized subject.
+        apple_read_keys = _apple_mail_load_read_keys()
         # read-state frisch pro Request applizieren, ohne Cache zu invalidieren
         annotated = []
         for m in msgs:
             m2 = dict(m)
-            m2["read"] = m2["id"] in read_set
+            # 1) Lokaler State (explicit mark-read via UI)
+            is_read = m2["id"] in read_set
+            # 2) Apple Mail Envelope-Index-Sync (nur fuer E-Mails)
+            if not is_read and m2.get("type") == "email" and apple_read_keys:
+                key = _apple_mail_match_key(m2.get("sender_address", ""), m2.get("subject", ""))
+                if key in apple_read_keys:
+                    is_read = True
+            m2["read"] = is_read
             annotated.append(m2)
         return annotated
 
@@ -12529,6 +12609,44 @@ def api_probe_fda():
         "imessage": _imsg_probe_access(),
         "apple_mail": _apple_mail_envelope_probe(),
     })
+
+
+@app.route("/api/probe-mail-schema")
+def api_probe_mail_schema():
+    """Debug-Endpoint: listet Tabellen + relevante Felder des Envelope-
+    Index — hilft beim Finden der passenden message_id-Spalte."""
+    import glob as _gl
+    paths = sorted(_gl.glob(os.path.expanduser("~/Library/Mail/V*/MailData/Envelope Index")))
+    if not paths:
+        return jsonify({"ok": False, "reason": "Envelope-Index nicht gefunden"})
+    p = paths[-1]
+    try:
+        import sqlite3 as _sq
+        conn = _sq.connect(f"file:{p}?mode=ro&immutable=1", uri=True, timeout=2)
+        cur = conn.cursor()
+        cur.execute("SELECT name FROM sqlite_master WHERE type='table'")
+        tables = [r[0] for r in cur.fetchall()]
+        info = {"path": p, "tables": tables, "columns": {}}
+        for t in tables[:10]:
+            try:
+                cur.execute(f"PRAGMA table_info({t})")
+                info["columns"][t] = [(c[1], c[2]) for c in cur.fetchall()]
+            except Exception as e:
+                info["columns"][t] = f"err: {e}"
+        # Sample einer 'messages'-Zeile — damit wir ID-Matching verstehen
+        if "messages" in tables:
+            try:
+                cur.execute("SELECT * FROM messages LIMIT 1")
+                names = [d[0] for d in cur.description]
+                row = cur.fetchone()
+                info["messages_sample_fields"] = names
+                info["messages_sample_row"] = dict(zip(names, row)) if row else None
+            except Exception as e:
+                info["sample_err"] = str(e)
+        conn.close()
+        return jsonify({"ok": True, **info})
+    except Exception as e:
+        return jsonify({"ok": False, "reason": str(e)})
 
 
 @app.route("/api/messages/sources")
