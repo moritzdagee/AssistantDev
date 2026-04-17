@@ -6,6 +6,23 @@ Format: [Datum] Änderung | Datei | Grund
 
 ## 2026-04-16
 
+### Bug-Fix: Test-Artefakte ueberschatten echte Konversationen in der History-Sidebar
+- **Was der Nutzer beobachtete:** Im Signicat-Agent wurden die "letzten Konversationen" nicht angezeigt — die History-Sidebar war voll mit "Sag nur das Wort: TESTOK" und "/find test"-Eintraegen, echte Konversationen tauchten erst ganz unten auf.
+- **Ursache:** `tests/run_tests.py` nutzte `signicat` als Chat-Smoke-Test-Agent (z.B. `/chat` mit `message='/find test'` oder kleine "TESTOK"-Prompts, jeweils mit eigener Session). Dadurch entstanden bei jedem Test-Lauf 10–20 neue `konversation_*.txt`-Dateien im echten `signicat/`-Ordner. Akkumuliert: **214 Test-Artefakte in signicat** (von 395), 9 in `system ward`. Diese tauchten in `/get_history` vor den echten Konversationen auf, weil Auto-Save die mtime permanent aktualisierte.
+- **Fix — Teil 1 (Datenbereinigung):**
+  - Neues Skript `scripts/cleanup_test_conversations.py` erkennt Test-Artefakte strikt: `<agent>/konversation_*.txt` mit Groesse ≤ 3500 Bytes, in dem **alle** `Du:`-Zeilen aus einer kleinen Whitelist stammen (`Sag nur das Wort: TESTOK`, `/find test`, `Antworte NUR mit: TEST_OK`, `Say hello`, `TEST`, `test`) und die User-Nachrichten keine CREATE_*/URL-Marker enthalten. Betreff/Subject in Assistant-Antworten werden toleriert (echte Suchergebnisse).
+  - Verschiebt (nicht loescht) nach `backups/<ts>_test_artifacts/<agent>/` — jederzeit wiederherstellbar.
+  - `--dry-run` und `--agent <name>`-Flags.
+  - Einmalig live ausgefuehrt: **214 Dateien verschoben** (signicat 214, sonst 0 nach Filter-Refinement).
+- **Fix — Teil 2 (Ursache):**
+  - `tests/run_tests.py` merkt sich beim Start `_TEST_START_TIME = time.time()`. Am Ende laeuft ein Cleanup-Hook, der alle `konversation_*.txt` in allen Agent-Ordnern scannt, deren `mtime > _TEST_START_TIME - 2s`, die nur Test-Muster als User-Messages enthalten und keine verdaechtigen Marker. Diese werden in `backups/<ts>_test_artifacts_autoclean/` verschoben.
+  - Output zeigt am Ende der Test-Suite in Gelb: `Test-Artefakte aufgeraeumt: N Datei(en) verschoben nach ...`. Live verifiziert: 2 Dateien nach jedem `run_tests.py`-Lauf.
+- **Live-Verifikation:** `/get_history?agent=signicat` liefert jetzt **49 Sessions, davon 45 echte Konversationen** (Top: "Bitte lege dir jetzt eine Datei in deinem Working Memory an.", "Antworte auf die E-Mail von [Absender]...", "Erstelle eine PowerPoint-Praesentation...", "Ich mache bitte einen deep research..."). 4 Rest-Eintraege mit "/find test" bleiben drin, weil ihre Assistant-Antworten URLs/CREATE_*-Marker enthalten und die konservative Filter-Logik sie als potentiell echt einstuft.
+- **Dateien:** `scripts/cleanup_test_conversations.py` (neu, ~140 Zeilen), `tests/run_tests.py` (+~90 Zeilen: `_TEST_START_TIME`, `_cleanup_test_artifacts()`).
+- **Tests:** Suite **849/849 gruen**. Cleanup-Hook bereinigt seine eigenen Artefakte pro Lauf.
+- **Backups:** `backups/2026-04-16_21-53-34_test_artifacts/` (175 Dateien, erster Lauf), `backups/2026-04-16_21-57-xx_test_artifacts/` (7 weitere, zweiter Lauf), `backups/2026-04-16_21-56-47_test_artifacts_autoclean/` (erste Autoclean-Iteration).
+- **Feature-Branch:** `feature/cleanup-test-artifacts`.
+
 ### Bug-Fix: E-Mail-Inbox-Zaehlung zeigte Staging-Ordner statt tatsaechliche Archive
 - **Was der Nutzer beobachtete:** `/admin/permissions` und Access-Control-Matrix zeigten "E-Mail Inbox: 1 Datei", obwohl tausende E-Mails in den Agent-Memorys liegen. Gleichzeitig stand kChat auf 0 trotz laufender App.
 - **Ursachen:**

@@ -33,6 +33,11 @@ warnings = []
 # Test-Session-ID (isoliert von echten Sessions)
 TEST_SESSION = "test_" + str(int(time.time()))
 
+# Start-Zeit — wird am Ende fuer das Test-Artefakt-Cleanup genutzt.
+# Alle Konversations-Dateien in <agent>/, die WAEHREND des Tests frisch
+# erzeugt wurden UND reine Test-Muster enthalten, werden am Ende aufgeraeumt.
+_TEST_START_TIME = time.time()
+
 
 def test(name, condition, details=""):
     if condition:
@@ -3222,6 +3227,104 @@ if os.path.isdir(_agents_dir) and _ct_import_ok:
          len(_lost_user) == 0,
          details="Leer: " + ", ".join(_lost_user))
 
+
+# ============================================================
+# TEST-ARTEFAKT-CLEANUP
+# ============================================================
+# Tests erzeugen ueber den Chat-Endpoint echte Konversations-Dateien in den
+# Agent-Ordnern (z.B. signicat/konversation_*.txt). Die sollen die UI-History
+# des Nutzers nicht zumuellen. Wir raeumen hier alle Dateien auf, die:
+#   - WAEHREND der Test-Session erzeugt wurden (mtime > _TEST_START_TIME - 2s)
+#   - nur aus Test-Mustern bestehen (jede "Du:"-Zeile ist bekanntes Test-Muster)
+#   - keine CREATE_*/URL/Betreff-Marker enthalten
+# Wir verschieben nach ~/AssistantDev/backups/<ts>_test_artifacts/, nie loeschen.
+
+_TEST_CLEANUP_PATTERNS = {
+    "Sag nur das Wort: TESTOK",
+    "/find test",
+    "Antworte NUR mit: TEST_OK",
+    "Say hello",
+    "TEST",
+    "test",
+}
+
+
+def _cleanup_test_artifacts():
+    import shutil
+    import datetime as _dt
+    cutoff = _TEST_START_TIME - 2
+    removed_per_agent = {}
+    backup_root = os.path.expanduser(
+        f"~/AssistantDev/backups/{_dt.datetime.now().strftime('%Y-%m-%d_%H-%M-%S')}_test_artifacts_autoclean"
+    )
+    try:
+        for entry in os.listdir(DATALAKE):
+            agent_dir = os.path.join(DATALAKE, entry)
+            if not os.path.isdir(agent_dir):
+                continue
+            if entry.startswith('.') or entry in (
+                'config', 'email_inbox', 'webclips', 'calendar', 'whatsapp'
+            ):
+                continue
+            victims = []
+            try:
+                for fname in os.listdir(agent_dir):
+                    if not (fname.startswith('konversation_') and fname.endswith('.txt')):
+                        continue
+                    fpath = os.path.join(agent_dir, fname)
+                    try:
+                        st = os.stat(fpath)
+                    except OSError:
+                        continue
+                    if st.st_mtime < cutoff:
+                        continue
+                    if st.st_size > 3500:
+                        continue
+                    try:
+                        with open(fpath, 'r', encoding='utf-8', errors='replace') as _rf:
+                            _c = _rf.read()
+                    except OSError:
+                        continue
+                    du_lines = [l for l in _c.splitlines() if l.startswith('Du: ')]
+                    if not du_lines:
+                        continue
+                    if not all(d[4:].strip() in _TEST_CLEANUP_PATTERNS for d in du_lines):
+                        continue
+                    # Marker nur in User-Lines pruefen (Assistant darf alles)
+                    _du_bad = False
+                    for _du in du_lines:
+                        _msg = _du[4:].strip().lower()
+                        if any(m in _msg for m in (
+                            'create_email', 'create_file', 'create_image',
+                            'create_video', 'create_whatsapp', 'http://', 'https://'
+                        )):
+                            _du_bad = True
+                            break
+                    if _du_bad:
+                        continue
+                    victims.append(fpath)
+            except OSError:
+                continue
+            if not victims:
+                continue
+            target = os.path.join(backup_root, entry)
+            os.makedirs(target, exist_ok=True)
+            for src in victims:
+                try:
+                    shutil.move(src, os.path.join(target, os.path.basename(src)))
+                except OSError:
+                    pass
+            removed_per_agent[entry] = len(victims)
+    except OSError:
+        return
+    if removed_per_agent:
+        total_removed = sum(removed_per_agent.values())
+        print(f"\n{YELLOW}Test-Artefakte aufgeraeumt: {total_removed} Datei(en) verschoben nach {backup_root}{RESET}")
+        for ag, n in removed_per_agent.items():
+            print(f"  {ag}: {n}")
+
+
+_cleanup_test_artifacts()
 
 # ============================================================
 # ERGEBNIS
