@@ -11794,6 +11794,38 @@ def _apple_mail_match_key(sender_email: str, subject: str) -> str:
     return f"{se}|{su}"
 
 
+def _apple_mail_load_unread_keys() -> set:
+    """Liefert die Menge der Match-Keys fuer alle Apple-Mail-Mails,
+    die read=0 sind — invers zur read-Funktion. Fuer die Baseline-
+    Synchronisation: alles was NICHT in dieser Menge ist, kann als
+    gelesen markiert werden."""
+    import glob as _gl
+    paths = sorted(_gl.glob(os.path.expanduser("~/Library/Mail/V*/MailData/Envelope Index")))
+    if not paths:
+        return set()
+    p = paths[-1]
+    try:
+        import sqlite3 as _sq
+        conn = _sq.connect(f"file:{p}?mode=ro&immutable=1", uri=True, timeout=3)
+        cur = conn.cursor()
+        cur.execute("""
+            SELECT subj.subject, s.address
+            FROM messages m
+            LEFT JOIN subjects subj ON subj.ROWID = m.subject
+            LEFT JOIN addresses s ON s.ROWID = m.sender
+            WHERE m.read = 0 AND (m.deleted IS NULL OR m.deleted = 0)
+        """)
+        keys = set()
+        for row in cur.fetchall():
+            subj, addr = row
+            keys.add(_apple_mail_match_key(addr or '', subj or ''))
+        conn.close()
+        return keys
+    except Exception as e:
+        print(f"[APPLE-MAIL-SYNC] unread-query Fehler: {e}")
+        return set()
+
+
 def _apple_mail_load_read_keys() -> set:
     """Liefert ein Set von Match-Keys fuer alle Apple-Mail-Mails, die
     read=1 sind. Cache TTL 90s."""
@@ -12740,6 +12772,58 @@ def api_messages_mark_read():
     return jsonify({"ok": True, "read": read, "message_id": mid})
 
 
+@app.route("/api/messages/sync-from-apple-mail", methods=["POST"])
+def api_messages_sync_from_apple_mail():
+    """Einmalige Baseline-Synchronisation: holt das aktuelle Unread-Set
+    aus Apple Mail's Envelope-Index und markiert jede Dashboard-Mail,
+    deren Match-Key NICHT im Unread-Set ist, als gelesen.
+
+    Rationale: Alles was in Apple Mail als gelesen gilt (oder gar nicht
+    im Envelope-Index ist — z.B. archiviert, geloescht, Junk) wird auch
+    hier als gelesen markiert. Nur echte aktuelle Apple-Mail-unreads
+    bleiben im Dashboard unread.
+    """
+    try:
+        messages = _msg_get_all()
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+    email_msgs = [m for m in messages if m.get("type") == "email"]
+    if not email_msgs:
+        return jsonify({"ok": False, "error": "Keine E-Mails im Dashboard"}), 400
+
+    apple_unread = _apple_mail_load_unread_keys()
+    if not apple_unread and _APPLE_MAIL_READ_CACHE.get("error"):
+        return jsonify({"ok": False, "error": "Apple Mail Envelope-Index nicht lesbar: " + str(_APPLE_MAIL_READ_CACHE["error"])}), 500
+
+    before_unread = sum(1 for m in email_msgs if not m.get("read"))
+
+    to_mark_read = set()
+    kept_unread = 0
+    for m in email_msgs:
+        key = _apple_mail_match_key(m.get("sender_address", ""), m.get("subject", ""))
+        if key in apple_unread:
+            kept_unread += 1
+            continue
+        to_mark_read.add(m["id"])
+
+    with _MSG_STATE_LOCK:
+        state = _msg_load_state()
+        read_set = set(state.get("read_messages", []))
+        read_set |= to_mark_read
+        state["read_messages"] = sorted(read_set)
+        _msg_save_state(state)
+
+    return jsonify({
+        "ok": True,
+        "total_emails": len(email_msgs),
+        "before_unread": before_unread,
+        "after_unread": kept_unread,
+        "marked_read": len(to_mark_read),
+        "apple_mail_unread_count": len(apple_unread),
+    })
+
+
 @app.route("/api/messages/bulk-mark-read", methods=["POST"])
 def api_messages_bulk_mark_read():
     """Markiert mehrere Messages in einem Schwung als gelesen/ungelesen.
@@ -12888,6 +12972,7 @@ _MSG_DASHBOARD_HTML = r"""<!DOCTYPE html>
   <h1>📬 Posteingang</h1>
   <input id="md-search" type="text" placeholder="Alle Spalten durchsuchen..." autocomplete="off">
   <span class="md-hdr-stat" id="md-stat-text">Lade...</span>
+  <button class="md-hdr-btn" id="md-btn-sync-apple-mail" title="Baseline aus Apple Mail: uebernimmt den aktuellen Read-Status von Apple Mail einmalig. Nur wirklich in Apple Mail ungelesene Mails bleiben hier unread.">&#128260; Baseline Apple Mail</button>
   <button class="md-hdr-btn" id="md-btn-mark-all-read" title="Alle sichtbaren Nachrichten in allen Spalten als gelesen markieren">\u2713 Alle gelesen</button>
   <button class="md-hdr-btn" id="md-btn-refresh">Aktualisieren</button>
   <button class="md-hdr-btn" onclick="location.href='/'">&larr; Chat</button>
@@ -13510,6 +13595,27 @@ _MSG_DASHBOARD_HTML = r"""<!DOCTYPE html>
     if (!visible.length) { showToast('Keine ungelesenen Nachrichten.'); return; }
     if (!confirm(visible.length + ' ungelesene Nachrichten in allen Spalten als gelesen markieren?')) return;
     _bulkMarkRead(visible.map(function(m){ return m.id; }), true);
+  });
+
+  // ─── Baseline-Sync aus Apple Mail ──────────────────────────────────────
+  var syncBtn = document.getElementById('md-btn-sync-apple-mail');
+  if (syncBtn) syncBtn.addEventListener('click', async function(){
+    if (!confirm('Baseline aus Apple Mail uebernehmen?\n\nAlle E-Mails, die in Apple Mail als gelesen markiert sind (oder dort gar nicht mehr existieren), werden hier auch als gelesen gesetzt. Der bestehende Read-Status fuer nicht-Mail-Quellen (WhatsApp, iMessage) bleibt unveraendert.')) return;
+    syncBtn.disabled = true;
+    syncBtn.textContent = 'Sync laeuft...';
+    try {
+      var r = await fetch('/api/messages/sync-from-apple-mail', {method:'POST'});
+      var d = await r.json();
+      if (!d.ok) { showToast('Fehler: ' + (d.error || 'unbekannt')); return; }
+      showToast('Baseline gesetzt: ' + d.marked_read + ' als gelesen markiert, ' + d.after_unread + ' bleiben unread');
+      // Voller Reload, damit die neuen read-states ueberall angezeigt werden
+      await fullReload(true);
+    } catch(e) {
+      showToast('Netzwerk-Fehler: ' + e.message);
+    } finally {
+      syncBtn.disabled = false;
+      syncBtn.innerHTML = '\u{1F504} Baseline Apple Mail';
+    }
   });
 
   fullReload(false);
