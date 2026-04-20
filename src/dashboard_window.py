@@ -34,7 +34,15 @@ except Exception:
 # ── URL bestimmen ────────────────────────────────────────────────────────────
 
 BASE_URL = "http://localhost:8080"
-path = sys.argv[1] if len(sys.argv) > 1 else ""
+
+# Default-Route:
+# • Wenn frontend/dist/index.html existiert → /app  (neue React-SPA)
+# • sonst                                    → /    (Legacy-HTML aus web_server.py)
+_REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+_FRONTEND_INDEX = os.path.join(_REPO_ROOT, "frontend", "dist", "index.html")
+DEFAULT_PATH = "/app" if os.path.isfile(_FRONTEND_INDEX) else ""
+
+path = sys.argv[1] if len(sys.argv) > 1 else DEFAULT_PATH
 if path and not path.startswith("/"):
     path = "/" + path
 url = BASE_URL + path
