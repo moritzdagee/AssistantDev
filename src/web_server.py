@@ -12116,6 +12116,7 @@ def _imsg_load_messages(max_messages=2000):
                 "type": "imessage",
                 "is_junk": False,
                 "is_archived": bool(is_arch),
+                "conversation_id": f"im:{chat_rowid or handle_id or 'unknown'}",
             })
         conn.close()
         _IMSG_CACHE["messages"] = out
@@ -12370,7 +12371,133 @@ def _msg_normalize_email_content(fpath, fname, source_key, agent_name, only_head
         "type": "email",
         "is_junk": _msg_is_junk(sender_email, subject, preview),
         "is_archived": False,
+        # Conversation = normalisierter Subject ohne Re:/Fwd:/AW:-Prefixe,
+        # damit das Frontend Thread-Aggregation machen kann.
+        "conversation_id": "em:" + _apple_mail_match_key(sender_email, subject),
     }
+
+
+def _msg_parse_whatsapp_messages(fpath, fname, source_key, agent_name,
+                                   tail_only=True, max_messages=50,
+                                   days_back=30):
+    """Parst WhatsApp-Chat-File in EINZELNE Messages (nicht eine pro File).
+
+    Jede eingehende Nachricht (kein 'Ich:') wird ein eigenes Message-Dict
+    mit eigenem Timestamp + eindeutiger id. Bei sehr grossen Files nur
+    die letzten `max_messages` Messages / letzten `days_back` Tage.
+
+    Returns: list[dict] — juengste zuerst.
+
+    Nutzt `conversation_id` (Kontakt-Name), damit das Frontend im "nur
+    ungelesen"-Modus aggregieren kann ("3 neue Nachrichten von Naiara").
+    """
+    try:
+        if tail_only:
+            # Head (8 KB fuer Kontakt-Info) + Tail (64 KB fuer letzte Messages)
+            with open(fpath, "rb") as f:
+                head_bytes = f.read(_MSG_PARSE_READ_BYTES)
+                f.seek(0, 2)
+                size = f.tell()
+                if size > _MSG_PARSE_READ_BYTES * 2:
+                    f.seek(max(0, size - 1024 * 64))
+                    tail_bytes = f.read()
+                else:
+                    tail_bytes = b""
+            if not head_bytes.strip():
+                return []
+            head = head_bytes.decode("utf-8", errors="replace")
+            tail = tail_bytes.decode("utf-8", errors="replace") if tail_bytes else ""
+        else:
+            with open(fpath, "rb") as f:
+                head_bytes = f.read(1024 * 512)
+            head = head_bytes.decode("utf-8", errors="replace")
+            tail = ""
+    except Exception:
+        return []
+
+    # Kontakt aus Header extrahieren
+    contact = ""
+    for line in head.splitlines()[:10]:
+        if line.lower().startswith("kontakt:"):
+            contact = line.split(":", 1)[1].strip()
+            break
+
+    # Archiviert-Status (aus WhatsApp-DB)
+    try:
+        is_archived = contact.strip() in _msg_whatsapp_archived_names() if contact else False
+    except Exception:
+        is_archived = False
+
+    # kChat-Hash-Sender-Regex fuer Skip-bei-Aggregation (aber NICHT fuer
+    # Skip bei Message-Erstellung — Hash-Messages sind echte Nachrichten
+    # wenn sie existieren, siehe Naiara-Fall).
+    _is_hash_sender = _msgd_re.compile(r'^[A-Za-z0-9+/=]{20,}:\s')
+
+    # Body = tail wenn verfuegbar, sonst head
+    body_for_parse = tail or head
+    cutoff_dt = datetime.datetime.now() - datetime.timedelta(days=days_back)
+
+    messages = []
+    import hashlib as _hl
+    for line in body_for_parse.splitlines():
+        if not (line.startswith("[") and "]" in line):
+            continue
+        try:
+            ts_str = line[1:line.index("]")]
+            rest = line[line.index("]")+1:].strip()
+        except Exception:
+            continue
+        if rest.startswith("Ich:"):
+            continue  # eigene ausgehende Messages skippen
+        # Timestamp parsen
+        try:
+            dt = datetime.datetime.strptime(ts_str, "%Y-%m-%d %H:%M")
+        except Exception:
+            try:
+                dt = datetime.datetime.strptime(ts_str[:10], "%Y-%m-%d")
+            except Exception:
+                continue
+        if dt < cutoff_dt:
+            continue
+        # Sender + Text extrahieren ("Sender: text")
+        if ": " in rest:
+            sender, text = rest.split(": ", 1)
+        else:
+            sender, text = rest, ""
+        # Hash-Sender-Flag (fuer spaetere UI-Entscheidung)
+        sender_is_hash = bool(_is_hash_sender.match(rest))
+        display_sender = contact or sender
+        preview = text[:150] + ("..." if len(text) > 150 else "")
+        # Eindeutige ID: File-hash + timestamp + laufender Zeilen-Index
+        seed = f"{fpath}|{dt.isoformat()}|{text[:80]}"
+        mid = _hl.sha1(seed.encode('utf-8', errors='replace')).hexdigest()[:16]
+        messages.append({
+            "id": mid,
+            "source": source_key,
+            "source_agent": agent_name,
+            "sender_name": display_sender[:150],
+            "sender_address": "",
+            "to": "",
+            "subject": contact[:200] or fname,
+            "preview": preview,
+            "full_content": "",  # Wird erst bei Detail-Request geladen
+            "timestamp": dt.isoformat(),
+            "timestamp_epoch": dt.timestamp(),
+            "read": False,
+            "has_attachments": any(tag in text for tag in ("[Bild]", "[Video]", "[Sprachnachricht]", "[Dokument]")),
+            "attachments": [],
+            "raw_file_path": fpath,
+            "message_id": "",
+            "type": "whatsapp",
+            "is_junk": False,
+            "is_archived": is_archived,
+            "conversation_id": f"wa:{contact or fname}",
+            "sender_is_hash": sender_is_hash,
+        })
+
+    # Juengste zuerst + limit
+    messages.sort(key=lambda m: m["timestamp_epoch"], reverse=True)
+    return messages[:max_messages]
 
 
 def _msg_normalize_whatsapp_file(fpath, fname, source_key, agent_name, only_header=True):
@@ -12688,13 +12815,19 @@ def _msg_scan_whatsapp_source(source):
                 continue
     candidates.sort(key=lambda x: x[0], reverse=True)
     candidates = candidates[:_MSG_MAX_FILES_PER_SOURCE]
+    # Per-Message-Parser: pro Chat-Datei werden bis zu 50 Einzelmessages
+    # der letzten 30 Tage zurueckgegeben. So ist jede WhatsApp-Nachricht
+    # ein eigenes Dashboard-Item mit eigenem Timestamp + Read-State.
     for _, fpath, fname, agent in candidates:
         try:
-            msg = _msg_normalize_whatsapp_file(fpath, fname, source["key"], agent, only_header=True)
+            msgs = _msg_parse_whatsapp_messages(
+                fpath, fname, source["key"], agent,
+                tail_only=True, max_messages=50, days_back=30,
+            )
         except Exception:
             continue
-        if msg:
-            out.append(msg)
+        if msgs:
+            out.extend(msgs)
     return out
 
 
@@ -12803,14 +12936,18 @@ def _msg_scan_kchat_source(source):
     candidates = candidates[:_MSG_MAX_FILES_PER_SOURCE]
     for _, fpath, fname, agent in candidates:
         try:
-            # kchat-Files aehneln der chat.db-Struktur. Wir nutzen den
-            # whatsapp-Normalizer als Best-Effort — die Nachrichten-Struktur
-            # ist nah genug (Header + timestamp-prefix + body).
-            msg = _msg_normalize_whatsapp_file(fpath, fname, source["key"], agent, only_header=True)
-            if msg:
-                msg["type"] = "kchat"
-                msg["source"] = source["key"]
-                out.append(msg)
+            # kchat-Files haben aehnliche Struktur wie WhatsApp (Header +
+            # [timestamp] Sender: text). Wir nutzen den Per-Message-Parser.
+            msgs = _msg_parse_whatsapp_messages(
+                fpath, fname, source["key"], agent,
+                tail_only=True, max_messages=50, days_back=30,
+            )
+            for m in msgs:
+                m["type"] = "kchat"
+                m["source"] = source["key"]
+                # Conversation-ID fuer kChat differenzieren
+                m["conversation_id"] = m["conversation_id"].replace("wa:", "kc:", 1)
+            out.extend(msgs)
         except Exception:
             continue
     return out
@@ -13450,47 +13587,132 @@ _MSG_DASHBOARD_HTML = r"""<!DOCTYPE html>
       body.appendChild(e);
       return;
     }
-    list.forEach(function(m){
-      var card = document.createElement('div');
-      card.className = 'md-card' + (m.read ? '' : ' unread');
-      card.setAttribute('data-id', m.id);
-      // Quick-Unread-Toggle-Button in der Card: 1 Klick = read<->unread
-      // ohne Expand. Tooltip abhaengig vom aktuellen Status.
-      var qrBtnTitle = m.read ? 'Als ungelesen markieren' : 'Als gelesen markieren';
-      var qrBtnIcon = m.read ? '\u25CB' : '\u25CF'; // hohl vs. gefuellt
-      card.innerHTML =
-        '<div class="md-card-top">' +
-          '<span class="md-dot ' + (m.read ? '' : 'unread') + '"></span>' +
-          '<span class="md-card-sender">' + esc(m.sender_name) + '</span>' +
-          '<span class="md-card-time">' + esc(fmtTime(m.timestamp)) + '</span>' +
-          '<button class="md-card-quickread" title="' + qrBtnTitle + '">' + qrBtnIcon + '</button>' +
-        '</div>' +
-        '<div class="md-card-subject">' + esc(m.subject || '(kein Betreff)') + '</div>' +
-        '<div class="md-card-preview">' + esc(m.preview || '') + '</div>' +
-        (m.has_attachments ? '<div class="md-card-meta"><span class="md-attach">📎 Anhang</span></div>' : '') +
-        '<div class="md-card-expand"></div>';
-      card.addEventListener('click', function(ev){
-        if (ev.detail === 2) return;
-        setTimeout(function(){ if (!card._dblClicked) onCardSingleClick(card, m); }, 160);
+
+    // Aggregation im "nur ungelesen"-Modus: mehrere Messages derselben
+    // Conversation werden zu einer Summary-Card zusammengefasst
+    // ("3 ungelesene Nachrichten von Naiara"). Im "alle"-Modus bleibt
+    // jede Nachricht einzeln.
+    var onlyUnread = !!(STATE.onlyUnread && STATE.onlyUnread[sourceKey]);
+    if (onlyUnread) {
+      var grouped = {};
+      list.forEach(function(m){
+        var key = m.conversation_id || m.id;
+        if (!grouped[key]) grouped[key] = [];
+        grouped[key].push(m);
       });
-      card.addEventListener('dblclick', function(){
-        card._dblClicked = true;
-        setTimeout(function(){ card._dblClicked = false; }, 400);
-        // Doppelklick oeffnet jetzt die Nachricht in einem SEPARATEN Fenster
-        // (Preview mit 'Mit Agent oeffnen'-Menuleiste), statt das alte
-        // Agent-Auswahl-Modal zu zeigen.
-        window.open('/messages/view/' + encodeURIComponent(m.id),
-                    'msgview_' + m.id,
-                    'width=900,height=700,menubar=yes,toolbar=no,resizable=yes,scrollbars=yes');
+      // Ordne nach juengster Message pro Gruppe
+      var groups = Object.keys(grouped).map(function(k){
+        var g = grouped[k];
+        g.sort(function(a,b){ return b.timestamp_epoch - a.timestamp_epoch; });
+        return {key: k, messages: g};
       });
-      // Quick-Read-Toggle: stoppt Event-Propagation, damit Card nicht auch
-      // noch expandiert.
-      card.querySelector('.md-card-quickread').addEventListener('click', function(ev){
-        ev.stopPropagation();
-        toggleRead(m);
+      groups.sort(function(a,b){
+        return b.messages[0].timestamp_epoch - a.messages[0].timestamp_epoch;
       });
-      body.appendChild(card);
+      groups.forEach(function(g){
+        if (g.messages.length === 1) {
+          renderSingleCard(body, g.messages[0]);
+        } else {
+          renderAggregateCard(body, g.messages);
+        }
+      });
+      return;
+    }
+
+    // Alle-Modus: jede Message einzeln
+    list.forEach(function(m){ renderSingleCard(body, m); });
+  }
+
+  function renderSingleCard(body, m){
+    var card = document.createElement('div');
+    card.className = 'md-card' + (m.read ? '' : ' unread');
+    card.setAttribute('data-id', m.id);
+    var qrBtnTitle = m.read ? 'Als ungelesen markieren' : 'Als gelesen markieren';
+    var qrBtnIcon = m.read ? '\u25CB' : '\u25CF';
+    card.innerHTML =
+      '<div class="md-card-top">' +
+        '<span class="md-dot ' + (m.read ? '' : 'unread') + '"></span>' +
+        '<span class="md-card-sender">' + esc(m.sender_name) + '</span>' +
+        '<span class="md-card-time">' + esc(fmtTime(m.timestamp)) + '</span>' +
+        '<button class="md-card-quickread" title="' + qrBtnTitle + '">' + qrBtnIcon + '</button>' +
+      '</div>' +
+      '<div class="md-card-subject">' + esc(m.subject || '(kein Betreff)') + '</div>' +
+      '<div class="md-card-preview">' + esc(m.preview || '') + '</div>' +
+      (m.has_attachments ? '<div class="md-card-meta"><span class="md-attach">📎 Anhang</span></div>' : '') +
+      '<div class="md-card-expand"></div>';
+    card.addEventListener('click', function(ev){
+      if (ev.detail === 2) return;
+      setTimeout(function(){ if (!card._dblClicked) onCardSingleClick(card, m); }, 160);
     });
+    card.addEventListener('dblclick', function(){
+      card._dblClicked = true;
+      setTimeout(function(){ card._dblClicked = false; }, 400);
+      window.open('/messages/view/' + encodeURIComponent(m.id),
+                  'msgview_' + m.id,
+                  'width=900,height=700,menubar=yes,toolbar=no,resizable=yes,scrollbars=yes');
+    });
+    card.querySelector('.md-card-quickread').addEventListener('click', function(ev){
+      ev.stopPropagation();
+      toggleRead(m);
+    });
+    body.appendChild(card);
+  }
+
+  // Aggregat-Card fuer mehrere ungelesene Messages in derselben Conversation.
+  // Zeigt: Absender, Anzahl "N neue Nachrichten", Preview der juengsten.
+  // Klick expandiert zur Liste der Einzel-Messages. Quick-Read markiert alle.
+  function renderAggregateCard(body, messages){
+    var latest = messages[0];
+    var count = messages.length;
+    var card = document.createElement('div');
+    card.className = 'md-card md-card-aggregate unread';
+    card.setAttribute('data-agg-key', latest.conversation_id || latest.id);
+    card.innerHTML =
+      '<div class="md-card-top">' +
+        '<span class="md-dot unread"></span>' +
+        '<span class="md-card-sender">' + esc(latest.sender_name) + '</span>' +
+        '<span class="md-card-time">' + esc(fmtTime(latest.timestamp)) + '</span>' +
+        '<button class="md-card-quickread" title="Alle ' + count + ' als gelesen markieren">\u25CF</button>' +
+      '</div>' +
+      '<div class="md-card-subject">' +
+        '<span style="background:#f0c060;color:#111;padding:1px 7px;border-radius:10px;font-size:10px;font-weight:700;margin-right:6px">' + count + '</span>' +
+        esc(count === 1 ? '1 neue Nachricht' : count + ' neue Nachrichten') +
+        (latest.subject ? ' \u00b7 ' + esc(latest.subject) : '') +
+      '</div>' +
+      '<div class="md-card-preview">' + esc(latest.preview || '') + '</div>' +
+      '<div class="md-card-expand"></div>';
+
+    var expanded = false;
+    card.addEventListener('click', function(ev){
+      if (ev.target.classList.contains('md-card-quickread')) return;
+      if (expanded) { card.classList.remove('expanded'); expanded = false; return; }
+      expanded = true;
+      card.classList.add('expanded');
+      var expEl = card.querySelector('.md-card-expand');
+      expEl.innerHTML = messages.map(function(m){
+        return '<div class="md-agg-item" data-msg-id="' + esc(m.id) + '" style="padding:6px 8px;border-top:1px solid #2a2a2a;font-size:11px;cursor:pointer">' +
+               '<span style="color:#888;font-size:10px;display:inline-block;min-width:80px">' + esc(fmtTime(m.timestamp)) + '</span> ' +
+               esc(m.preview || '(leer)') + '</div>';
+      }).join('');
+      // Klick auf einzelne Message im Expand -> Detail-Fenster
+      expEl.querySelectorAll('.md-agg-item').forEach(function(it){
+        it.addEventListener('click', function(ev){
+          ev.stopPropagation();
+          var mid = it.getAttribute('data-msg-id');
+          window.open('/messages/view/' + encodeURIComponent(mid),
+                      'msgview_' + mid,
+                      'width=900,height=700,menubar=yes,toolbar=no,resizable=yes,scrollbars=yes');
+        });
+      });
+    });
+
+    // Quick-Read auf Aggregat: alle markieren
+    card.querySelector('.md-card-quickread').addEventListener('click', function(ev){
+      ev.stopPropagation();
+      var ids = messages.map(function(m){ return m.id; });
+      _bulkMarkRead(ids, true);
+    });
+    body.appendChild(card);
   }
 
   function updateColumnHeaderCounts(){
