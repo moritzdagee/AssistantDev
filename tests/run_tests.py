@@ -3010,6 +3010,50 @@ test("/api/messages: kein globaler messages[:2000]-Cap mehr",
      "messages = messages[:limit]" not in _ws_src
      or "per_source_limit" in _ws_src)
 
+# Receipt-only Status fuer Typen ohne Read-Sync-Rueckkanal (2026-04-20)
+# WhatsApp/iMessage/kChat haben keine Schreib-API zur Quelle. Dort macht
+# ein Read/Unread-Flag keinen Sinn und erzeugt False-Positives im Unread-
+# Count. Stattdessen: neutraler "Erhalten"-Badge in der UI.
+test("Receipt-only: _MSG_BIDIRECTIONAL_SYNC_TYPES definiert (enthaelt 'email')",
+     '_MSG_BIDIRECTIONAL_SYNC_TYPES = {"email"}' in _ws_src)
+test("Receipt-only: _msg_get_all setzt 'sync_direction' pro Message",
+     'm2["sync_direction"] =' in _ws_src
+     and '"bidirectional" if bidirectional else "receipt_only"' in _ws_src)
+test("Receipt-only: nicht-bidirektionale Messages haben permanent read=True",
+     '# Receipt-only: kein Read/Unread-Konzept' in _ws_src
+     and 'm2["read"] = True' in _ws_src)
+test("Receipt-only: Frontend-Check auf sync_direction === 'receipt_only'",
+     "m.sync_direction === 'receipt_only'" in _ws_src)
+test("Receipt-only: 'Erhalten'-Badge statt Quickread-Button",
+     "md-card-receipt" in _ws_src
+     and "Erhalten" in _ws_src)
+test("Receipt-only: CSS .md-card-receipt vorhanden",
+     ".md-card-receipt { background:" in _ws_src
+     or ".md-card-receipt {" in _ws_src)
+test("Receipt-only: .md-dot.receipt fuer neutralen Dot-Status",
+     ".md-dot.receipt" in _ws_src)
+test("Receipt-only: CSS .md-card.receipt-only Sender-Styles",
+     ".md-card.receipt-only .md-card-sender" in _ws_src)
+test("Receipt-only: Quickread-Handler defensiv via null-check",
+     "var qrBtnEl = card.querySelector('.md-card-quickread');" in _ws_src
+     and "if (qrBtnEl)" in _ws_src)
+
+# End-to-End: Backend labelt korrekt
+import importlib.util as _ilu2
+try:
+    _spec2 = _ilu2.spec_from_file_location("web_server_check", _ws_path)
+    # Wir importieren NICHT (Module-Side-Effects). Stattdessen rein Source-
+    # Check: Verify dass die drei receipt-only-Typen nicht in
+    # _MSG_BIDIRECTIONAL_SYNC_TYPES stehen.
+    test("Receipt-only: whatsapp nicht bidirektional",
+         '"whatsapp"' not in _ws_src.split('_MSG_BIDIRECTIONAL_SYNC_TYPES =')[1].split('\n')[0])
+    test("Receipt-only: imessage nicht bidirektional",
+         '"imessage"' not in _ws_src.split('_MSG_BIDIRECTIONAL_SYNC_TYPES =')[1].split('\n')[0])
+    test("Receipt-only: kchat nicht bidirektional",
+         '"kchat"' not in _ws_src.split('_MSG_BIDIRECTIONAL_SYNC_TYPES =')[1].split('\n')[0])
+except Exception as _e:
+    test(f"Receipt-only: Source-Introspection OK ({_e})", False)
+
 
 # ============================================================
 

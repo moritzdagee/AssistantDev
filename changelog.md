@@ -6,6 +6,21 @@ Format: [Datum] Änderung | Datei | Grund
 
 ## 2026-04-20
 
+### Feature: Receipt-only-Status fuer Kanaele ohne Read-Sync-Rueckkanal
+- **Was der Nutzer wollte:** Bei Nachrichten-Typen, wo der Read-Status nicht zur Quelle zurueckgeschrieben werden kann (WhatsApp/iMessage/kChat — keine Schreib-API), macht das Dashboard-interne "gelesen/ungelesen"-Flag keinen Sinn und erzeugt False Positives im Unread-Count. Stattdessen soll ein neutraler "Erhalten"-Status angezeigt werden.
+- **Backend (`src/web_server.py`):**
+  - Neue Konstante `_MSG_BIDIRECTIONAL_SYNC_TYPES = {"email"}` — Whitelist der Typen mit echtem Read-Sync (aktuell nur Apple Mail via Envelope-Index + AppleScript-Write-Back).
+  - `_msg_get_all()` setzt pro Message ein Feld `sync_direction`:
+    - `"bidirectional"`: Read-State wird wie bisher aus lokalem State + Apple-Mail-Envelope gemerged.
+    - `"receipt_only"`: `read` wird fest auf `True` gesetzt. Effekt: Unread-Zaehler (oben im Dashboard + Column-Badges) ignorieren diese Messages, und der "nur ungelesen"-Filter zeigt sie nicht an.
+- **Frontend (`renderSingleCard`):**
+  - Receipt-only Cards bekommen keine `unread`-CSS-Klasse, keinen orangen Unread-Dot und keinen Quickread-Toggle-Button.
+  - Stattdessen: neutraler grauer Dot (`.md-dot.receipt`) + Badge `📥 Erhalten` statt `\u25CF/\u25CB` Read-Toggle. Sender-Font leichter (500 statt 700 bei unread). Subject-Farbe grau statt weiss.
+  - Event-Handler fuer `.md-card-quickread` ist defensiv (null-check), damit das Fehlen des Buttons bei receipt-only-Cards keine JS-Fehler wirft.
+- **Cap-bezogener Effekt:** Per-Source-Cap (500) greift weiter. Live-Zahlen: whatsapp: 500 (receipt-only), imessage: 45 (receipt-only), email_privat/signicat/trustedcarrier: bidirectional. Unread-Count zeigt jetzt nur noch die 34 echten ungelesenen E-Mails.
+- **Tests:** 12 neue Tests in der Section "Email-Anhang-Auto-Load + Dashboard-Button 2026-04-20": prueft Konstante, sync_direction-Annotation, permanentes `read=True` fuer receipt-only, Frontend-Rendering (Badge + CSS-Klassen + null-sicherer Event-Handler), plus Sanity-Check dass whatsapp/imessage/kchat NICHT in der bidirektionalen Whitelist stehen. Suite **971/971 gruen**.
+- **Deploy:** `scripts/deploy.sh`, Server neu aus `src/`, Healthcheck OK.
+
 ### Fix: Dashboard zeigte nur 2 signicat-Mails / 0 trustedcarrier — Limit jetzt PER SOURCE
 - **Was der Nutzer gesehen hat:** Posteingang zeigte in der signicat.com-Spalte nur 2 Mails und in trustedcarrier.net-Spalte 0, obwohl auf Disk hunderte von Mails pro Agent existieren (signicat: 3047 IN-Files, trustedcarrier: 542 IN-Files). User war zu Recht stinkig, weil er jahrelang mit tausenden Mails arbeitet.
 - **Root Cause:** Die Route `/api/messages` hatte einen **globalen Cap von 2000** (`messages = messages[:limit]`) nach einer Sortierung "ungelesen zuerst". WhatsApp hat aktuell ~1700 ungelesene Nachrichten — die fuellten die ersten 1700 Slots, und nur ~300 Slots blieben fuer alle anderen Sources zusammen. Das globale Cap ist alt (existiert seit der ersten Message-Dashboard-Implementierung); bis die WhatsApp-60s-Polling-Logik eingefuehrt wurde (Commit 3cb34f4) hat's gereicht.

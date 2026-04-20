@@ -13099,9 +13099,28 @@ def _kchat_probe_status() -> dict:
         return {"ok": False, "reason": str(e)}
 
 
+#: Message-Typen mit bidirektionalem Read-Sync. Nur fuer diese macht das
+#: Unread/Read-Flag Sinn (Apple Mail kann in beide Richtungen synchronisiert
+#: werden). Alle anderen Typen (WhatsApp/iMessage/kChat) haben keine
+#: Schreib-API zurueck zur Quelle — dort zeigen wir einen neutralen
+#: "Erhalten"-Status statt Read/Unread, um False Positives zu vermeiden.
+_MSG_BIDIRECTIONAL_SYNC_TYPES = {"email"}
+
+
 def _msg_get_all(force=False):
     """Liefert alle Nachrichten mit read-state Annotation. Nutzt einen
-    einfachen In-Memory-Cache mit TTL damit die Kanban-UI fluessig scrollt."""
+    einfachen In-Memory-Cache mit TTL damit die Kanban-UI fluessig scrollt.
+
+    Setzt pro Message das Feld `sync_direction`:
+      - "bidirectional": Read-State wird in beide Richtungen synchronisiert
+        (aktuell nur E-Mail via Apple Mail Envelope-Index + AppleScript-
+        Write-Back). Hier macht die Unread/Read-Unterscheidung Sinn.
+      - "receipt_only": Nur Eingangs-Empfang, kein Read-Sync moeglich
+        (WhatsApp, iMessage, kChat). Das Frontend stellt diese Nachrichten
+        mit einem neutralen "Erhalten"-Badge dar und rendert weder
+        Unread-Dot noch Read-Toggle. `read` bleibt immer True, damit die
+        Messages nicht in den globalen "N ungelesen"-Zaehlern auftauchen.
+    """
     with _MSG_CACHE["lock"]:
         now = _msgd_time.time()
         if (not force and _MSG_CACHE["messages"] is not None
@@ -13125,14 +13144,24 @@ def _msg_get_all(force=False):
         annotated = []
         for m in msgs:
             m2 = dict(m)
-            # 1) Lokaler State (explicit mark-read via UI)
-            is_read = m2["id"] in read_set
-            # 2) Apple Mail Envelope-Index-Sync (nur fuer E-Mails)
-            if not is_read and m2.get("type") == "email" and apple_read_keys:
-                key = _apple_mail_match_key(m2.get("sender_address", ""), m2.get("subject", ""))
-                if key in apple_read_keys:
-                    is_read = True
-            m2["read"] = is_read
+            mtype = m2.get("type", "")
+            bidirectional = mtype in _MSG_BIDIRECTIONAL_SYNC_TYPES
+            m2["sync_direction"] = "bidirectional" if bidirectional else "receipt_only"
+            if bidirectional:
+                # 1) Lokaler State (explicit mark-read via UI)
+                is_read = m2["id"] in read_set
+                # 2) Apple Mail Envelope-Index-Sync (nur fuer E-Mails)
+                if not is_read and mtype == "email" and apple_read_keys:
+                    key = _apple_mail_match_key(m2.get("sender_address", ""), m2.get("subject", ""))
+                    if key in apple_read_keys:
+                        is_read = True
+                m2["read"] = is_read
+            else:
+                # Receipt-only: kein Read/Unread-Konzept. Permanent True
+                # halten, damit Unread-Zaehler und 'nur ungelesen'-Filter
+                # diese Messages nicht einbeziehen. Frontend rendert
+                # stattdessen ein "Erhalten"-Badge anhand sync_direction.
+                m2["read"] = True
             annotated.append(m2)
         return annotated
 
@@ -13583,6 +13612,12 @@ _MSG_DASHBOARD_HTML = r"""<!DOCTYPE html>
   .md-card.unread .md-card-quickread { color:#f0c060; }
   .md-card-agentbtn { background:#1B6FD8; color:#fff; border:none; border-radius:4px; cursor:pointer; padding:2px 7px; font-size:10px; font-weight:600; line-height:1.4; flex-shrink:0; transition:background .12s; font-family:inherit; letter-spacing:0.2px; }
   .md-card-agentbtn:hover { background:#2580e8; }
+  /* Receipt-only Messages (WhatsApp/iMessage/kChat — keine Read-Sync-Ruec-
+     kkanal zur Quelle). Kein Unread-Highlight, neutraler Empfangs-Badge. */
+  .md-dot.receipt { background:#555; opacity:0.6; }
+  .md-card-receipt { background:transparent; color:#6a8fa8; border:1px solid #2a3a4a; padding:2px 7px; border-radius:4px; font-size:9.5px; line-height:1.4; font-weight:500; flex-shrink:0; letter-spacing:0.2px; cursor:default; user-select:none; }
+  .md-card.receipt-only .md-card-sender { font-weight:500; color:#c9c9c9; }
+  .md-card.receipt-only .md-card-subject { color:#a9a9a9; font-weight:400; }
   .md-card.keyboard-active { box-shadow:0 0 0 2px #4a8aca; }
   .md-card.keyboard-active.unread { box-shadow:0 0 0 2px #f0c060; }
   .md-card.selected { background:#1e2a4a; border-color:#4a8aca; }
@@ -13777,17 +13812,41 @@ _MSG_DASHBOARD_HTML = r"""<!DOCTYPE html>
 
   function renderSingleCard(body, m){
     var card = document.createElement('div');
-    card.className = 'md-card' + (m.read ? '' : ' unread');
+    // Receipt-only Messages (WhatsApp/iMessage/kChat) haben keinen
+    // Read-Sync zur Quelle. Wir zeigen KEIN Unread-Highlight und KEINEN
+    // Read-Toggle, sondern ein neutrales "Erhalten"-Badge.
+    var isReceiptOnly = m.sync_direction === 'receipt_only';
+    card.className = 'md-card'
+      + (isReceiptOnly ? ' receipt-only' : (m.read ? '' : ' unread'));
     card.setAttribute('data-id', m.id);
-    var qrBtnTitle = m.read ? 'Als ungelesen markieren' : 'Als gelesen markieren';
-    var qrBtnIcon = m.read ? '\u25CB' : '\u25CF';
+
+    var topRight;
+    if (isReceiptOnly) {
+      // Neutrales Badge statt Read-Toggle — kein false-positive-Unread-
+      // Flag fuer Kanaele ohne Schreib-Sync.
+      topRight = '<span class="md-card-receipt" title="Erhalten (kein Read-Sync zur Quelle)">\uD83D\uDCE5 Erhalten</span>';
+    } else {
+      var qrBtnTitle = m.read ? 'Als ungelesen markieren' : 'Als gelesen markieren';
+      var qrBtnIcon = m.read ? '\u25CB' : '\u25CF';
+      topRight = '<button class="md-card-quickread" title="' + qrBtnTitle + '">' + qrBtnIcon + '</button>';
+    }
+
+    var leftDot;
+    if (isReceiptOnly) {
+      // Kein Unread-Indikator — die Nachricht ist weder "gelesen" noch
+      // "ungelesen" aus Dashboard-Sicht, nur empfangen.
+      leftDot = '<span class="md-dot receipt"></span>';
+    } else {
+      leftDot = '<span class="md-dot ' + (m.read ? '' : 'unread') + '"></span>';
+    }
+
     card.innerHTML =
       '<div class="md-card-top">' +
-        '<span class="md-dot ' + (m.read ? '' : 'unread') + '"></span>' +
+        leftDot +
         '<span class="md-card-sender">' + esc(m.sender_name) + '</span>' +
         '<span class="md-card-time">' + esc(fmtTime(m.timestamp)) + '</span>' +
         '<button class="md-card-agentbtn" title="Mit Agent oeffnen">\u21A9\uFE0E Agent</button>' +
-        '<button class="md-card-quickread" title="' + qrBtnTitle + '">' + qrBtnIcon + '</button>' +
+        topRight +
       '</div>' +
       '<div class="md-card-subject">' + esc(m.subject || '(kein Betreff)') + '</div>' +
       '<div class="md-card-preview">' + esc(m.preview || '') + '</div>' +
@@ -13804,10 +13863,16 @@ _MSG_DASHBOARD_HTML = r"""<!DOCTYPE html>
                   'msgview_' + m.id,
                   'width=900,height=700,menubar=yes,toolbar=no,resizable=yes,scrollbars=yes');
     });
-    card.querySelector('.md-card-quickread').addEventListener('click', function(ev){
-      ev.stopPropagation();
-      toggleRead(m);
-    });
+    // Quickread-Toggle gibt es nur fuer bidirectional-sync Messages.
+    // Receipt-only Messages haben stattdessen das "Erhalten"-Badge ohne
+    // Event-Handler — deshalb hier der Null-Check.
+    var qrBtnEl = card.querySelector('.md-card-quickread');
+    if (qrBtnEl) {
+      qrBtnEl.addEventListener('click', function(ev){
+        ev.stopPropagation();
+        toggleRead(m);
+      });
+    }
     // Direkter "Mit Agent oeffnen"-Button auf der Miniatur — kein
     // Ueberklicken mehr noetig um zur Expand-View zu kommen. Lazy-fetcht
     // die volle Message (inkl. full_content + attachments) und zeigt
