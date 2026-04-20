@@ -44,22 +44,23 @@ VALID_SESSION_TYPES = {0, 1}  # Only direct + group chats
 
 
 def apple_ts_to_iso(ts):
-    """Convert Apple Core Data timestamp to ISO string."""
+    """Convert Apple Core Data timestamp to ISO string in LOCAL timezone.
+    (Frueher utcfromtimestamp — das hat in BR-Zeit 3h Offset erzeugt.)"""
     if not ts:
         return None
     try:
-        dt = datetime.datetime.utcfromtimestamp(ts + APPLE_EPOCH)
+        dt = datetime.datetime.fromtimestamp(ts + APPLE_EPOCH)
         return dt.strftime('%Y-%m-%d %H:%M')
     except (OSError, ValueError):
         return None
 
 
 def apple_ts_to_date(ts):
-    """Convert Apple Core Data timestamp to date string."""
+    """Convert Apple Core Data timestamp to date string (LOCAL timezone)."""
     if not ts:
         return None
     try:
-        dt = datetime.datetime.utcfromtimestamp(ts + APPLE_EPOCH)
+        dt = datetime.datetime.fromtimestamp(ts + APPLE_EPOCH)
         return dt.strftime('%Y-%m-%d')
     except (OSError, ValueError):
         return None
@@ -258,12 +259,19 @@ def import_chat(chat, db_path, agent, since_date=None):
     with open(fpath, 'w', encoding='utf-8') as f:
         f.write(output)
 
-    # Mirror to Downloads shared/whatsapp/ for global access
-    shared_wa_dir = os.path.join(os.path.dirname(BASE), 'whatsapp')
-    os.makedirs(shared_wa_dir, exist_ok=True)
-    shared_path = os.path.join(shared_wa_dir, f'{agent}_{fname}')
-    with open(shared_path, 'w', encoding='utf-8') as f:
-        f.write(output)
+    # Mirror to Downloads shared/whatsapp/ for global access.
+    # Fehler (typisch: iCloud-Sync-Conflict "Resource deadlock avoided")
+    # werden geschluckt: der Mirror ist optional, das primary-File liegt
+    # bereits im Agent-Memory. Fruehere Version hat bei diesem Fehler
+    # den gesamten Import gestoppt (crashed nach 4 Chats von 228).
+    try:
+        shared_wa_dir = os.path.join(os.path.dirname(BASE), 'whatsapp')
+        os.makedirs(shared_wa_dir, exist_ok=True)
+        shared_path = os.path.join(shared_wa_dir, f'{agent}_{fname}')
+        with open(shared_path, 'w', encoding='utf-8') as f:
+            f.write(output)
+    except OSError as _mirror_err:
+        print(f"  [mirror skip: {_mirror_err}]", flush=True)
 
     return {
         'contact': chat['name'],

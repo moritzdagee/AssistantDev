@@ -10318,17 +10318,18 @@ def api_calendar():
         days_back=days_back, days_ahead=days_ahead,
         calendars=calendars, search=search,
     )
-    if error:
-        return jsonify({'error': error, 'events': [], 'count': 0})
-
     now = datetime.datetime.now()
+    _range = {
+        'from': (now - datetime.timedelta(days=days_back)).strftime('%Y-%m-%d'),
+        'to': (now + datetime.timedelta(days=days_ahead)).strftime('%Y-%m-%d'),
+    }
+    if error:
+        return jsonify({'error': error, 'events': [], 'count': 0, 'range': _range})
+
     return jsonify({
         'events': events,
         'count': len(events),
-        'range': {
-            'from': (now - datetime.timedelta(days=days_back)).strftime('%Y-%m-%d'),
-            'to': (now + datetime.timedelta(days=days_ahead)).strftime('%Y-%m-%d'),
-        },
+        'range': _range,
         'calendars_found': sorted(cals_found),
     })
 
@@ -11792,6 +11793,7 @@ _MSG_SOURCES = [
     # Spalte ausgeblendet (vorher sichtbar mit 0 gesamt).
     {"key": "whatsapp",             "label": "WhatsApp",                        "agent": None,             "icon": "\U0001F4F1", "type": "whatsapp", "group": "Messaging"},
     {"key": "imessage",             "label": "iMessage",                        "agent": "privat",         "icon": "\U0001F4AC", "type": "imessage", "group": "Messaging"},
+    {"key": "kchat",                "label": "kChat",                           "agent": "privat",         "icon": "\U0001F4AC", "type": "kchat",    "group": "Messaging"},
     # "Chat-Verlauf" war interne Agent-Konversations-History (konversation_*.txt),
     # kein Inflow-Channel — raus aus dem Dashboard.
 ]
@@ -12373,12 +12375,36 @@ def _msg_normalize_email_content(fpath, fname, source_key, agent_name, only_head
 
 def _msg_normalize_whatsapp_file(fpath, fname, source_key, agent_name, only_header=True):
     try:
-        mode_size = _MSG_PARSE_READ_BYTES if only_header else 1024 * 512
-        with open(fpath, "rb") as f:
-            raw_bytes = f.read(mode_size)
-        if not raw_bytes.strip():
-            return None
-        raw = raw_bytes.decode("utf-8", errors="replace")
+        if only_header:
+            # Header (erste 8 KB) + Tail (letzte 8 KB) lesen, damit wir
+            # die letzte echte Nachricht + deren Timestamp finden koennen.
+            # Sonst zeigt WA-Import-Parser bei grossen Files (88 KB+) nur
+            # Header und faellt fuer last_ts auf mtime zurueck = faelschlich
+            # "heute/kuerzlich".
+            with open(fpath, "rb") as f:
+                head_bytes = f.read(_MSG_PARSE_READ_BYTES)
+                try:
+                    f.seek(0, 2)
+                    size = f.tell()
+                    if size > _MSG_PARSE_READ_BYTES * 2:
+                        f.seek(max(0, size - _MSG_PARSE_READ_BYTES))
+                        tail_bytes = f.read()
+                    else:
+                        tail_bytes = b""
+                except Exception:
+                    tail_bytes = b""
+            if not head_bytes.strip():
+                return None
+            raw = head_bytes.decode("utf-8", errors="replace")
+            if tail_bytes:
+                # Separator, damit der Parser nicht in der Mitte abknickt
+                raw = raw + "\n" + tail_bytes.decode("utf-8", errors="replace")
+        else:
+            with open(fpath, "rb") as f:
+                raw_bytes = f.read(1024 * 512)
+            if not raw_bytes.strip():
+                return None
+            raw = raw_bytes.decode("utf-8", errors="replace")
     except Exception:
         return None
 
@@ -12405,31 +12431,56 @@ def _msg_normalize_whatsapp_file(fpath, fname, source_key, agent_name, only_head
     last_in_line = ""
     last_ts = None
     # kChat/Mattermost-User-IDs haben base64-haften Format wie
-    # "CKD+h88GIABIAZABAPABAg==" — die landen manchmal in WhatsApp-Files
-    # wegen gemischter Clipping-Pipelines. Solche Zeilen werden uebersprungen,
-    # damit die WhatsApp-Preview nur echte WhatsApp-Absender zeigt.
+    # "CKD+h88GIABIAZABAPABAg==". Der Import-Skript schreibt sie
+    # teilweise als Sender in WhatsApp-Files (wenn der WhatsApp-DB-Sender
+    # nicht aufloesbar ist). Wir suchen bevorzugt nach "echten" Sendern,
+    # aber wenn nur Hash-Sender vorhanden sind (typisch bei aktuellen
+    # Naiara-Chats), akzeptieren wir sie fuer last_ts + als last_in_line
+    # damit das aktuelle Datum/Message nicht verloren geht.
     _is_kchat_sender = _msgd_re.compile(r'^[A-Za-z0-9+/=]{20,}:\s')
-    for line in reversed(body.splitlines()):
-        if line.startswith("[") and "]" in line:
+
+    def _parse_ts(ts_str):
+        try:
+            return datetime.datetime.strptime(ts_str, "%Y-%m-%d %H:%M")
+        except Exception:
             try:
-                ts_str = line[1:line.index("]")]
-                rest = line[line.index("]")+1:].strip()
-                if rest.startswith("Ich:"):
-                    continue
-                # Nicht-WhatsApp-Muster (kChat-UserID-Hash) ignorieren.
-                if _is_kchat_sender.match(rest):
-                    continue
-                last_in_line = rest
-                try:
-                    last_ts = datetime.datetime.strptime(ts_str, "%Y-%m-%d %H:%M")
-                except Exception:
-                    try:
-                        last_ts = datetime.datetime.strptime(ts_str[:10], "%Y-%m-%d")
-                    except Exception:
-                        pass
-                break
+                return datetime.datetime.strptime(ts_str[:10], "%Y-%m-%d")
             except Exception:
+                return None
+
+    # last_ts = allerletzte sichtbare Timestamp (egal ob Hash- oder echter
+    # Sender — so kriegen wir das aktuelle Datum auch wenn die juengste
+    # Message kChat-Hash-Format hat).
+    # last_in_line = bevorzugt erste echte (nicht-Hash, nicht-"Ich:")
+    # Nachricht von hinten gelesen. Fallback: Hash-Nachricht.
+    best_real_line = ""
+    best_hash_line = ""
+    for line in reversed(body.splitlines()):
+        if not (line.startswith("[") and "]" in line):
+            continue
+        try:
+            ts_str = line[1:line.index("]")]
+            rest = line[line.index("]")+1:].strip()
+            parsed = _parse_ts(ts_str)
+            if parsed is None:
                 continue
+            # last_ts immer hochziehen wenn juenger
+            if last_ts is None or parsed > last_ts:
+                last_ts = parsed
+            if rest.startswith("Ich:"):
+                continue
+            is_hash = bool(_is_kchat_sender.match(rest))
+            if not is_hash and not best_real_line:
+                best_real_line = rest
+            elif is_hash and not best_hash_line:
+                best_hash_line = rest
+            # Beide Kandidaten gefunden? Stop.
+            if best_real_line and best_hash_line:
+                break
+        except Exception:
+            continue
+
+    last_in_line = best_real_line or best_hash_line
 
     if not last_ts:
         try:
@@ -12621,24 +12672,18 @@ def _msg_scan_whatsapp_source(source):
                             mtime = entry.stat(follow_symlinks=False).st_mtime
                         except Exception:
                             mtime = 0
-                        # Datum aus Dateinamen (letztes YYYY-MM-DD vor .txt) hat
-                        # Vorrang vor mtime (iCloud-Sync-Artefakte).
-                        fname_ts = None
-                        dm = _msgd_re.search(r"(\d{4}-\d{2}-\d{2})\.txt$", fname)
-                        if dm:
-                            try:
-                                fname_ts = datetime.datetime.strptime(dm.group(1), "%Y-%m-%d").timestamp()
-                            except Exception:
-                                fname_ts = None
-                        if fname_ts is not None:
-                            if fname_ts < cutoff:
-                                continue
-                            sort_ts = fname_ts
-                        else:
-                            if mtime < cutoff:
-                                continue
-                            sort_ts = mtime
-                        candidates.append((sort_ts, entry.path, fname, agent))
+                        # Der WhatsApp-Importer benennt Files beim Erst-Import
+                        # mit dem Datum der LETZTEN damals sichtbaren Nachricht
+                        # (z.B. whatsapp_chat_Naiara_2025-11-28.txt). Nach neuen
+                        # Nachrichten wird aber der Filename NICHT erneuert —
+                        # er bleibt historisch. Fuer den Cutoff nutzen wir
+                        # daher AUSSCHLIESSLICH mtime; Filename-Datum wird
+                        # ignoriert. Das Sort-ts wird aus der zuletzt-echten
+                        # Nachricht beim Parsing gezogen (siehe _msg_normalize_
+                        # whatsapp_file, last_ts).
+                        if mtime < cutoff:
+                            continue
+                        candidates.append((mtime, entry.path, fname, agent))
             except Exception:
                 continue
     candidates.sort(key=lambda x: x[0], reverse=True)
@@ -12720,7 +12765,76 @@ def _msg_scan_source(source):
     if stype == "imessage":
         msgs, _arch = _imsg_load_messages()
         return msgs
+    if stype == "kchat":
+        # kChat-Files liegen als kchat_*.txt in agent memory dirs
+        return _msg_scan_kchat_source(source)
     return []
+
+
+def _msg_scan_kchat_source(source):
+    """Scannt kchat_*.txt in allen Agent-Memorys. Analog zu whatsapp,
+    aber mit Prefix kchat_."""
+    out = []
+    cutoff = _msgd_time.time() - (_MSG_INBOX_WINDOW_DAYS * 86400)
+    candidates = []
+    for agent in ["privat", "signicat", "trustedcarrier", "standard", "system ward"]:
+        speicher = get_agent_speicher(agent)
+        memdir = os.path.join(speicher, "memory")
+        if not os.path.isdir(memdir):
+            continue
+        try:
+            with os.scandir(memdir) as it:
+                for entry in it:
+                    if not entry.is_file(follow_symlinks=False):
+                        continue
+                    fname = entry.name
+                    if not fname.startswith("kchat_") or not fname.endswith(".txt"):
+                        continue
+                    try:
+                        mtime = entry.stat(follow_symlinks=False).st_mtime
+                    except Exception:
+                        mtime = 0
+                    if mtime < cutoff:
+                        continue
+                    candidates.append((mtime, entry.path, fname, agent))
+        except Exception:
+            continue
+    candidates.sort(key=lambda x: x[0], reverse=True)
+    candidates = candidates[:_MSG_MAX_FILES_PER_SOURCE]
+    for _, fpath, fname, agent in candidates:
+        try:
+            # kchat-Files aehneln der chat.db-Struktur. Wir nutzen den
+            # whatsapp-Normalizer als Best-Effort — die Nachrichten-Struktur
+            # ist nah genug (Header + timestamp-prefix + body).
+            msg = _msg_normalize_whatsapp_file(fpath, fname, source["key"], agent, only_header=True)
+            if msg:
+                msg["type"] = "kchat"
+                msg["source"] = source["key"]
+                out.append(msg)
+        except Exception:
+            continue
+    return out
+
+
+def _kchat_probe_status() -> dict:
+    """Status des kChat-Imports. Liest letzte Zeilen von
+    /tmp/kchat_watcher.log und erkennt 401/unauthorized."""
+    log = "/tmp/kchat_watcher.log"
+    if not os.path.isfile(log):
+        return {"ok": False, "reason": "Watcher-Log nicht gefunden"}
+    try:
+        with open(log, "r", encoding="utf-8", errors="replace") as f:
+            f.seek(0, 2)
+            sz = f.tell()
+            f.seek(max(0, sz - 4000))
+            tail = f.read().lower()
+        if "401" in tail or "unauthorized" in tail or "ungueltig" in tail:
+            return {"ok": False, "reason": "Token 401 / ungueltig — neuen Token in config/models.json eintragen (kchat.auth_token)"}
+        if "error" in tail or "traceback" in tail:
+            return {"ok": False, "reason": "Watcher-Fehler (siehe /tmp/kchat_watcher.log)"}
+        return {"ok": True}
+    except Exception as e:
+        return {"ok": False, "reason": str(e)}
 
 
 def _msg_get_all(force=False):
@@ -12878,6 +12992,11 @@ def api_messages_sources():
         # Fehlermeldung zeigen kann, wenn die Permission fehlt.
         if src["type"] == "imessage":
             probe = _imsg_probe_access()
+            entry["access_ok"] = probe.get("ok", False)
+            entry["access_error"] = probe.get("reason") if not probe.get("ok") else None
+        # kChat: Token-Status aus Watcher-Log
+        elif src["type"] == "kchat":
+            probe = _kchat_probe_status()
             entry["access_ok"] = probe.get("ok", False)
             entry["access_error"] = probe.get("reason") if not probe.get("ok") else None
         out.append(entry)
@@ -13426,14 +13545,24 @@ _MSG_DASHBOARD_HTML = r"""<!DOCTYPE html>
             '<span>auch Archiv</span>' +
           '</label>'
         : '';
-      // iMessage: wenn FDA fehlt, Warnbanner im Header anzeigen.
+      // iMessage/kChat: bei access_ok=false ein rotes Warnbanner zeigen.
       var accessBanner = '';
-      if (s.type === 'imessage' && s.access_ok === false) {
+      if (s.access_ok === false) {
+        var title, hint;
+        if (s.type === 'imessage') {
+          title = 'Kein Zugriff auf Messages-App';
+          hint = 'Der Server-Prozess hat keinen Full-Disk-Access. Gehe zu <em>Systemeinstellungen &rarr; Datenschutz &amp; Sicherheit &rarr; Festplattenvollzugriff</em> und aktiviere <code>/Applications/Xcode.app/Contents/Developer/usr/bin/python3</code>.';
+        } else if (s.type === 'kchat') {
+          title = 'kChat-Import nicht aktiv';
+          hint = 'Der kChat-Watcher kann keine Nachrichten holen (meist: ungueltiger Token). Setze einen frischen Personal-Access-Token in <code>config/models.json</code> &rarr; <code>kchat.auth_token</code>.';
+        } else {
+          title = 'Kein Zugriff';
+          hint = '';
+        }
         accessBanner =
           '<div class="md-col-warning" style="background:#4a1f1f;border:1px solid #8a4a4a;color:#d09090;padding:8px 10px;border-radius:5px;margin:6px 0;font-size:11px;line-height:1.5">' +
-          '<strong>&#9888; Kein Zugriff auf Messages-App</strong><br>' +
-          'Der Server-Prozess hat keinen Full-Disk-Access. Gehe zu <em>Systemeinstellungen &rarr; Datenschutz &amp; Sicherheit &rarr; Festplattenvollzugriff</em> und aktiviere <code>/usr/bin/python3</code>. ' +
-          '<span style="color:#c06060">Detail: ' + esc(s.access_error || '') + '</span>' +
+          '<strong>&#9888; ' + title + '</strong><br>' + hint +
+          ' <span style="color:#c06060">Detail: ' + esc(s.access_error || '') + '</span>' +
           '</div>';
       }
       col.innerHTML =
