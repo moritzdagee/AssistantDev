@@ -90,11 +90,10 @@ Nicht aendern ohne explizite Anweisung.
 Nach JEDER Aenderung an web_server.py MUSS folgendes ausgefuehrt werden:
 
 1. Syntax pruefen: `python3 -m py_compile src/web_server.py`
-2. App Bundle aktualisieren (siehe unten)
-3. Server neu starten: `pkill -f web_server.py && sleep 3`
-4. Tests ausfuehren: `python3 ~/AssistantDev/tests/run_tests.py`
-5. Nur wenn alle Tests gruen: changelog.md aktualisieren
-6. Bei roten Tests: Fehler beheben, dann nochmal testen
+2. Tests ausfuehren: `python3 ~/AssistantDev/tests/run_tests.py`
+3. Deploy via `bash scripts/deploy.sh` (SIGTERM an alten Server, Neustart aus `src/`, Healthcheck auf :8080)
+4. Nur wenn alle Tests gruen + Healthcheck OK: changelog.md aktualisieren
+5. Bei roten Tests oder fehlgeschlagenem Healthcheck: Fehler beheben, dann nochmal
 
 NIEMALS deployen ohne gruene Tests!
 
@@ -129,19 +128,16 @@ Claude Code ist kompetent. Schreibe Prompts die **Was** und **Warum** erklaeren,
 
 Claude Code liest die Dateien selbst, versteht den Kontext selbst, und schreibt den Code selbst. Deine Aufgabe ist es, praezise Anforderungen zu formulieren — nicht, die Loesung vorwegzunehmen.
 
-## APP BUNDLE
+## LAUFZEIT & DEPLOYMENT
 
-Nach Aenderungen an src/*.py muessen die Dateien auch nach `/Applications/Assistant.app/Contents/Resources/` kopiert werden, da der laufende Server von dort laedt:
-```
-cp src/web_server.py /Applications/Assistant.app/Contents/Resources/
-cp src/search_engine.py /Applications/Assistant.app/Contents/Resources/
-```
+Der Web Server laeuft **direkt aus `src/web_server.py`** — es gibt keinen App-Bundle-Copy-Schritt mehr.
 
-Danach Server neu starten:
-```
-pkill -f web_server.py
-```
-(App startet automatisch neu)
+- Deploy ausschliesslich via `bash scripts/deploy.sh`:
+  sendet SIGTERM an den auf :8080 lauschenden Prozess, wartet bis zu 35s auf sauberes Ende,
+  startet `/usr/bin/python3 -u web_server.py` aus `src/`, macht Healthcheck auf `/agents`.
+- Watchdog-LaunchAgent `com.assistantdev.watchdog` startet den Server bei Crash neu (`logs/watchdog.log`).
+- `/Applications/AssistantDev.app/` ist nur noch ein Launcher-Wrapper fuer das native
+  Dashboard-Fenster (pywebview) — enthaelt KEINE Python-Quellen mehr. Niemals dorthin kopieren.
 
 ## Entwicklungs-Workflow (PFLICHT)
 
@@ -184,7 +180,7 @@ Branches: main (stable), develop (integration), feature/* (Arbeit)
 **Branching-Regeln:**
 - Neue Features immer von `develop` abzweigen: `scripts/new_feature.sh <name>`
 - Feature fertig: `scripts/finish_feature.sh <name>` (merged in develop)
-- Deploy: `scripts/deploy.sh` (kopiert ins App-Bundle, testet, committed, pusht)
+- Deploy: `scripts/deploy.sh` (stoppt alten Server, startet neu aus `src/`, Healthcheck)
 - Claude-Aufgabe starten: `scripts/claude_task.sh "<aufgabe>" [branch-name]`
 
 **Workflow:**

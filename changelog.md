@@ -4,6 +4,19 @@ Format: [Datum] Änderung | Datei | Grund
 
 ---
 
+## 2026-04-20
+
+### Housekeeping: CLAUDE.md-Dokumentation aktualisiert (Runtime-Realitaet)
+- **Was der Nutzer wollte:** Beim Audit der aktuellen Git-/Deploy-Lage fiel auf, dass CLAUDE.md noch den alten App-Bundle-Workflow (`/Applications/Assistant.app/Contents/Resources/` + `cp`-Schritt) beschreibt — obwohl `scripts/deploy.sh` den Server seit laengerem direkt aus `src/` startet und das Bundle gar nicht mehr existiert.
+- **Aenderungen in `CLAUDE.md`:**
+  - Abschnitt "APP BUNDLE" entfernt und ersetzt durch "LAUFZEIT & DEPLOYMENT" mit korrekter Beschreibung: Server laeuft direkt aus `src/web_server.py`, Deploy via `scripts/deploy.sh` (SIGTERM → Neustart → Healthcheck), Watchdog-LaunchAgent `com.assistantdev.watchdog` als Crash-Recovery, `/Applications/AssistantDev.app/` als reiner pywebview-Launcher-Wrapper.
+  - "PFLICHT: Tests nach jeder Aenderung": Schritt "App Bundle aktualisieren" und manuelles `pkill`-Restart entfernt; stattdessen Deploy-Aufruf von `scripts/deploy.sh`.
+  - Beschreibung `scripts/deploy.sh` im Git-Workflow-Abschnitt von "kopiert ins App-Bundle, testet, committed, pusht" korrigiert zu "stoppt alten Server, startet neu aus `src/`, Healthcheck".
+- **Warum:** Instruktionen fuer zukuenftige Claude-Sessions sollen die Realitaet beschreiben — sonst entstehen `cp`-Aufrufe auf nicht-existente Pfade oder unnoetige `pkill`-Schritte, die den Watchdog zu Race-Conditions fuehren koennen.
+- **Keine Code-Aenderungen, keine Tests noetig.**
+
+---
+
 ## 2026-04-16
 
 ### Feature: iMessage-Integration (direkter Read-Only-Zugriff auf chat.db)
