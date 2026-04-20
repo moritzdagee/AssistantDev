@@ -6,6 +6,32 @@ Format: [Datum] Änderung | Datei | Grund
 
 ## 2026-04-20
 
+### Feature: Email-Routing komplett auf Domain-Basis umgestellt
+- **Was der Nutzer wollte:** Emails sollten nicht mehr nach Keyword-Matching in Subject/Body einsortiert werden, sondern rein nach Domain der eigenen Adresse (Empfaenger bei IN, Absender bei OUT). Der `standard`-Agent wurde komplett abgeschafft. Zusaetzlich: alle importierten Emails sollen als globale Kopie in einem separaten Ordner liegen (fuer optionalen Cross-Agent-Zugriff), und Anhaenge sollen im Email-Text referenziert werden, damit das Dashboard sie spaeter beim Laden mitziehen kann.
+- **Routing-Regel (neu):**
+  - Mails an/von `@signicat.com` oder `@signicat.tech` → Agent `signicat`
+  - Mails an/von `*trustedcarrier*` (egal welche TLD: .net, .de, ...) → Agent `trustedcarrier`
+  - Alles andere → Agent `privat` (neuer Default, statt `standard`)
+- **Aenderungen in `src/email_watcher.py`:**
+  - Alte `ROUTING`-Liste (Keyword-Matching in Subject+Sender+Body[:500]) entfernt.
+  - Neue Konstanten `DOMAIN_AGENT_MAP_EXACT` (signicat.com/.tech) und `DOMAIN_AGENT_MAP_SUBSTR` (trustedcarrier).
+  - `route_agent()` neue Signatur: `(direction, sender, to_field)`. Bei IN werden alle Empfaenger-Adressen aus To/Cc durchgegangen, "meine" bevorzugt; bei OUT wird die From-Adresse genutzt.
+  - `DEFAULT_AGENT = "privat"` (statt `"standard"`).
+  - Neue Konstante `GLOBAL_EMAIL_DIR = email_inbox/all_emails/`. Jede importierte Email wird zusaetzlich dorthin als .txt geschrieben (identischer Content).
+  - Anhang-Handling umgestellt: Anhaenge werden nun VOR dem .txt-Write gespeichert und bekommen einen Timestamp+Direction+Kontakt-Prefix (`2026-04-20_11-05-12_IN_yuliya_at_onventis_nl__proposal.pdf`), damit gleichnamige Anhaenge verschiedener Mails nicht kollidieren.
+  - Im Email-Header der .txt steht jetzt eine Zeile `Anhaenge: N (file1, file2, ...)`. Das Dashboard kann die Liste parsen und beim Oeffnen einer Email die Anhaenge mitladen (Follow-up-Task fuer `web_server.py`).
+- **Migration des alten `standard/memory/`:**
+  - 514 Files aus `standard/memory/` nach `privat/memory/` verschoben.
+  - Namenskollisionen wurden mit `_std`-Suffix aufgeloest.
+  - `standard/memory/contacts.json` liegt jetzt als `privat/memory/contacts_from_standard_20260420.json` (fuer manuelle Zusammenfuehrung).
+  - `standard/` ist leer bis auf alten Backup-Folder + `_DEACTIVATED_20260420.txt`-Marker; der Agent wurde schon vorher aus `config/agents/` entfernt, also nicht mehr in der UI.
+- **Sofort-Fix vor dem Umbau:** 9 Onventis-Mails von Yuliya Kovtanyuk (2026-04-09 bis 2026-04-20), die durch das alte Keyword-Routing faelschlich in `standard/memory/` gelandet waren, wurden nach `signicat/memory/` verschoben.
+- **Deployment:**
+  - PyInstaller-Bundle neu gebaut (`build_emailwatcher/dist/EmailWatcher`), altes Binary als `EmailWatcher.bak_20260420_112004` gesichert.
+  - LaunchAgent `com.moritz.emailwatcher` via `launchctl unload/load` neu gestartet, neuer Prozess PID 26365.
+- **Tests:** 22 neue Tests in `tests/run_tests.py` (Section "Email-Routing Domain-Based 2026-04-20"): prueft Source-Konstanten, Funktionssignatur, Reihenfolge Attachments-vor-Text, plus 9 end-to-end Routing-Cases (signicat.com, signicat.tech, trustedcarrier.net/.de, privat, IN/OUT, Multi-Empfaenger). Suite: **885/885 gruen**.
+- **Bekannte Follow-ups:** (1) Dashboard-Integration der `Anhaenge:`-Header-Zeile in `src/web_server.py` steht noch aus, damit beim Email-Laden die Anhang-Files automatisch in den Kontext wandern. (2) Der global-Email-Folder wird befuellt, aber hat noch keinen UI-Einstiegspunkt.
+
 ### Housekeeping: CLAUDE.md-Dokumentation aktualisiert (Runtime-Realitaet)
 - **Was der Nutzer wollte:** Beim Audit der aktuellen Git-/Deploy-Lage fiel auf, dass CLAUDE.md noch den alten App-Bundle-Workflow (`/Applications/Assistant.app/Contents/Resources/` + `cp`-Schritt) beschreibt — obwohl `scripts/deploy.sh` den Server seit laengerem direkt aus `src/` startet und das Bundle gar nicht mehr existiert.
 - **Aenderungen in `CLAUDE.md`:**

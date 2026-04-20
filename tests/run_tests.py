@@ -2855,6 +2855,78 @@ if os.path.exists(_app_bin) and os.path.exists(_ew_path):
 
 # ============================================================
 
+section("Email-Routing Domain-Based 2026-04-20")
+
+# Der alte Keyword-basierte Routing-Mechanismus ist komplett ersetzt
+# durch reines Domain-Matching der eigenen Empfaenger- bzw. Sender-Adresse.
+test("EmailWatcher: DEFAULT_AGENT = 'privat' (nicht mehr 'standard')",
+     'DEFAULT_AGENT = "privat"' in _ew_src)
+test("EmailWatcher: alte ROUTING-Liste entfernt",
+     "ROUTING = [" not in _ew_src)
+test("EmailWatcher: DOMAIN_AGENT_MAP_EXACT definiert",
+     "DOMAIN_AGENT_MAP_EXACT" in _ew_src)
+test("EmailWatcher: DOMAIN_AGENT_MAP_SUBSTR definiert",
+     "DOMAIN_AGENT_MAP_SUBSTR" in _ew_src)
+test("EmailWatcher: signicat.com -> signicat im Mapping",
+     '"signicat.com": "signicat"' in _ew_src)
+test("EmailWatcher: signicat.tech -> signicat im Mapping",
+     '"signicat.tech": "signicat"' in _ew_src)
+test("EmailWatcher: trustedcarrier-Substring -> trustedcarrier",
+     '("trustedcarrier", "trustedcarrier")' in _ew_src)
+test("EmailWatcher: route_agent neue Signatur (direction, sender, to_field)",
+     "def route_agent(direction, sender, to_field):" in _ew_src)
+test("EmailWatcher: GLOBAL_EMAIL_DIR fuer globale Email-Kopie definiert",
+     "GLOBAL_EMAIL_DIR" in _ew_src)
+test("EmailWatcher: process_eml schreibt globale Kopie in GLOBAL_EMAIL_DIR",
+     "os.makedirs(GLOBAL_EMAIL_DIR" in _ew_src)
+test("EmailWatcher: process_eml referenziert Anhaenge im Header",
+     "Anhaenge: {len(saved_attachments)}" in _ew_src
+     or 'f"Anhaenge: {len(saved_attachments)}' in _ew_src)
+test("EmailWatcher: Anhaenge werden VOR dem .txt-Write gespeichert",
+     _ew_src.find("saved_attachments.append(final_name)")
+         < _ew_src.find("primary_path = os.path.join(memory_dir, email_filename)"))
+test("EmailWatcher: Attachments bekommen Timestamp-Prefix gegen Kollisionen",
+     "att_prefix = f\"{timestamp}_{direction}" in _ew_src)
+
+# Funktionsebene: route_agent liefert die erwarteten Agenten zurueck
+import importlib.util as _ilu
+_spec = _ilu.spec_from_file_location("email_watcher", _ew_path)
+_ew_mod = _ilu.module_from_spec(_spec)
+try:
+    _spec.loader.exec_module(_ew_mod)
+    test("route_agent: IN an signicat.com -> signicat",
+         _ew_mod.route_agent("IN", "x@external.com",
+                             "moritz.cremer@signicat.com") == "signicat")
+    test("route_agent: IN an signicat.tech -> signicat",
+         _ew_mod.route_agent("IN", "x@external.com",
+                             "moritz.cremer@signicat.tech") == "signicat")
+    test("route_agent: IN an trustedcarrier.net -> trustedcarrier",
+         _ew_mod.route_agent("IN", "x@external.com",
+                             "moritz.cremer@trustedcarrier.net") == "trustedcarrier")
+    test("route_agent: IN an trustedcarrier.de -> trustedcarrier",
+         _ew_mod.route_agent("IN", "x@external.com",
+                             "moritz@trustedcarrier.de") == "trustedcarrier")
+    test("route_agent: IN an privat-Adresse -> privat",
+         _ew_mod.route_agent("IN", "x@external.com",
+                             "moritz.cremer@me.com") == "privat")
+    test("route_agent: OUT von signicat -> signicat",
+         _ew_mod.route_agent("OUT", "moritz.cremer@signicat.com",
+                             "customer@example.com") == "signicat")
+    test("route_agent: OUT von trustedcarrier -> trustedcarrier",
+         _ew_mod.route_agent("OUT", "moritz@trustedcarrier.de",
+                             "x@external.com") == "trustedcarrier")
+    test("route_agent: unbekannte Domains -> privat (Default)",
+         _ew_mod.route_agent("IN", "spam@shady.xyz",
+                             "random@nowhere.net") == "privat")
+    test("route_agent: Multi-Empfaenger, eigene signicat bevorzugt",
+         _ew_mod.route_agent("IN", "acme@partner.io",
+             "moritz.cremer@me.com, moritz.cremer@signicat.com") == "signicat")
+except Exception as _e:
+    test(f"route_agent: Modul-Import erfolgreich ({_e})", False)
+
+
+# ============================================================
+
 section("Message Dashboard Kanban 2026-04-16")
 
 # Backend: Routen existieren in der Source

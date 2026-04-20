@@ -33,7 +33,12 @@ except ImportError:
 BASE = os.path.expanduser("~/Library/Mobile Documents/com~apple~CloudDocs/Downloads shared/claude_datalake")
 WATCH_DIR = os.path.join(BASE, "email_inbox")
 PROCESSED_SUBDIR = os.path.join(WATCH_DIR, "processed")
-DEFAULT_AGENT = "standard"
+# Globaler Email-Pool: Kopie jeder importierten Email als .txt, unabhaengig
+# vom primaeren Agent-Routing. Andere Agenten koennen darauf optional Zugriff
+# bekommen (nicht Default-Modus).
+GLOBAL_EMAIL_DIR = os.path.join(WATCH_DIR, "all_emails")
+# Fallback-Agent: Alles was nicht an eine bekannte Business-Domain ging.
+DEFAULT_AGENT = "privat"
 
 # Processed log lives in HOME folder - avoids iCloud permission issues with LaunchAgent
 PROCESSED_LOG = os.path.expanduser("~/.emailwatcher_processed.json")
@@ -41,15 +46,17 @@ PROCESSED_LOG = os.path.expanduser("~/.emailwatcher_processed.json")
 PROCESSED_LOG_MIRROR = os.path.join(BASE, "config", "email_processed_log.json")
 OWN_ADDRS_CACHE = os.path.expanduser("~/.emailwatcher_own_addresses.json")
 
-ROUTING = [
-    ("signicat", "signicat"),
-    ("elavon", "signicat"),
+# Agent-Routing nach Empfaenger- bzw. (bei OUT) Sender-Domain.
+# Mapping: Domain-Muster -> Agent-Name.
+# - exact-match: ganze Domain gleich (z.B. "signicat.com")
+# - substring-match: Token taucht irgendwo in der Domain auf (z.B. "trustedcarrier"
+#   matcht trustedcarrier.net, trustedcarrier.de, trustedcarrier.com, ...).
+DOMAIN_AGENT_MAP_EXACT = {
+    "signicat.com": "signicat",
+    "signicat.tech": "signicat",
+}
+DOMAIN_AGENT_MAP_SUBSTR = [
     ("trustedcarrier", "trustedcarrier"),
-    ("trusted carrier", "trustedcarrier"),
-    ("tangerina", "privat"),
-    ("privat", "privat"),
-    ("family", "privat"),
-    ("familie", "privat"),
 ]
 
 # ── Signatur-Extraktion Patterns ────────────────────────────────────────────
@@ -186,11 +193,46 @@ def save_processed(processed):
 
 # ── Routing ──────────────────────────────────────────────────────────────────
 
-def route_agent(subject, sender, body):
-    text = (subject + " " + sender + " " + body[:500]).lower()
-    for keyword, agent in ROUTING:
-        if keyword in text:
-            if os.path.exists(os.path.join(BASE, "config/agents", agent + ".txt")):
+def _domain_of(addr):
+    """Extrahiert Domain aus 'Name <local@domain.tld>' oder 'local@domain.tld'.
+    Gibt '' zurueck wenn keine Adresse gefunden."""
+    if not addr:
+        return ""
+    m = re.search(r'@([\w.-]+)', str(addr))
+    return m.group(1).lower() if m else ""
+
+
+def route_agent(direction, sender, to_field):
+    """Agent-Routing rein nach Domain der IN-VOLVIERTEN eigenen Adresse.
+
+    - Bei IN: welcher Empfaenger in To/Cc ist "mein" Account?
+    - Bei OUT: welche "meine" Absender-Adresse steht im From?
+
+    Mapping:
+        signicat.com, signicat.tech -> signicat
+        *trustedcarrier*           -> trustedcarrier
+        alles andere               -> privat (Default)
+
+    Die Funktion fuellt nie den alten "standard"-Agent — der existiert
+    nicht mehr.
+    """
+    if direction == "OUT":
+        candidates = [extract_email_addr(sender)]
+    else:
+        # alle To/Cc-Adressen durchgehen, "meine" bevorzugen
+        candidates = re.findall(r'[\w.+%-]+@[\w.-]+\.[a-zA-Z]{2,}', str(to_field or ""))
+        mine = [c for c in candidates if is_own(c)]
+        if mine:
+            candidates = mine
+
+    for addr in candidates:
+        domain = _domain_of(addr)
+        if not domain:
+            continue
+        if domain in DOMAIN_AGENT_MAP_EXACT:
+            return DOMAIN_AGENT_MAP_EXACT[domain]
+        for marker, agent in DOMAIN_AGENT_MAP_SUBSTR:
+            if marker in domain:
                 return agent
     return DEFAULT_AGENT
 
@@ -457,7 +499,7 @@ def process_eml(eml_path, processed):
 
         timestamp = datetime.datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
         body, attachments = extract_body_and_attachments(msg)
-        agent = route_agent(subject, sender, body)
+        agent = route_agent(direction, sender, to)
 
         memory_dir = os.path.join(BASE, agent, "memory")
         os.makedirs(memory_dir, exist_ok=True)
@@ -467,8 +509,28 @@ def process_eml(eml_path, processed):
         subject_clean = clean_for_filename(subject, 55)
         email_filename = f"{timestamp}_{direction}_{contact_clean}_{subject_clean}.txt"
 
-        # Dateiinhalt mit allen Metadaten
+        # 1) Anhaenge ZUERST speichern — damit wir ihre finalen Namen
+        #    im Email-Text referenzieren koennen. Um Kollisionen mit
+        #    gleichnamigen Anhaengen anderer Mails zu vermeiden, bekommt
+        #    jeder Anhang einen Timestamp+Direction-Prefix, der exakt zum
+        #    Email-Filename passt (ohne Subject). Beispiel:
+        #        2026-04-20_11-05-12_IN_yuliya_at_onventis_nl__proposal.pdf
+        saved_attachments = []
+        att_prefix = f"{timestamp}_{direction}_{contact_clean}__"
+        for att_name, att_data in attachments:
+            safe_att = re.sub(r'[^\w.-]', '_', att_name)
+            final_name = f"{att_prefix}{safe_att}"
+            att_path = os.path.join(memory_dir, final_name)
+            with open(att_path, 'wb') as f:
+                f.write(att_data)
+            saved_attachments.append(final_name)
+
+        # 2) Header + Body fuer .txt
         separator = '\u2500' * 60
+        if saved_attachments:
+            anh_line = f"Anhaenge: {len(saved_attachments)} ({', '.join(saved_attachments)})\n"
+        else:
+            anh_line = "Anhaenge: 0\n"
         content = (f"Von: {sender}\n"
                    f"An: {to}\n"
                    f"Betreff: {subject}\n"
@@ -477,10 +539,22 @@ def process_eml(eml_path, processed):
                    f"Kontakt: {contact}\n"
                    f"Agent: {agent}\n"
                    f"Importiert: {timestamp}\n"
+                   f"{anh_line}"
                    f"{separator}\n\n{body}")
 
-        with open(os.path.join(memory_dir, email_filename), 'w') as f:
+        primary_path = os.path.join(memory_dir, email_filename)
+        with open(primary_path, 'w') as f:
             f.write(content)
+
+        # 3) Globale Kopie nach email_inbox/all_emails/ — identischer Text,
+        #    damit andere Agenten bei Bedarf Zugriff bekommen koennen.
+        try:
+            os.makedirs(GLOBAL_EMAIL_DIR, exist_ok=True)
+            global_path = os.path.join(GLOBAL_EMAIL_DIR, email_filename)
+            with open(global_path, 'w') as f:
+                f.write(content)
+        except Exception as e:
+            print(f"  Warning: global-copy failed for {email_filename}: {e}")
 
         # Kontakt-Tracking: contacts.json aktualisieren
         if not is_own(contact):
@@ -493,15 +567,6 @@ def process_eml(eml_path, processed):
         # Index aktualisieren — robustly: direct API first, then a touch
         # fallback so the next reader rebuilds the index.
         _trigger_index_update_for(memory_dir, email_filename)
-
-        # Anhaenge speichern
-        saved_attachments = []
-        for att_name, att_data in attachments:
-            safe_att = re.sub(r'[^\w.-]', '_', att_name)
-            att_path = os.path.join(memory_dir, safe_att)
-            with open(att_path, 'wb') as f:
-                f.write(att_data)
-            saved_attachments.append(safe_att)
 
         processed.add(eml_name)
         save_processed(processed)
