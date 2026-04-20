@@ -6,6 +6,47 @@ Format: [Datum] Änderung | Datei | Grund
 
 ## 2026-04-20
 
+### Feature: Email-Anhaenge automatisch in Agent-Konversation + direkter "Mit Agent oeffnen"-Button im Posteingang
+- **Was der Nutzer wollte:** Wenn eine E-Mail entweder ueber die Suche oder ueber das Message-Dashboard (Posteingang) in eine Agent-Konversation geladen wird, sollen die referenzierten Anhaenge automatisch als Context-Files in die Session mitkommen. Zusaetzlich soll die Miniatur-Card im Dashboard einen direkten "Mit Agent oeffnen"-Button haben (kein "Ueberklicken" zur Expand-View mehr), und das Agent-Auswahl-Modal soll eine eigene Kachel fuer jeden Agent UND jeden Sub-Agent haben (statt nur die Parents).
+- **Backend (`src/web_server.py`):**
+  - `_msg_normalize_email_content`: Parst den neuen `Anhaenge: N (file1, file2, ...)`-Header (den der Email-Watcher seit heute schreibt) und fuellt das bisher leere `attachments: []`-Feld im Message-Dict. `has_attachments` liefert True sobald die Liste nicht leer ist (zusaetzlich zum bisherigen Body-Regex-Fallback).
+  - `_read_txt_email` in `/api/email-content`-Route: kennt jetzt die Header-Keys `anhaenge:` / `anhänge:`. Response enthaelt neu die Felder `attachments` (Filenames) und `attachment_paths` (absolute Pfade — die Anhaenge liegen im gleichen Memory-Ordner wie die Mail und werden vor dem Ausliefern per `os.path.exists` validiert).
+- **Frontend Posteingang / Message Dashboard:**
+  - `renderSingleCard`: Neuer Button `.md-card-agentbtn` ("\u21A9\uFE0E Agent") direkt oben rechts in der Miniatur-Card, zwischen Zeit und Quickread-Toggle. Klick lazy-fetcht die volle Message-Version (inkl. full_content + attachments) via `/api/messages/<id>` und oeffnet dann das Agent-Modal.
+  - CSS `.md-card-agentbtn` + Hover-State (Signicat-Blau, wie andere Primary-Buttons).
+  - `openAgentModal`: Umgebaut auf flaches Kachel-Grid. Jeder Parent-Agent UND jeder Sub-Agent bekommt jetzt eine eigene Kachel. Sub-Agenten werden als `parent \u203a sub` gerendert und mit CSS-Klasse `.md-agent-sub` leicht eingerueckt (11px statt 12px, blauerer Hover).
+- **Frontend Auto-Anhang-Load:**
+  - `handlePreloadMessage` (Deep-Link-Flow `/?agent=X&preload_message=Y` aus Dashboard → Agent-Chat): Nach dem Laden der Message werden `m.attachments` + `m.raw_file_path` kombiniert zu absoluten Pfaden und per POST `/load_selected_files` in die aktive Session geladen. Jede Datei bekommt ein `addCtxItem(name, 'file')`-Pill in der UI; Status-Message "📎 N Anhang/Anhaenge automatisch in Kontext geladen".
+  - `_openEmailInChat` (Suche → Chat): gleiche Logik, nutzt das neue `data.attachment_paths`-Feld aus der API-Response. Bilder-Anhaenge (png/jpg/gif/webp) werden vom bestehenden `/load_selected_files`-Endpoint automatisch als base64-Image fuers Vision-Modell vorbereitet.
+- **Doppelklick-Fenster bereits vorhanden:** Das separate `/messages/view/<id>`-Fenster (`_MSG_VIEW_HTML`) existierte schon mit `mv-btn-open-agent` und einem Agent-Dropdown inkl. Sub-Agenten — keine Aenderung noetig. Doppelklick auf Miniatur-Card oeffnet es weiterhin.
+- **Tests:** 16 neue Tests in `tests/run_tests.py` (Section "Email-Anhang-Auto-Load + Dashboard-Button 2026-04-20"): prueft Header-Parsing (Backend), attachment_paths im JSON-Response, CSS+HTML fuer md-card-agentbtn, Sub-Agent-Rendering im Modal, `/load_selected_files`-Aufruf in beiden Frontend-Flows, Status-Message. Suite **956/956 gruen**.
+- **Deploy:** `scripts/deploy.sh` — Server neu gestartet aus `src/` (PID 30802), Healthcheck OK.
+
+### Feature: React/Vite/TS/Tailwind/shadcn-Frontend-Scaffold (`frontend/`)
+- **Was der Nutzer wollte:** Start der Migration weg von inline HTML/CSS/JS in `src/web_server.py` (4 Triple-Quoted-Templates, zusammen ~8.000 Zeilen JS) hin zu einem getrennten `frontend/`-Projekt mit modernem Stack. pywebview/fetch-APIs bleiben unveraendert.
+- **Aenderungen:**
+  - Neues Verzeichnis `frontend/` mit install-ready Configs: `package.json`, `vite.config.ts`, `tsconfig.json`, `tsconfig.node.json`, `tailwind.config.ts`, `postcss.config.cjs`, `components.json`, `index.html`, `README.md`, `.gitignore`.
+  - Entry-Points: `src/main.tsx` (React 18 StrictMode + QueryClient + BrowserRouter), `src/App.tsx` (Router-Map fuer 8 Routen), `src/index.css` (Tailwind-Layer + shadcn-CSS-Variablen, dark-mode default).
+  - Layout: `Shell.tsx` (Sidebar + Content), `Sidebar.tsx` (Nav zu 7 Bereichen), `PageHeader.tsx`.
+  - shadcn/ui-Primitives: `button.tsx`, `card.tsx`, `separator.tsx`.
+  - Pages als Stubs mit `MigrationNotice`-Verweis auf die Original-Zeilen in `web_server.py`: `Dashboard` (/), `Messages` (/messages), `Admin` (/admin), `AdminDocs` (/admin/docs), `AdminChangelog` (/admin/changelog), `AdminPermissions` (/admin/permissions), `Memory` (/memory, /memory/:agent), `NotFound` (*).
+  - `lib/api.ts`: fetch-Wrapper mit `ApiError`-Typ + `pywebviewApi()`-Helper fuer die JS-zu-Python-Bridge.
+  - `lib/endpoints.ts`: zentrale Referenz-Liste aller Backend-Endpunkte, damit Pfad-Strings nicht verstreut sind.
+  - Dashboard-Page nutzt bereits `@tanstack/react-query` gegen den echten `/agents`-Endpunkt — als funktionierender End-to-End-Beleg.
+- **`src/web_server.py`:**
+  - Import erweitert um `send_from_directory`, `abort`.
+  - Neue Route `/app` + `/app/<path:subpath>` — SPA-Mount fuer die React-Bundle (liefert `frontend/dist/index.html`, 503 falls noch nicht gebaut).
+  - Neue Route `/assets/<path:filename>` — Vite-Build-Artefakte mit 1-Jahres-Cache.
+  - Neue Route `/favicon.svg`.
+  - Legacy-Route `/` unveraendert — solange `frontend/dist/` fehlt, laeuft das alte UI weiter (reversibel, non-destruktiv).
+  - Bonus-Fix: JS-Escape `'\u{1F4CE}'` in `handlePreloadMessage` (uncommitted in-progress) wurde zu `'\\u{1F4CE}'` umgestellt, weil der umgebende `HTML`-String kein raw-string ist und Python `py_compile` sonst an `truncated \uXXXX escape` stirbt. Verhalten im Browser/JS ist identisch.
+- **`src/dashboard_window.py`:**
+  - Berechnet `DEFAULT_PATH = "/app"` wenn `frontend/dist/index.html` existiert, sonst `""` (Legacy).
+  - Ohne CLI-Argument oeffnet das native Fenster damit automatisch die neue SPA, sobald gebaut.
+- **`tests/run_tests.py`:** Neue Sektion "Features 2026-04-20: Frontend-Scaffold" mit Existenz-Checks aller 30+ Scaffold-Dateien, `package.json`-Stack-Validierung und Backend-Route-Assertions. Suite: 936/936 gruen.
+- **Migrationsstand:** Die 4 inline HTML-Templates (`HTML`, `_MEMORY_PAGE_HTML`, `_MSG_DASHBOARD_HTML`, `_MSG_VIEW_HTML`) sind unveraendert. Ihre Funktionalitaet muss in Folge-Sessions Feature-fuer-Feature in die React-Pages portiert werden — Reihenfolge im `frontend/README.md`.
+- **Deployment:** `cd frontend && npm install && npm run build` erzeugt `frontend/dist/`. Sobald vorhanden, liefert `/app` die SPA und `dashboard_window.py` oeffnet sie als Default. Bis dahin aendert sich fuer den Nutzer nichts.
+
 ### Feature: Email-Routing komplett auf Domain-Basis umgestellt
 - **Was der Nutzer wollte:** Emails sollten nicht mehr nach Keyword-Matching in Subject/Body einsortiert werden, sondern rein nach Domain der eigenen Adresse (Empfaenger bei IN, Absender bei OUT). Der `standard`-Agent wurde komplett abgeschafft. Zusaetzlich: alle importierten Emails sollen als globale Kopie in einem separaten Ordner liegen (fuer optionalen Cross-Agent-Zugriff), und Anhaenge sollen im Email-Text referenziert werden, damit das Dashboard sie spaeter beim Laden mitziehen kann.
 - **Routing-Regel (neu):**

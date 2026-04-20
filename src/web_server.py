@@ -34,7 +34,7 @@ except ImportError:
     update_all_indexes = None
     reindex_all_embeddings_async = None
 import requests
-from flask import Flask, request, jsonify, render_template_string, make_response
+from flask import Flask, request, jsonify, render_template_string, make_response, send_from_directory, abort
 from bs4 import BeautifulSoup
 
 try:
@@ -6109,6 +6109,21 @@ function _openEmailInChat(emailMeta) {
     .then(function(data) {
       if (!data.ok) { addStatusMsg('E-Mail konnte nicht geladen werden: ' + (data.error || 'unbekannt')); return; }
       _showEmailCard(data);
+      // Anhaenge automatisch in Session-Kontext laden. Das Backend
+      // liefert die absoluten Pfade zu Files die neben der Email im
+      // gleichen Memory-Ordner liegen (vom Email-Watcher abgelegt).
+      if (data.attachment_paths && data.attachment_paths.length) {
+        fetch('/load_selected_files', {method:'POST', headers:{'Content-Type':'application/json'},
+          body: JSON.stringify({paths: data.attachment_paths, session_id: SESSION_ID})})
+          .then(function(rl){ return rl.json(); })
+          .then(function(dl){
+            if (dl && dl.ok && dl.loaded) {
+              dl.loaded.forEach(function(fn){ try { addCtxItem(fn, 'file'); } catch(e){} });
+              if (dl.loaded.length) addStatusMsg('📎 ' + dl.loaded.length + ' Anhang/Anhaenge der E-Mail in Kontext geladen');
+            }
+          })
+          .catch(function(e){ console.log('Anhang-Load-Fehler:', e); });
+      }
     })
     .catch(function(e) { addStatusMsg('Fehler: ' + e.message); });
 }
@@ -7036,6 +7051,27 @@ async function handlePreloadMessage(msgId){
     var m = d.message;
     var body = m.full_content || m.preview || '';
     if (body.length > 4000) body = body.substring(0, 4000) + '\\n[... gekuerzt]';
+    // Anhaenge der Mail mit in den Session-Kontext laden. Der Watcher
+    // schreibt seit 2026-04-20 eine Anhaenge-Liste in den .txt-Header;
+    // die Dateien selbst liegen im gleichen Memory-Ordner wie die Mail.
+    try {
+      if (m.attachments && m.attachments.length && m.raw_file_path) {
+        var dirEnd = m.raw_file_path.lastIndexOf('/');
+        if (dirEnd > 0) {
+          var dir = m.raw_file_path.substring(0, dirEnd);
+          var paths = m.attachments.map(function(a){ return dir + '/' + a; });
+          var rl = await fetch('/load_selected_files', {
+            method:'POST', headers:{'Content-Type':'application/json'},
+            body: JSON.stringify({paths: paths, session_id: SESSION_ID})
+          });
+          var dl = await rl.json();
+          if (dl.ok && dl.loaded) {
+            dl.loaded.forEach(function(fn){ try { addCtxItem(fn, 'file'); } catch(e){} });
+            if (dl.loaded.length) addStatusMsg('\\u{1F4CE} ' + dl.loaded.length + ' Anhang/Anhaenge automatisch in Kontext geladen');
+          }
+        }
+      }
+    } catch(e){ console.log('Anhang-Load-Fehler:', e); }
     var previewHtml = mdEscHtml(body.substring(0, 700));
     var banner = document.createElement('div');
     banner.className = 'preload-banner';
@@ -7099,6 +7135,52 @@ window.onload = async () => {
 </body>
 </html>
 """
+
+# ─── REACT-FRONTEND (frontend/dist/) ─────────────────────────────────────────
+# Non-destruktives Static-Serving fuer das neue React/Vite-Frontend.
+# Solange `frontend/dist/` fehlt, bleiben alle bestehenden Legacy-HTML-Routen
+# unveraendert aktiv. Sobald gebaut, liefert `/app` die React-SPA und
+# `/assets/...` die Vite-Build-Artefakte. API-Routen bleiben 1:1 identisch.
+
+_FRONTEND_DIST = os.path.normpath(
+    os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'frontend', 'dist')
+)
+
+
+def _react_frontend_ready():
+    return os.path.isfile(os.path.join(_FRONTEND_DIST, 'index.html'))
+
+
+@app.route('/app')
+@app.route('/app/')
+@app.route('/app/<path:subpath>')
+def react_app(subpath=''):
+    if not _react_frontend_ready():
+        return (
+            'React-Frontend noch nicht gebaut — `cd frontend && npm install && npm run build` ausfuehren.',
+            503,
+        )
+    del subpath  # SPA-Fallback: jede /app/*-Route liefert index.html
+    resp = make_response(send_from_directory(_FRONTEND_DIST, 'index.html'))
+    resp.headers['Cache-Control'] = 'no-store, no-cache, must-revalidate, max-age=0'
+    return resp
+
+
+@app.route('/assets/<path:filename>')
+def react_assets(filename):
+    assets_dir = os.path.join(_FRONTEND_DIST, 'assets')
+    if not os.path.isdir(assets_dir):
+        abort(404)
+    return send_from_directory(assets_dir, filename, max_age=31536000)
+
+
+@app.route('/favicon.svg')
+def react_favicon():
+    path = os.path.join(_FRONTEND_DIST, 'favicon.svg')
+    if os.path.isfile(path):
+        return send_from_directory(_FRONTEND_DIST, 'favicon.svg')
+    abort(404)
+
 
 @app.route("/")
 def index():
@@ -8807,8 +8889,9 @@ def email_content_route():
             body = full[header_end+2:] if header_end < len(full) else ''
             headers = {}
             for line in header_block.split('\n'):
-                for key_de, key_en in [('von:','from'),('an:','to'),('betreff:','subject'),('datum:','date'),('cc:','cc'),('kopie:','cc'),('message-id:','message_id')]:
-                    if line.lower().startswith(key_de) or line.lower().startswith(key_en + ':'):
+                low = line.lower()
+                for key_de, key_en in [('von:','from'),('an:','to'),('betreff:','subject'),('datum:','date'),('cc:','cc'),('kopie:','cc'),('message-id:','message_id'),('anhaenge:','attachments'),('anhänge:','attachments')]:
+                    if low.startswith(key_de) or low.startswith(key_en + ':'):
                         headers[key_en] = line.split(':', 1)[1].strip()
                         break
             return headers, body
@@ -8854,12 +8937,33 @@ def email_content_route():
                             pass
                         if len(body) > 5000:
                             body = body[:5000] + '\n\n[... gekuerzt, ' + str(len(body)) + ' Zeichen gesamt]'
+                        # Anhaenge-Header parsen (gleiche Logik wie in
+                        # _msg_normalize_email_content): "N (file1, file2)" →
+                        # Liste von Filenames relativ zum Memory-Ordner.
+                        attachments_list = []
+                        anh_raw = headers.get('attachments', '')
+                        if anh_raw:
+                            import re as _re_att
+                            m_anh = _re_att.match(r"\s*\d+\s*\((.+)\)\s*$", anh_raw)
+                            if m_anh:
+                                attachments_list = [x.strip() for x in m_anh.group(1).split(",") if x.strip()]
+                            elif "," in anh_raw or "." in anh_raw:
+                                attachments_list = [x.strip() for x in anh_raw.split(",") if x.strip()]
+                        # Absolute Pfade berechnen (fuer /load_selected_files).
+                        # Die Anhaenge liegen neben der Email im gleichen Ordner.
+                        base_dir = os.path.dirname(fpath)
+                        attachment_paths = [
+                            os.path.join(base_dir, a) for a in attachments_list
+                            if os.path.exists(os.path.join(base_dir, a))
+                        ]
                         return jsonify({
                             'ok': True,
                             'from_name': from_name, 'from_email': from_email,
                             'to': headers.get('to', ''), 'cc': headers.get('cc', ''),
                             'subject': subj_txt, 'date': date_display,
                             'message_id': mid, 'body': body, 'file': fname,
+                            'attachments': attachments_list,
+                            'attachment_paths': attachment_paths,
                         })
                     with open(fpath, 'r', errors='replace') as f:
                         msg = _email_mod.message_from_file(f)
@@ -12349,7 +12453,28 @@ def _msg_normalize_email_content(fpath, fname, source_key, agent_name, only_head
     if len(body_clean) > _MSG_PREVIEW_LEN:
         preview = preview + "..."
 
-    has_attachments = bool(_msgd_re.search(r"(anhang|attachment|\[cid:|\[Bild\]|\.pdf|\.docx|\.xlsx|\.png|\.jpg)", body_clean[:2000], _msgd_re.IGNORECASE))
+    # Anhaenge-Header parsen: Der Email-Watcher schreibt seit 2026-04-20
+    # eine Zeile `Anhaenge: N (file1, file2, ...)` direkt unter die
+    # anderen Header. Wir extrahieren die Filenames, damit Dashboard und
+    # Chat-UI die Anhaenge zusammen mit der Mail in den Session-Kontext
+    # laden koennen. Leerer String wenn der Watcher keine Anhaenge fand.
+    attachments_list = []
+    anh_raw = fields.get("anhaenge", fields.get("anhänge", fields.get("attachments", "")))
+    if anh_raw:
+        m_anh = _msgd_re.match(r"\s*\d+\s*\((.+)\)\s*$", anh_raw)
+        if m_anh:
+            inner = m_anh.group(1).strip()
+            attachments_list = [x.strip() for x in inner.split(",") if x.strip()]
+        elif "," in anh_raw or "." in anh_raw:
+            # Fallback: nur Komma-Liste ohne "N (...)"-Wrapper
+            attachments_list = [x.strip() for x in anh_raw.split(",") if x.strip()]
+
+    has_attachments = (
+        len(attachments_list) > 0
+        or bool(_msgd_re.search(
+            r"(anhang|attachment|\[cid:|\[Bild\]|\.pdf|\.docx|\.xlsx|\.png|\.jpg)",
+            body_clean[:2000], _msgd_re.IGNORECASE))
+    )
 
     return {
         "id": _msg_hash_path(fpath),
@@ -12365,7 +12490,7 @@ def _msg_normalize_email_content(fpath, fname, source_key, agent_name, only_head
         "timestamp_epoch": dt.timestamp(),
         "read": False,
         "has_attachments": has_attachments,
-        "attachments": [],
+        "attachments": attachments_list,
         "raw_file_path": fpath,
         "message_id": fields.get("message-id", ""),
         "type": "email",
@@ -13434,6 +13559,8 @@ _MSG_DASHBOARD_HTML = r"""<!DOCTYPE html>
   .md-card-quickread { background:transparent; border:none; color:#555; cursor:pointer; padding:0 2px; font-size:13px; line-height:1; border-radius:3px; flex-shrink:0; transition:color .12s, background .12s; }
   .md-card-quickread:hover { color:#f0c060; background:rgba(240,192,96,0.08); }
   .md-card.unread .md-card-quickread { color:#f0c060; }
+  .md-card-agentbtn { background:#1B6FD8; color:#fff; border:none; border-radius:4px; cursor:pointer; padding:2px 7px; font-size:10px; font-weight:600; line-height:1.4; flex-shrink:0; transition:background .12s; font-family:inherit; letter-spacing:0.2px; }
+  .md-card-agentbtn:hover { background:#2580e8; }
   .md-card.keyboard-active { box-shadow:0 0 0 2px #4a8aca; }
   .md-card.keyboard-active.unread { box-shadow:0 0 0 2px #f0c060; }
   .md-card.selected { background:#1e2a4a; border-color:#4a8aca; }
@@ -13467,6 +13594,9 @@ _MSG_DASHBOARD_HTML = r"""<!DOCTYPE html>
   .md-agent-choice.recommended { border-color:#f0c060; background:#22201a; color:#f0c060; font-weight:700; }
   .md-agent-choice .md-agent-desc { font-size:10px; font-weight:400; color:#888; margin-top:3px; display:block; }
   .md-agent-choice.recommended .md-agent-desc { color:#cba976; }
+  .md-agent-choice.md-agent-sub { padding-left:22px; font-size:11px; background:#181818; border-color:#262626; }
+  .md-agent-choice.md-agent-sub:hover { border-color:#7ab8f5; color:#7ab8f5; background:#15202a; }
+  .md-agent-choice.md-agent-sub.recommended { border-color:#f0c060; background:#22201a; color:#f0c060; }
   .md-modal-actions { display:flex; justify-content:flex-end; gap:8px; }
   .md-close { background:none; border:none; color:#666; font-size:20px; cursor:pointer; float:right; margin-top:-6px; }
   .md-close:hover { color:#f0c060; }
@@ -13634,6 +13764,7 @@ _MSG_DASHBOARD_HTML = r"""<!DOCTYPE html>
         '<span class="md-dot ' + (m.read ? '' : 'unread') + '"></span>' +
         '<span class="md-card-sender">' + esc(m.sender_name) + '</span>' +
         '<span class="md-card-time">' + esc(fmtTime(m.timestamp)) + '</span>' +
+        '<button class="md-card-agentbtn" title="Mit Agent oeffnen">\u21A9\uFE0E Agent</button>' +
         '<button class="md-card-quickread" title="' + qrBtnTitle + '">' + qrBtnIcon + '</button>' +
       '</div>' +
       '<div class="md-card-subject">' + esc(m.subject || '(kein Betreff)') + '</div>' +
@@ -13654,6 +13785,19 @@ _MSG_DASHBOARD_HTML = r"""<!DOCTYPE html>
     card.querySelector('.md-card-quickread').addEventListener('click', function(ev){
       ev.stopPropagation();
       toggleRead(m);
+    });
+    // Direkter "Mit Agent oeffnen"-Button auf der Miniatur — kein
+    // Ueberklicken mehr noetig um zur Expand-View zu kommen. Lazy-fetcht
+    // die volle Message (inkl. full_content + attachments) und zeigt
+    // dann das Agent-Auswahl-Modal mit allen Agenten + Sub-Agenten.
+    card.querySelector('.md-card-agentbtn').addEventListener('click', async function(ev){
+      ev.stopPropagation();
+      try {
+        var rf = await fetch('/api/messages/' + encodeURIComponent(m.id));
+        var df = await rf.json();
+        if (df.ok && df.message) { openAgentModal(df.message); return; }
+      } catch(e) {}
+      openAgentModal(m);
     });
     body.appendChild(card);
   }
@@ -13923,6 +14067,9 @@ _MSG_DASHBOARD_HTML = r"""<!DOCTYPE html>
       var agents = await ensureAgents();
       var recommended = (STATE.sources.find(function(s){ return s.key === msg.source; }) || {}).recommended_agent;
       list.innerHTML = '';
+      // Flaches Grid: Jeder Agent UND jeder Sub-Agent bekommt eine
+      // eigene Kachel. Parent wird mit Label gezeigt, Sub als
+      // "parent \u203a sub". Recommended bekommt den Stern.
       agents.forEach(function(a){
         var btn = document.createElement('button');
         btn.className = 'md-agent-choice' + (a.name === recommended ? ' recommended' : '');
@@ -13930,6 +14077,20 @@ _MSG_DASHBOARD_HTML = r"""<!DOCTYPE html>
                         (a.description ? '<span class="md-agent-desc">' + esc(a.description) + '</span>' : '');
         btn.addEventListener('click', function(){ openChatWithMessage(a.name, msg.id); });
         list.appendChild(btn);
+        // Sub-Agenten als eigene Kacheln direkt danach — so kann der
+        // User den passenden Spezial-Agent (z.B. signicat_outbound,
+        // signicat_meddpicc) direkt waehlen ohne Umweg.
+        if (a.subagents && a.subagents.length) {
+          a.subagents.forEach(function(sub){
+            var subLabel = (a.label || a.name) + ' \u203a ' + (sub.label || sub.name);
+            var sbtn = document.createElement('button');
+            sbtn.className = 'md-agent-choice md-agent-sub' + (sub.name === recommended ? ' recommended' : '');
+            sbtn.innerHTML = '<span>' + esc(subLabel) + (sub.name === recommended ? ' \u2605' : '') + '</span>' +
+                             (sub.description ? '<span class="md-agent-desc">' + esc(sub.description) + '</span>' : '');
+            sbtn.addEventListener('click', function(){ openChatWithMessage(sub.name, msg.id); });
+            list.appendChild(sbtn);
+          });
+        }
       });
     } catch(e){
       list.innerHTML = '<span style="color:#c66">Fehler beim Laden der Agenten.</span>';

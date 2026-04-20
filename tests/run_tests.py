@@ -2927,6 +2927,78 @@ except Exception as _e:
 
 # ============================================================
 
+section("Email-Anhang-Auto-Load + Dashboard-Button 2026-04-20")
+
+# Backend: Anhaenge-Header-Parsing in _msg_normalize_email_content
+test("Dashboard: Email-Parser kennt 'anhaenge' Header-Key",
+     'fields.get("anhaenge"' in _ws_src)
+test("Dashboard: attachments-Liste wird aus Header befuellt",
+     "attachments_list = []" in _ws_src
+     and '"attachments": attachments_list' in _ws_src)
+test("Dashboard: has_attachments nutzt attachments_list-Laenge",
+     "len(attachments_list) > 0" in _ws_src)
+
+# Backend: email_content_route gibt attachment_paths mit
+test("email_content_route: parst 'anhaenge' Header",
+     "'anhaenge:','attachments'" in _ws_src
+     or "('anhaenge:','attachments')" in _ws_src)
+test("email_content_route: returned attachment_paths",
+     "'attachment_paths': attachment_paths" in _ws_src)
+test("email_content_route: attachment_paths = absolute Pfade",
+     "base_dir = os.path.dirname(fpath)" in _ws_src
+     and "attachment_paths = [" in _ws_src)
+
+# Frontend: Miniatur-Card hat direkten 'Mit Agent oeffnen'-Button
+test("Dashboard-Card: .md-card-agentbtn in HTML",
+     "'md-card-agentbtn'" in _ws_src
+     or 'class="md-card-agentbtn"' in _ws_src
+     or "class=\"md-card-agentbtn\"" in _ws_src)
+test("Dashboard-Card: .md-card-agentbtn CSS definiert",
+     ".md-card-agentbtn { background:" in _ws_src
+     or ".md-card-agentbtn {background:" in _ws_src)
+test("Dashboard-Card: Agent-Button-Handler lazy-fetcht volle Message",
+     "card.querySelector('.md-card-agentbtn')" in _ws_src
+     and "openAgentModal(df.message)" in _ws_src)
+
+# Frontend: Agent-Modal zeigt Sub-Agents als eigene Kacheln
+test("Agent-Modal: .md-agent-sub CSS-Klasse definiert",
+     ".md-agent-choice.md-agent-sub" in _ws_src)
+test("Agent-Modal: Sub-Agents werden iteriert (a.subagents.forEach)",
+     "a.subagents.forEach" in _ws_src)
+test("Agent-Modal: Sub-Agent-Label 'parent > sub' gerendert",
+     "(a.label || a.name) + ' \\u203a '" in _ws_src
+     or "(a.label || a.name) + ' \u203a '" in _ws_src)
+test("Agent-Modal: Sub-Agent-Klick ruft openChatWithMessage(sub.name, ...)",
+     "openChatWithMessage(sub.name, msg.id)" in _ws_src)
+
+# Frontend: handlePreloadMessage laedt Anhaenge automatisch
+test("handlePreloadMessage: laedt Anhaenge via /load_selected_files",
+     "handlePreloadMessage" in _ws_src
+     and "/load_selected_files" in _ws_src
+     and "m.attachments" in _ws_src)
+test("handlePreloadMessage: addCtxItem fuer jeden Anhang",
+     "dl.loaded.forEach" in _ws_src
+     and "addCtxItem(fn, 'file')" in _ws_src)
+test("handlePreloadMessage: Status-Msg bei Auto-Load",
+     "automatisch in Kontext geladen" in _ws_src)
+
+# Frontend: _openEmailInChat (Suche) laedt Anhaenge ebenfalls automatisch
+test("_openEmailInChat: nutzt data.attachment_paths aus API",
+     "data.attachment_paths" in _ws_src
+     and "_openEmailInChat" in _ws_src)
+test("_openEmailInChat: Load-Request enthaelt attachment_paths",
+     "body: JSON.stringify({paths: data.attachment_paths" in _ws_src)
+
+# Doppelklick-Fenster: bereits da, Button dort existiert
+test("Msg-View-Fenster: 'Mit Agent oeffnen' Button vorhanden",
+     'id="mv-btn-open-agent"' in _ws_src)
+test("Msg-View-Fenster: Sub-Agenten im Dropdown-Menu",
+     "a.subagents.forEach" in _ws_src
+     and "(a.label||a.name)+' \\u203a '" in _ws_src)
+
+
+# ============================================================
+
 section("Message Dashboard Kanban 2026-04-16")
 
 # Backend: Routen existieren in der Source
@@ -3474,6 +3546,126 @@ def _cleanup_test_artifacts():
         print(f"\n{YELLOW}Test-Artefakte aufgeraeumt: {total_removed} Datei(en) verschoben nach {backup_root}{RESET}")
         for ag, n in removed_per_agent.items():
             print(f"  {ag}: {n}")
+
+
+# ============================================================
+# FRONTEND-MIGRATION 2026-04-20
+# Scaffold fuer React/Vite/TS/Tailwind/shadcn/ui neben dem inline-HTML.
+# Tests pruefen Existenz der Scaffold-Dateien und dass web_server.py
+# bzw. dashboard_window.py die neuen Routen korrekt ansprechen — ohne
+# das React-Frontend tatsaechlich zu bauen (kein npm install in CI).
+# ============================================================
+section("Features 2026-04-20: Frontend-Scaffold")
+
+_REPO = os.path.expanduser("~/AssistantDev")
+_FRONT = os.path.join(_REPO, "frontend")
+
+for _fname in (
+    "package.json",
+    "vite.config.ts",
+    "tsconfig.json",
+    "tsconfig.node.json",
+    "tailwind.config.ts",
+    "postcss.config.cjs",
+    "components.json",
+    "index.html",
+    "README.md",
+    ".gitignore",
+):
+    test(
+        f"frontend/{_fname} existiert",
+        os.path.isfile(os.path.join(_FRONT, _fname)),
+    )
+
+for _fname in (
+    "src/main.tsx",
+    "src/App.tsx",
+    "src/index.css",
+    "src/vite-env.d.ts",
+    "src/lib/api.ts",
+    "src/lib/endpoints.ts",
+    "src/lib/utils.ts",
+    "src/components/layout/Shell.tsx",
+    "src/components/layout/Sidebar.tsx",
+    "src/components/layout/PageHeader.tsx",
+    "src/components/MigrationNotice.tsx",
+    "src/components/ui/button.tsx",
+    "src/components/ui/card.tsx",
+    "src/components/ui/separator.tsx",
+):
+    test(
+        f"frontend/{_fname} existiert",
+        os.path.isfile(os.path.join(_FRONT, _fname)),
+    )
+
+for _page in (
+    "Dashboard",
+    "Messages",
+    "Admin",
+    "AdminDocs",
+    "AdminChangelog",
+    "AdminPermissions",
+    "Memory",
+    "NotFound",
+):
+    test(
+        f"frontend/src/pages/{_page}.tsx existiert",
+        os.path.isfile(os.path.join(_FRONT, "src", "pages", f"{_page}.tsx")),
+    )
+
+try:
+    with open(os.path.join(_FRONT, "package.json"), encoding="utf-8") as _fh:
+        _pkg = json.load(_fh)
+    _deps = {**_pkg.get("dependencies", {}), **_pkg.get("devDependencies", {})}
+    for _dep in (
+        "react",
+        "react-dom",
+        "react-router-dom",
+        "vite",
+        "typescript",
+        "tailwindcss",
+        "@tanstack/react-query",
+        "class-variance-authority",
+        "lucide-react",
+    ):
+        test(f"package.json → {_dep} gelistet", _dep in _deps)
+    _scripts = _pkg.get("scripts", {})
+    for _s in ("dev", "build", "preview"):
+        test(f"package.json → script '{_s}' definiert", _s in _scripts)
+except Exception as _e:
+    test("package.json parsebar", False, str(_e))
+
+try:
+    with open(os.path.join(_REPO, "src", "web_server.py"), encoding="utf-8") as _fh:
+        _ws = _fh.read()
+    test("web_server.py importiert send_from_directory", "send_from_directory" in _ws)
+    test("web_server.py definiert _FRONTEND_DIST", "_FRONTEND_DIST" in _ws)
+    test(
+        "web_server.py definiert /app-Route",
+        "@app.route('/app')" in _ws or '@app.route("/app")' in _ws,
+    )
+    test(
+        "web_server.py definiert /assets-Route",
+        "@app.route('/assets/<path:filename>')" in _ws
+        or '@app.route("/assets/<path:filename>")' in _ws,
+    )
+    test(
+        "web_server.py behaelt Legacy-Index-Route",
+        '@app.route("/")' in _ws or "@app.route('/')" in _ws,
+    )
+except Exception as _e:
+    test("web_server.py lesbar", False, str(_e))
+
+try:
+    with open(os.path.join(_REPO, "src", "dashboard_window.py"), encoding="utf-8") as _fh:
+        _dw = _fh.read()
+    test("dashboard_window.py kennt DEFAULT_PATH", "DEFAULT_PATH" in _dw)
+    test(
+        "dashboard_window.py verweist auf frontend/dist/index.html",
+        "frontend" in _dw and "dist" in _dw and "index.html" in _dw,
+    )
+except Exception as _e:
+    test("dashboard_window.py lesbar", False, str(_e))
 
 
 _cleanup_test_artifacts()
