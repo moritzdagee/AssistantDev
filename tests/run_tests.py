@@ -3143,6 +3143,79 @@ except Exception as e:
     test("GET /admin/permissions HTTP-Aufruf", False, details=str(e))
 
 
+section("Timezone-Konsistenz 2026-04-20")
+
+# Zentraler Helper muss existieren und korrekte API haben
+_tu_path = os.path.expanduser("~/AssistantDev/src/timeutils.py")
+test("timeutils.py existiert", os.path.isfile(_tu_path))
+try:
+    sys.path.insert(0, os.path.expanduser("~/AssistantDev/src"))
+    import timeutils as _tu
+    _tu_ok = True
+except Exception as _e:
+    _tu_ok = False
+    print(f"  import-error: {_e}")
+test("timeutils importierbar", _tu_ok)
+
+if _tu_ok:
+    for name in ("now", "now_iso", "from_unix", "from_apple",
+                 "to_local", "to_local_naive", "parse_rfc822"):
+        test(f"timeutils.{name} verfuegbar", hasattr(_tu, name))
+
+    # Runtime: now() liefert aware datetime in lokaler TZ
+    _t = _tu.now()
+    test("timeutils.now() ist timezone-aware", _t.tzinfo is not None)
+    test("timeutils.now_iso() enthaelt TZ-Offset", any(x in _tu.now_iso() for x in ('+', '-')) and 'T' in _tu.now_iso())
+
+    # Apple-Timestamp-Helper: 0 -> 2001-01-01 UTC (Apple-Epoch).
+    # Rechne zurueck in UTC fuer den Vergleich (lokale Zeit kann je nach
+    # TZ 2000-12-31 sein).
+    _dt_apple_utc = _tu.from_apple(0).astimezone(_dt.timezone.utc) if '_dt' in dir() else None
+    if _dt_apple_utc is None:
+        import datetime as _dt_local_ref
+        _dt_apple_utc = _tu.from_apple(0).astimezone(_dt_local_ref.timezone.utc)
+    test("timeutils.from_apple(0) == 2001-01-01 UTC (Apple-Epoch)",
+         _dt_apple_utc.year == 2001 and _dt_apple_utc.month == 1 and _dt_apple_utc.day == 1)
+
+# Regression: Verhindere echte Aufrufe von utcfromtimestamp/utcnow
+# (produzieren naive-UTC-Timestamps die als lokal missverstanden werden).
+# Wir matchen nur `.utcnow(` / `.utcfromtimestamp(` — also echte Method-
+# Calls. Kommentare/Docstrings/String-Hinweise erwaehnen gern den Namen,
+# aber ohne '(' direkt danach.
+_src_dirs = [
+    os.path.expanduser("~/AssistantDev/src"),
+    os.path.expanduser("~/AssistantDev/scripts"),
+]
+_utc_leaks = []
+import re as _re_audit
+_call_re = _re_audit.compile(r'\.(utcnow|utcfromtimestamp)\s*\(')
+for _base in _src_dirs:
+    for _root, _dirs, _files in os.walk(_base):
+        for _f in _files:
+            if not _f.endswith('.py') or '.backup' in _f:
+                continue
+            _fp = os.path.join(_root, _f)
+            # timeutils.py definiert die Regel selbst — die Docstring
+            # erwaehnt beide Namen als Negativ-Beispiel. Aussen vor lassen.
+            if _f == 'timeutils.py':
+                continue
+            try:
+                with open(_fp, 'r', encoding='utf-8', errors='replace') as _fh:
+                    _content = _fh.read()
+            except Exception:
+                continue
+            for _ln, _line in enumerate(_content.splitlines(), 1):
+                if _call_re.search(_line):
+                    # Kommentar?
+                    if _line.lstrip().startswith('#'):
+                        continue
+                    _utc_leaks.append(f"{_fp}:{_ln}: {_line.strip()[:100]}")
+
+test("Keine utcfromtimestamp/utcnow Method-Calls im Code",
+     len(_utc_leaks) == 0,
+     details="\n".join(_utc_leaks[:5]) if _utc_leaks else "")
+
+
 section("Dynamic Capabilities Injection 2026-04-16")
 
 # Modul existiert und ist importierbar
