@@ -13268,7 +13268,16 @@ def api_messages_sources():
 @app.route("/api/messages")
 def api_messages():
     """Liefert alle Nachrichten (ohne full_content).
-    Optional: ?source=<key>&limit=<n>."""
+    Optional: ?source=<key>&limit=<n>.
+
+    Limit-Semantik: PER SOURCE, nicht global. Rationale: Bei einem
+    globalen Cap fuellt die groesste Quelle (meist WhatsApp mit tausenden
+    Messages) alle Slots und verdraengt die kleineren Inbox-Spalten
+    (signicat, trustedcarrier, ...). Der Per-Source-Cap sorgt dafuer,
+    dass jede Dashboard-Spalte sinnvoll befuellt wird. Auf Scan-Ebene
+    ist bereits `_MSG_MAX_FILES_PER_SOURCE = 500` wirksam; das limit
+    hier ist die UI-seitige Obergrenze pro Spalte.
+    """
     try:
         messages = _msg_get_all(force=(request.args.get("refresh") == "1"))
     except Exception as e:
@@ -13277,16 +13286,29 @@ def api_messages():
     if source_filter:
         messages = [m for m in messages if m["source"] == source_filter]
     try:
-        limit = int(request.args.get("limit", "2000"))
+        per_source_limit = int(request.args.get("limit", "500"))
     except Exception:
-        limit = 2000
+        per_source_limit = 500
+
     # Sortierung: ungelesen zuerst (aelteste oben), dann gelesen (neueste oben)
-    messages.sort(key=lambda m: (
-        0 if not m["read"] else 1,
-        m["timestamp_epoch"] if not m["read"] else -m["timestamp_epoch"],
-    ))
-    messages = messages[:limit]
-    slim = [{k: v for k, v in m.items() if k != "full_content"} for m in messages]
+    def _sort_key(m):
+        return (
+            0 if not m["read"] else 1,
+            m["timestamp_epoch"] if not m["read"] else -m["timestamp_epoch"],
+        )
+
+    # Per-Source-Cap: gruppieren, pro Gruppe sortieren und auf limit kuerzen.
+    from collections import defaultdict as _dd
+    by_source = _dd(list)
+    for m in messages:
+        by_source[m.get("source", "")].append(m)
+    capped = []
+    for src_msgs in by_source.values():
+        src_msgs.sort(key=_sort_key)
+        capped.extend(src_msgs[:per_source_limit])
+    # Gesamt-Sortierung fuer konsistente Reihenfolge auf Client-Seite
+    capped.sort(key=_sort_key)
+    slim = [{k: v for k, v in m.items() if k != "full_content"} for m in capped]
     return jsonify({"ok": True, "messages": slim, "count": len(slim)})
 
 

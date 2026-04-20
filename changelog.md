@@ -6,6 +6,13 @@ Format: [Datum] Änderung | Datei | Grund
 
 ## 2026-04-20
 
+### Fix: Dashboard zeigte nur 2 signicat-Mails / 0 trustedcarrier — Limit jetzt PER SOURCE
+- **Was der Nutzer gesehen hat:** Posteingang zeigte in der signicat.com-Spalte nur 2 Mails und in trustedcarrier.net-Spalte 0, obwohl auf Disk hunderte von Mails pro Agent existieren (signicat: 3047 IN-Files, trustedcarrier: 542 IN-Files). User war zu Recht stinkig, weil er jahrelang mit tausenden Mails arbeitet.
+- **Root Cause:** Die Route `/api/messages` hatte einen **globalen Cap von 2000** (`messages = messages[:limit]`) nach einer Sortierung "ungelesen zuerst". WhatsApp hat aktuell ~1700 ungelesene Nachrichten — die fuellten die ersten 1700 Slots, und nur ~300 Slots blieben fuer alle anderen Sources zusammen. Das globale Cap ist alt (existiert seit der ersten Message-Dashboard-Implementierung); bis die WhatsApp-60s-Polling-Logik eingefuehrt wurde (Commit 3cb34f4) hat's gereicht.
+- **Fix in `src/web_server.py`:** Der Cap gilt jetzt **per Source** statt global. Messages werden vor dem Cap nach `source`-Feld gruppiert, jede Gruppe einzeln sortiert (ungelesen zuerst, dann Zeitstempel) und auf `limit` (default 500) gekuerzt, danach wieder zusammengefuehrt. Effekt: whatsapp: 500, email_privat: 497, email_signicat: 469, email_trustedcarrier: 442 — jede Spalte bekommt ihre Messages.
+- **Tests:** 3 neue Regression-Tests fuer den Per-Source-Cap (keine globalen `messages[:2000]`-Artefakte, `per_source_limit` im Response-Handler, default 500). Suite **959/959 gruen**.
+- **Deploy:** Per `scripts/deploy.sh`, Server neu aus `src/`, Healthcheck OK.
+
 ### Feature: Email-Anhaenge automatisch in Agent-Konversation + direkter "Mit Agent oeffnen"-Button im Posteingang
 - **Was der Nutzer wollte:** Wenn eine E-Mail entweder ueber die Suche oder ueber das Message-Dashboard (Posteingang) in eine Agent-Konversation geladen wird, sollen die referenzierten Anhaenge automatisch als Context-Files in die Session mitkommen. Zusaetzlich soll die Miniatur-Card im Dashboard einen direkten "Mit Agent oeffnen"-Button haben (kein "Ueberklicken" zur Expand-View mehr), und das Agent-Auswahl-Modal soll eine eigene Kachel fuer jeden Agent UND jeden Sub-Agent haben (statt nur die Parents).
 - **Backend (`src/web_server.py`):**

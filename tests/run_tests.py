@@ -2996,6 +2996,20 @@ test("Msg-View-Fenster: Sub-Agenten im Dropdown-Menu",
      "a.subagents.forEach" in _ws_src
      and "(a.label||a.name)+' \\u203a '" in _ws_src)
 
+# Regression (2026-04-20): /api/messages cappt PER SOURCE, nicht global.
+# Rationale: Mit globalem Cap von 2000 fuellte WhatsApp mit ~1700 Messages
+# fast alle Slots und drueckte signicat auf 2 Messages runter — Dashboard
+# zeigte leere Inbox-Spalten trotz hunderter verfuegbarer Emails.
+test("/api/messages: per-source Limit statt globalem Cap",
+     "per_source_limit" in _ws_src
+     and "by_source = _dd(list)" in _ws_src)
+test("/api/messages: default per-source limit >= 500",
+     "int(request.args.get(\"limit\", \"500\"))" in _ws_src
+     or 'int(request.args.get("limit", "500"))' in _ws_src)
+test("/api/messages: kein globaler messages[:2000]-Cap mehr",
+     "messages = messages[:limit]" not in _ws_src
+     or "per_source_limit" in _ws_src)
+
 
 # ============================================================
 
