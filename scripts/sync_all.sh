@@ -242,6 +242,48 @@ build_frontend_and_redeploy() {
     fi
 }
 
+# Prueft nach dem Frontend-Pull, ob neue Commits Dateien AUSSERHALB des
+# Lovable-Territoriums beruehrt haben (siehe frontend/ARCHITECTURE.md).
+# Nur Warnung — bricht Sync nicht ab, damit du entscheiden kannst ob du's
+# behaeltst, revertest oder anpasst.
+check_lovable_territory() {
+    cd "$FRONTEND" || return 0
+    local prev head
+    # HEAD@{1} = Position VOR der letzten Ref-Update-Operation (= vor dem pull)
+    prev=$(git rev-parse 'HEAD@{1}' 2>/dev/null) || return 0
+    head=$(git rev-parse HEAD)
+    [ "$prev" = "$head" ] && return 0
+
+    # Nur Commits von Lovables GitHub-App betrachten — so werden eigene
+    # Claude/Moritz-Commits vom Guard ignoriert (sie duerfen ueberallhin).
+    local changed
+    changed=$(git log --author='gpt-engineer' --name-only --pretty=format: \
+        "$prev..$head" 2>/dev/null | sort -u)
+    [ -z "$changed" ] && return 0
+
+    # Whitelist: Lovable darf diese Pfade beruehren
+    local forbidden=""
+    while IFS= read -r f; do
+        [ -z "$f" ] && continue
+        case "$f" in
+            src/components/*|src/index.css|index.html|public/*|\
+            package.json|bun.lock|tsconfig*.json|\
+            ARCHITECTURE.md|README.md|.gitignore)
+                ;; # erlaubt
+            *)
+                forbidden="${forbidden}${f}\n"
+                ;;
+        esac
+    done <<< "$changed"
+
+    if [ -n "$forbidden" ]; then
+        warn "Lovable hat Dateien ausserhalb seines Territoriums geaendert:"
+        echo -e "$forbidden" | head -15 | sed 's/^/    ⚠ /'
+        warn "  -> pruefen: git show ${prev}..${head} -- <datei>"
+        warn "  -> Regeln: frontend/ARCHITECTURE.md"
+    fi
+}
+
 # Headless-Browser-Check nach dem Build: laedt /app und prueft dass React
 # in #root gerendert hat. Fangt Lovable-Bugs wie fehlende Context-Provider,
 # 404 auf Assets, JS-Runtime-Fehler — genau die Klasse Bugs, die die
@@ -275,6 +317,7 @@ prune_merged "$BACKEND" "Backend" main develop
 
 head1 "Frontend: assistantdev-frontend"
 sync_current_branch "$FRONTEND" "Frontend"
+check_lovable_territory
 prune_merged "$FRONTEND" "Frontend" main
 
 head1 "Frontend: Build + Deploy (wenn noetig)"

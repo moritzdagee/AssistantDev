@@ -6,6 +6,23 @@ Format: [Datum] Änderung | Datei | Grund
 
 ## 2026-04-21
 
+### Feature: Lovable-Territorium-Guard in sync_all.sh + Container/Presentational-Split (Frontend-PR #1)
+- **Was der Nutzer wollte:** Lovable als reines Design-Tool verwenden, die Designs aber zuverlaessig 1:1 uebernehmen. Vorher: Lovable hat grosse Monolith-Pages gebaut (Dashboard.tsx = 213 Zeilen inkl. API-Calls) — sobald ich die Verdrahtung angepasst haette, wuerde die naechste Lovable-Iteration sie wegblasen.
+- **Frontend-PR ([assistantdev-frontend#1](https://github.com/moritzdagee/assistantdev-frontend/pull/1)):**
+  - `ARCHITECTURE.md` im Frontend-Root — Regelwerk: Lovable editiert nur `src/components/`, Claude editiert `src/pages/`, `src/hooks/`, `src/lib/`, `src/main.tsx`, `src/App.tsx`.
+  - `src/hooks/useAgents.ts` — erster echter Data-Hook mit **Response-Adapter**: Backend liefert `/agents` als Array direkt, altes `Dashboard.tsx` erwartete `{ agents: [...] }` — deshalb blieb die Agent-Liste leer (stiller Bug).
+  - `src/components/dashboard/DashboardView.tsx` — pure UI mit Props + Mock-Defaults, **Lovable-Territorium**.
+  - `src/pages/Dashboard.tsx` — schlanker Container (13 Zeilen), verdrahtet Hook + View.
+  - READMEs in `components/` und `pages/` als prominente Territorium-Marker.
+  - `tsconfig.tsbuildinfo` aus Git entfernt (Build-Artefakt, verursachte unnoetige Diffs).
+- **Backend-Erweiterung `scripts/sync_all.sh`:**
+  - Neue Funktion `check_lovable_territory()` laeuft **nach** Frontend-pull
+  - Filtert per `git log --author='gpt-engineer'` nur auf Lovables GitHub-App-Commits (Claude/Moritz-Commits werden ignoriert, duerfen ueberallhin)
+  - Whitelist: `src/components/`, `src/index.css`, `index.html`, `public/`, `package.json`, `bun.lock`, `tsconfig*.json`, Meta-Docs
+  - Bei Regelverstoss: Warnung mit Dateiliste + `git show`-Kommandovorschlag — **bricht Sync nicht ab**, User/Claude entscheidet pro Fall
+- **Tests:** 3 neue in Sektion "Frontend-Migration /app 2026-04-21": pruefen dass `check_lovable_territory` existiert, den Author-Filter hat und `src/components/*` in der Whitelist steht. Suite **990/990 gruen**.
+- **Wirkung:** Lovable-Iterationen an `DashboardView` koennen jetzt das Design beliebig umbauen ohne die Backend-Verdrahtung zu brechen. Bei Versuch, `pages/` oder `hooks/` zu aendern, schlaegt der Sync-Guard Alarm.
+
 ### Feature: Frontend-Smoketest (Playwright / Chromium headless) als Teil von sync_all.sh
 - **Hintergrund:** Die Python-Unit-Tests in `tests/run_tests.py` arbeiten Grep-basiert gegen Source-Dateien und koennen **JS-Runtime-Fehler nicht fangen**. Konkret: Lovable hatte in einem Commit `CommandPaletteContext.tsx` + `useCommandPalette()` gebaut, den `<CommandPaletteProvider>` aber vergessen im Render-Tree zu mounten. Resultat: Topbar crasht beim Mount, React-Root bleibt leer, schwarzes Fenster — 981 Tests gruen, trotzdem komplett kaputt.
 - **Neuer Test `tests/test_frontend_smoke.py`:**

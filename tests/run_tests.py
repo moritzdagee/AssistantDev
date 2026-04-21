@@ -3820,6 +3820,25 @@ try:
 except Exception as _e:
     test("dashboard_window.py debug lesbar", False, str(_e))
 
+# Lovable-Territorium-Guard
+try:
+    with open(os.path.join(_REPO, "scripts", "sync_all.sh"), encoding="utf-8") as _fh:
+        _sa3 = _fh.read()
+    test(
+        "sync_all.sh: check_lovable_territory-Funktion vorhanden",
+        "check_lovable_territory" in _sa3,
+    )
+    test(
+        "sync_all.sh: Territorium-Guard filtert auf Lovable-Author",
+        "gpt-engineer" in _sa3 and "--author=" in _sa3,
+    )
+    test(
+        "sync_all.sh: Territorium-Whitelist enthaelt src/components/",
+        "src/components/*" in _sa3,
+    )
+except Exception as _e:
+    test("sync_all.sh territory-guard lesbar", False, str(_e))
+
 
 _cleanup_test_artifacts()
 
