@@ -17,3 +17,6 @@ $DB
 /app.py
 /web_server.py
 /email_watcher.py
+
+# Lovable/Claude shared frontend repo — separates Git-Repo, nicht als Submodul getrackt
+frontend/
