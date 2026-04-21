@@ -3770,6 +3770,16 @@ try:
 except Exception as _e:
     test("sync_all.sh lesbar", False, str(_e))
 
+try:
+    with open(os.path.join(_REPO, "macos_app", "AssistantDev"), encoding="utf-8") as _fh:
+        _la = _fh.read()
+    test(
+        "macos_app/AssistantDev (Launcher) default PATH_ARG=/app",
+        'PATH_ARG="${1:-/app}"' in _la,
+    )
+except Exception as _e:
+    test("macos_app/AssistantDev lesbar", False, str(_e))
+
 
 _cleanup_test_artifacts()
 

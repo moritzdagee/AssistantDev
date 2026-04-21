@@ -9,8 +9,9 @@ LOG="$ASSISTANT_DIR/logs/app_launcher.log"
 
 mkdir -p "$ASSISTANT_DIR/logs"
 
-# Pfad-Argument (z.B. /admin, /admin/docs) — Default: Dashboard
-PATH_ARG="${1:-/}"
+# Pfad-Argument (z.B. /admin, /admin/docs) — Default: neues React-Frontend
+# (Lovable/Vite) unter /app. Die alte eingebettete UI bleibt auf / als Fallback.
+PATH_ARG="${1:-/app}"
 
 echo "$(date '+%Y-%m-%d %H:%M:%S') [LAUNCH] Starting AssistantDev Dashboard (path=$PATH_ARG)" >> "$LOG"
 

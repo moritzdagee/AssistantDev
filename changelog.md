@@ -25,6 +25,12 @@ Format: [Datum] Änderung | Datei | Grund
 - **Tests:** 9 neue in Sektion "Frontend-Migration /app 2026-04-21": pruefen dass `_open_dashboard` auf `/app` zeigt, dass `sync_all.sh` die Build-Logik enthaelt (FRONTEND_DIST, Funktionsname, bun run build, PATH-Setup, deploy.sh-Call, dirty-tree-Guard). Suite **980/980 gruen**.
 - **Noch offen:** `_open_messages`, `_open_admin`, `_open_docs`, `_open_changelog` zeigen weiter auf die alte UI — migrieren wenn die React-Gegenstuecke komplett sind. User muss Desktop-App einmal neu starten, damit die neue `/app`-URL greift.
 
+### Fix: App-Bundle-Launcher zeigte weiter auf alte UI (/), obwohl _open_dashboard bereits /app lieferte
+- **Was der Nutzer gesehen hat:** Nach dem Commit `7f52674` ("Dashboard oeffnet /app") hat das App-Icon in Programme/Dock weiter die alte HTML-UI aufgemacht. Grund: das Bash-Launcher-Skript `/Applications/AssistantDev.app/Contents/MacOS/AssistantDev` wird beim App-Start **direkt** ausgefuehrt und ruft `dashboard_window.py "${1:-/}"` auf — die `src/app.py`-Aenderung betrifft nur die Menubar-Helper-App, nicht den Bundle-Launcher.
+- **Fix:** `macos_app/AssistantDev` (Source im Repo) und `/Applications/AssistantDev.app/Contents/MacOS/AssistantDev` (installierte Kopie via `scripts/install_app.sh`) → `PATH_ARG="${1:-/app}"`. Bundle neu installiert.
+- **Tests:** 1 neuer Test prueft, dass der Launcher-Source den neuen Default hat. Suite **981/981 gruen**.
+- **Noch offen:** Der User muss die App einmal komplett beenden (Cmd+Q im Dashboard-Fenster bzw. ueber die Menubar-App) und neu oeffnen — laufende `dashboard_window.py`-Prozesse behalten ihren urspruenglichen Pfad-Parameter.
+
 ### Feature: `scripts/sync_all.sh` — voll automatisierter Sync Backend + Lovable-Frontend
 - **Hintergrund:** `~/AssistantDev/frontend/` ist seit Commit `2bc4972` ein eigenes Repo (`moritzdagee/assistantdev-frontend`), geteilt mit Lovable. Zusammen mit dem Backend-Repo mussten bisher beide Seiten manuell gepullt/gepusht werden.
 - **Neues Skript `scripts/sync_all.sh`:**
