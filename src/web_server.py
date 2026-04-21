@@ -7295,6 +7295,81 @@ def api_changelog_json():
     return jsonify(entries)
 
 
+@app.route('/api/health-status')
+def api_health_status():
+    """Service-Health fuer das Admin-Health-Dashboard.
+
+    Checkt per socket ob die erwarteten Ports belegt sind; checkt per pgrep
+    ob die Python-Prozesse laufen. Liefert strukturiertes JSON mit pro Service
+    ok/label/port/pid. Git-Stand und Aktuelle-Uptime-Infos optional.
+    """
+    import socket
+    import subprocess
+
+    def _port_open(port: int) -> bool:
+        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        s.settimeout(0.3)
+        try:
+            return s.connect_ex(('127.0.0.1', port)) == 0
+        finally:
+            s.close()
+
+    def _pgrep(pattern: str):
+        try:
+            out = subprocess.check_output(['pgrep', '-f', pattern], text=True, timeout=1)
+            pids = [int(p) for p in out.strip().split('\n') if p.strip().isdigit()]
+            return pids[0] if pids else None
+        except Exception:
+            return None
+
+    services = [
+        {
+            'key': 'web_server',
+            'label': 'Web Server',
+            'port': 8080,
+            'port_ok': _port_open(8080),
+            'pid': _pgrep('web_server.py|AssistantDev WebServer'),
+        },
+        {
+            'key': 'web_clipper',
+            'label': 'Web Clipper',
+            'port': 8081,
+            'port_ok': _port_open(8081),
+            'pid': _pgrep('web_clipper_server.py'),
+        },
+        {
+            'key': 'email_watcher',
+            'label': 'Email Watcher',
+            'port': None,
+            'port_ok': None,
+            'pid': _pgrep('email_watcher.py|AssistantDev EmailWatcher'),
+        },
+    ]
+    for s in services:
+        running = (s['port_ok'] is True) or (s['pid'] is not None)
+        s['ok'] = bool(running)
+
+    # Git-Stand
+    git_info = {'branch': None, 'commit': None}
+    try:
+        branch = subprocess.check_output(
+            ['git', '-C', _REPO_ROOT_FOR_FRONTEND_APIS, 'rev-parse', '--abbrev-ref', 'HEAD'],
+            text=True, timeout=1,
+        ).strip()
+        commit = subprocess.check_output(
+            ['git', '-C', _REPO_ROOT_FOR_FRONTEND_APIS, 'rev-parse', '--short', 'HEAD'],
+            text=True, timeout=1,
+        ).strip()
+        git_info = {'branch': branch, 'commit': commit}
+    except Exception:
+        pass
+
+    return jsonify({
+        'services': services,
+        'git': git_info,
+    })
+
+
 @app.route('/api/oauth-status')
 def api_oauth_status():
     """Minimaler OAuth/Permission-Status fuer die /admin/permissions-Seite.
