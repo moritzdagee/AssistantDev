@@ -3839,6 +3839,53 @@ try:
 except Exception as _e:
     test("sync_all.sh territory-guard lesbar", False, str(_e))
 
+# Neue JSON-APIs fuer Frontend-Pages (docs, changelog, oauth-status)
+try:
+    _ws3 = open(os.path.join(_REPO, "src", "web_server.py"), encoding="utf-8").read()
+    test("web_server.py definiert /api/docs/list", "@app.route('/api/docs/list')" in _ws3)
+    test("web_server.py definiert /api/docs/read/<slug>", "@app.route('/api/docs/read/<slug>')" in _ws3)
+    test("web_server.py definiert /api/changelog.json", "@app.route('/api/changelog.json')" in _ws3)
+    test("web_server.py definiert /api/oauth-status", "@app.route('/api/oauth-status')" in _ws3)
+    test("web_server.py: Docs-Whitelist enthaelt architecture.md", "'architecture.md'" in _ws3 and "_DOCS_WHITELIST" in _ws3)
+except Exception as _e:
+    test("web_server.py neue Routes lesbar", False, str(_e))
+
+# Live-Tests: JSON-Responses sind parse-bar
+try:
+    import requests
+    r = requests.get("http://localhost:8080/api/docs/list", timeout=3)
+    _docs = r.json()
+    test(
+        "/api/docs/list liefert JSON-Array mit slug+title",
+        r.status_code == 200 and isinstance(_docs, list)
+        and all("slug" in d and "title" in d for d in _docs),
+    )
+except Exception as _e:
+    test("/api/docs/list live", False, str(_e))
+
+try:
+    import requests
+    r = requests.get("http://localhost:8080/api/changelog.json", timeout=3)
+    _cl = r.json()
+    test(
+        "/api/changelog.json liefert Eintraege mit date+body",
+        r.status_code == 200 and isinstance(_cl, list)
+        and (len(_cl) == 0 or all("date" in e and "body" in e for e in _cl)),
+    )
+except Exception as _e:
+    test("/api/changelog.json live", False, str(_e))
+
+try:
+    import requests
+    r = requests.get("http://localhost:8080/api/oauth-status", timeout=3)
+    _os = r.json()
+    test(
+        "/api/oauth-status liefert oauth/api_keys/macos_automation",
+        r.status_code == 200 and "oauth" in _os and "api_keys" in _os and "macos_automation" in _os,
+    )
+except Exception as _e:
+    test("/api/oauth-status live", False, str(_e))
+
 
 _cleanup_test_artifacts()
 

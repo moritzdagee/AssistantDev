@@ -8,6 +8,27 @@ Format: [Datum] Änderung | Datei | Grund
 
 ## 2026-04-21
 
+### Feature: Alle Platzhalter-Seiten migriert (Memory, Messages, Docs, Changelog, Permissions) + 4 neue JSON-APIs
+- **Backend-APIs (`src/web_server.py`):**
+  - `/api/docs/list` — enumeriert Whitelist (architecture.md, install.md, troubleshooting.md, README.md, COLLABORATION.md, CLAUDE.md) mit slug/title/preview
+  - `/api/docs/read/<slug>` — liefert Raw-Markdown
+  - `/api/changelog.json` — parst `changelog.md`, splittet bei `## YYYY-MM-DD`-Headers, liefert `[{date, body}]`
+  - `/api/oauth-status` — kombinierter Status (Slack/Canva/Google-Calendar via Config-File-Presence, API-Keys via Env-Vars, macOS-Automation als Hinweis). Echte Token-Refresh-Checks folgen spaeter.
+- **Frontend-PR:**
+  - 5 neue Hooks mit Response-Adaptern: `useMemory` (inkl. `useMemoryBrowser` Kombi-Hook), `useMessages` (`useMessageSources` + `useMessages`), `useDocs` (List + Read), `useChangelog`, `useOAuthStatus`
+  - 5 neue View-Components in `src/components/{memory,messages,docs,changelog,permissions}/` — alle Props-basiert, keine API-Calls, Lovable-Territorium
+  - 5 neue schlanke Container in `src/pages/` — ersetzen die `<MigrationNotice>`-Platzhalter
+  - Neue Dependencies: `react-markdown`, `remark-gfm`, `@tailwindcss/typography` (fuer Docs/Changelog-Rendering)
+- **Effekt:** Alle bisher leeren Seiten haben jetzt echte Backend-Daten:
+  - Dashboard zeigt die Agenten-Liste (privat, signicat mit Subagenten, etc.)
+  - Memory: File-Browser pro Agent
+  - Posteingang: Source-Uebersicht + Nachrichten-Stream (5 Quellen, ~2k Messages)
+  - Dokumentation: Markdown-Viewer mit TOC-Navigation
+  - Changelog: Timeline mit Datum-Gruppierung + Suche
+  - Berechtigungen: 3-spaltige Karten-Uebersicht (OAuth, API-Keys, macOS-Perms)
+- **Tests:** 8 neue (4 Route-Existenz-Tests + 3 Live-JSON-Response-Tests + 1 Docs-Whitelist-Test). Suite-Status: **997/998 gruen** — der eine Fail ist `/api/canva Token funktioniert` (pre-existing seit 2026-04-13, abgelaufener externer OAuth-Token, nicht dieser Commit).
+- **Noch offen:** Komplette Integration (Mark-as-read-Toggle fuer Messages, Memory-Add/Remove-Flow, OAuth-Real-Status-Checks statt File-Presence).
+
 ### Feature: Lovable-Territorium-Guard in sync_all.sh + Container/Presentational-Split (Frontend-PR #1)
 - **Was der Nutzer wollte:** Lovable als reines Design-Tool verwenden, die Designs aber zuverlaessig 1:1 uebernehmen. Vorher: Lovable hat grosse Monolith-Pages gebaut (Dashboard.tsx = 213 Zeilen inkl. API-Calls) — sobald ich die Verdrahtung angepasst haette, wuerde die naechste Lovable-Iteration sie wegblasen.
 - **Frontend-PR ([assistantdev-frontend#1](https://github.com/moritzdagee/assistantdev-frontend/pull/1)):**

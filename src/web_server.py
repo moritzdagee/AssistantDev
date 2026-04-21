@@ -7192,6 +7192,157 @@ def index():
     resp.headers['Expires'] = '0'
     return resp
 
+# ── JSON-APIs fuer das React-Frontend (docs, changelog, oauth-status) ──────
+
+_REPO_ROOT_FOR_FRONTEND_APIS = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+_DOCS_WHITELIST = {
+    'architecture': 'architecture.md',
+    'install': 'install.md',
+    'troubleshooting': 'troubleshooting.md',
+    'readme': 'README.md',
+    'collaboration': 'COLLABORATION.md',
+    'claude': 'CLAUDE.md',
+}
+
+_DOCS_TITLES = {
+    'architecture': 'Architektur',
+    'install': 'Installation',
+    'troubleshooting': 'Troubleshooting',
+    'readme': 'README',
+    'collaboration': 'Frontend Collaboration',
+    'claude': 'Claude-Regeln',
+}
+
+
+@app.route('/api/docs/list')
+def api_docs_list():
+    items = []
+    for slug, filename in _DOCS_WHITELIST.items():
+        path = os.path.join(_REPO_ROOT_FOR_FRONTEND_APIS, filename)
+        if not os.path.isfile(path):
+            continue
+        try:
+            with open(path, encoding='utf-8') as fh:
+                first_chunk = fh.read(400)
+        except OSError:
+            continue
+        items.append({
+            'slug': slug,
+            'name': filename,
+            'title': _DOCS_TITLES.get(slug, filename),
+            'preview': first_chunk.replace('\n', ' ').strip()[:200],
+        })
+    return jsonify(items)
+
+
+@app.route('/api/docs/read/<slug>')
+def api_docs_read(slug):
+    filename = _DOCS_WHITELIST.get(slug.lower())
+    if not filename:
+        return jsonify({'error': 'unknown slug'}), 404
+    path = os.path.join(_REPO_ROOT_FOR_FRONTEND_APIS, filename)
+    if not os.path.isfile(path):
+        return jsonify({'error': 'file missing'}), 404
+    with open(path, encoding='utf-8') as fh:
+        content = fh.read()
+    return jsonify({
+        'slug': slug,
+        'name': filename,
+        'title': _DOCS_TITLES.get(slug, filename),
+        'content': content,
+    })
+
+
+@app.route('/api/changelog.json')
+def api_changelog_json():
+    path = os.path.join(_REPO_ROOT_FOR_FRONTEND_APIS, 'changelog.md')
+    if not os.path.isfile(path):
+        return jsonify([])
+    with open(path, encoding='utf-8') as fh:
+        content = fh.read()
+
+    # Parse: Datum-Header "## YYYY-MM-DD" bis zum naechsten "## " oder Ende.
+    entries = []
+    current_date = None
+    current_body: list = []
+    for line in content.splitlines():
+        if line.startswith('## ') and len(line) >= 6:
+            # Header-Kandidat — nur als Datum erkennen wenn es YYYY-MM-DD passt.
+            candidate = line[3:].strip()
+            is_date = (
+                len(candidate) >= 10
+                and candidate[4] == '-' and candidate[7] == '-'
+                and candidate[:4].isdigit()
+                and candidate[5:7].isdigit() and candidate[8:10].isdigit()
+            )
+            if is_date:
+                if current_date:
+                    entries.append({
+                        'date': current_date,
+                        'body': '\n'.join(current_body).strip(),
+                    })
+                current_date = candidate[:10]
+                current_body = []
+                continue
+        if current_date is not None:
+            current_body.append(line)
+    if current_date:
+        entries.append({
+            'date': current_date,
+            'body': '\n'.join(current_body).strip(),
+        })
+    return jsonify(entries)
+
+
+@app.route('/api/oauth-status')
+def api_oauth_status():
+    """Minimaler OAuth/Permission-Status fuer die /admin/permissions-Seite.
+
+    Echte Integrations-Pruefung ist komplex (LaunchAgent-Status, Token-Refresh)
+    — vorerst liefert der Endpoint einen strukturierten Stub, den das Frontend
+    bereits sauber darstellen kann. Echte Status-Logik folgt in spaeteren Commits.
+    """
+    config_dir = os.path.join(_REPO_ROOT_FOR_FRONTEND_APIS, 'config')
+
+    def _file_exists(rel):
+        return os.path.isfile(os.path.join(config_dir, rel))
+
+    return jsonify({
+        'oauth': [
+            {
+                'service': 'slack',
+                'label': 'Slack',
+                'connected': _file_exists('slack_oauth.json'),
+                'note': 'Token-Refresh-Status in Konfiguration',
+            },
+            {
+                'service': 'canva',
+                'label': 'Canva',
+                'connected': _file_exists('canva_oauth.json'),
+                'note': 'OAuth-Flow via scripts/canva_oauth_setup.py',
+            },
+            {
+                'service': 'google_calendar',
+                'label': 'Google Calendar',
+                'connected': _file_exists('google_calendar_token.json'),
+                'note': 'Token im config/-Ordner erwartet',
+            },
+        ],
+        'api_keys': [
+            {'provider': 'anthropic', 'configured': bool(os.environ.get('ANTHROPIC_API_KEY'))},
+            {'provider': 'openai', 'configured': bool(os.environ.get('OPENAI_API_KEY'))},
+            {'provider': 'gemini', 'configured': bool(os.environ.get('GEMINI_API_KEY'))},
+            {'provider': 'mistral', 'configured': bool(os.environ.get('MISTRAL_API_KEY'))},
+        ],
+        'macos_automation': [
+            {'target': 'Mail', 'note': 'Benoetigt AppleScript-Automation-Zugriff'},
+            {'target': 'Contacts', 'note': 'Benoetigt Adressbuch-Zugriff'},
+            {'target': 'Calendar', 'note': 'Benoetigt Kalender-Zugriff'},
+        ],
+    })
+
+
 @app.route('/models')
 def get_models():
     config = load_models()
