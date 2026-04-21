@@ -333,7 +333,9 @@ class AssistantDevApp(rumps.App):
         )
 
     def _open_dashboard(self, _):
-        self._open_native_window("/")
+        # Seit 2026-04-21: Dashboard oeffnet das neue React-Frontend (Lovable/Vite)
+        # unter /app. Die alte eingebettete UI bleibt auf / als Fallback erreichbar.
+        self._open_native_window("/app")
 
     def _open_messages(self, _):
         self._open_native_window("/messages")

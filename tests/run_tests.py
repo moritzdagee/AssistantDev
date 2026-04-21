@@ -3726,6 +3726,51 @@ except Exception as _e:
     test("dashboard_window.py lesbar", False, str(_e))
 
 
+section("Frontend-Migration /app 2026-04-21")
+
+try:
+    with open(os.path.join(_REPO, "src", "app.py"), encoding="utf-8") as _fh:
+        _ap = _fh.read()
+    # _open_dashboard muss auf /app zeigen (neue React-UI), nicht auf /
+    _odash_idx = _ap.find("def _open_dashboard(")
+    _odash_block = _ap[_odash_idx:_odash_idx + 400] if _odash_idx >= 0 else ""
+    test("app.py: _open_dashboard existiert", _odash_idx >= 0)
+    test(
+        "app.py: _open_dashboard oeffnet /app (nicht / — alte UI)",
+        '_open_native_window("/app")' in _odash_block,
+    )
+except Exception as _e:
+    test("app.py lesbar", False, str(_e))
+
+try:
+    with open(os.path.join(_REPO, "scripts", "sync_all.sh"), encoding="utf-8") as _fh:
+        _sa = _fh.read()
+    test("sync_all.sh: kennt FRONTEND_DIST-Pfad", "FRONTEND_DIST=" in _sa)
+    test(
+        "sync_all.sh: hat Build+Deploy-Funktion",
+        "build_frontend_and_redeploy" in _sa,
+    )
+    test(
+        "sync_all.sh: triggered Build nach Frontend-Pull",
+        "FRONTEND_CHANGED" in _sa,
+    )
+    test("sync_all.sh: ruft bun run build auf", "bun run build" in _sa)
+    test(
+        "sync_all.sh: haengt ~/.bun/bin an PATH",
+        ".bun/bin" in _sa,
+    )
+    test(
+        "sync_all.sh: nutzt deploy.sh fuer Server-Restart",
+        "deploy.sh" in _sa,
+    )
+    test(
+        "sync_all.sh: merge develop->main bricht bei dirty tree ab",
+        "uncommitted changes" in _sa and "develop->main" in _sa,
+    )
+except Exception as _e:
+    test("sync_all.sh lesbar", False, str(_e))
+
+
 _cleanup_test_artifacts()
 
 # ============================================================

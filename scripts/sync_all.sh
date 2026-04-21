@@ -29,6 +29,12 @@ NC='\033[0m'
 
 BACKEND="$HOME/AssistantDev"
 FRONTEND="$HOME/AssistantDev/frontend"
+FRONTEND_DIST="$FRONTEND/dist"
+# bun liegt nicht im Standard-PATH eines LaunchAgent / cron → manuell einbinden
+export PATH="$HOME/.bun/bin:$PATH"
+
+# Wird von den Sync-Funktionen gesetzt, damit der Build-Step weiss ob er noetig ist
+FRONTEND_CHANGED=0
 
 info()  { echo -e "${BLUE}ℹ${NC}  $*"; }
 ok()    { echo -e "${GREEN}✓${NC}  $*"; }
@@ -61,6 +67,8 @@ sync_current_branch() {
         ok "$label: $branch already up to date"
     else
         ok "$label: $branch fast-forwarded"
+        # Wenn Frontend-Repo frische Commits bekommen hat, Build triggern
+        [ "$label" = "Frontend" ] && FRONTEND_CHANGED=1
     fi
 
     # Push
@@ -92,6 +100,12 @@ merge_develop_to_main() {
     if git merge-base --is-ancestor "$dev_sha" "$main_sha"; then
         ok "Backend: main enthaelt bereits develop (nichts zu mergen)"
         return 0
+    fi
+
+    # Dirty working tree: kein checkout-Switch, weil sonst Dateien verlorengehen koennten.
+    if ! git diff-index --quiet HEAD -- 2>/dev/null; then
+        warn "Backend: uncommitted changes — develop->main uebersprungen"
+        return 2
     fi
 
     local current
@@ -175,6 +189,59 @@ prune_merged() {
     done
 }
 
+# Baut das React-Frontend neu und startet das Backend durch deploy.sh neu,
+# damit die neue dist/ vom laufenden Server ausgeliefert wird.
+# Wird nur ausgefuehrt wenn Frontend-Commits frisch gepullt wurden ODER
+# dist/ komplett fehlt.
+build_frontend_and_redeploy() {
+    local needs_build=0
+    [ "$FRONTEND_CHANGED" = "1" ] && needs_build=1
+    [ ! -f "$FRONTEND_DIST/index.html" ] && needs_build=1
+
+    if [ "$needs_build" = "0" ]; then
+        ok "Frontend: dist/ aktuell, kein Build noetig"
+        return 0
+    fi
+
+    if ! command -v bun >/dev/null 2>&1; then
+        err "Frontend: bun nicht im PATH — kann nicht bauen"
+        warn "  -> installiere mit: curl -fsSL https://bun.sh/install | bash"
+        return 1
+    fi
+
+    cd "$FRONTEND" || return 1
+
+    # bun install nur wenn node_modules fehlt oder bun.lock juenger ist als das Verzeichnis
+    if [ ! -d node_modules ] || [ bun.lock -nt node_modules ] || [ package.json -nt node_modules ]; then
+        info "Frontend: bun install"
+        if ! bun install 2>&1 | tail -3; then
+            err "Frontend: bun install fehlgeschlagen"
+            return 2
+        fi
+    fi
+
+    info "Frontend: bun run build"
+    local build_out
+    build_out=$(bun run build 2>&1)
+    if [ $? -ne 0 ]; then
+        err "Frontend: build fehlgeschlagen:"
+        echo "$build_out" | tail -15
+        return 3
+    fi
+    ok "Frontend: neu gebaut ($(echo "$build_out" | grep -E 'built in|modules transformed' | tail -1))"
+
+    # Backend neu starten damit die neue dist/ greift (web_server.py cached den
+    # Pfad zwar nicht, aber Browser-Connections brauchen neues no-store-HTML)
+    if [ -x "$BACKEND/scripts/deploy.sh" ]; then
+        info "Backend: deploy.sh (Server-Neustart)"
+        if bash "$BACKEND/scripts/deploy.sh" >/dev/null 2>&1; then
+            ok "Backend: neu deployed (Healthcheck OK)"
+        else
+            warn "Backend: deploy.sh Fehler — manuell pruefen"
+        fi
+    fi
+}
+
 ##### RUN #####
 
 head1 "Backend: AssistantDev"
@@ -185,6 +252,9 @@ prune_merged "$BACKEND" "Backend" main develop
 head1 "Frontend: assistantdev-frontend"
 sync_current_branch "$FRONTEND" "Frontend"
 prune_merged "$FRONTEND" "Frontend" main
+
+head1 "Frontend: Build + Deploy (wenn noetig)"
+build_frontend_and_redeploy
 
 head1 "Status"
 cd "$BACKEND"  && echo -e "${BOLD}Backend${NC}  $(git rev-parse --abbrev-ref HEAD) @ $(git rev-parse --short HEAD)  [origin: $(git rev-parse --short '@{u}' 2>/dev/null || echo n/a)]"

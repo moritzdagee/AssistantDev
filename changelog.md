@@ -6,6 +6,25 @@ Format: [Datum] Änderung | Datei | Grund
 
 ## 2026-04-21
 
+### Feature: Dashboard oeffnet React-Frontend unter /app (erste Lovable-Integration live)
+- **Was der Nutzer wollte:** Beim Oeffnen der Desktop-App soll das neue, in Lovable bearbeitbare React-Frontend (`~/AssistantDev/frontend/`) erscheinen — nicht mehr das alte eingebettete HTML aus `src/web_server.py`. Nach Lovable-`Publish` + Claude-`sync alles` soll der Nutzer das Ergebnis in der nativen App sehen.
+- **Gegeben (aus vorherigen Sessions, nicht in diesem Commit):**
+  - `src/web_server.py` Flask-Routes `/app`, `/app/<path:subpath>`, `/assets/<path:filename>`, `/favicon.svg` — serven `frontend/dist/` sobald vorhanden, inkl. SPA-Fallback fuer React-Router.
+  - `src/dashboard_window.py` akzeptiert beliebigen Pfad-Parameter, default `/app`.
+  - `frontend/vite.config.ts` + `frontend/src/lib/api.ts` + `endpoints.ts` — Dev-Proxy auf :8080 und einheitlicher Backend-Call-Wrapper.
+- **In diesem Commit:**
+  - `bun` lokal installiert (`~/.bun/bin`), `cd frontend && bun install && bun run build` ausgefuehrt → `frontend/dist/` erstellt (index.html 1.9kB, Bundle 251kB / 80kB gzipped).
+  - `src/app.py` → `_open_dashboard` oeffnet jetzt `/app` statt `/` (alte UI bleibt als Fallback unter `/` erreichbar — keine Tests gebrochen, kein Admin-Feature migriert).
+  - `scripts/sync_all.sh` um `build_frontend_and_redeploy()` erweitert:
+    - `PATH` um `~/.bun/bin` ergaenzt (fuer LaunchAgent-Kontext)
+    - Nach Frontend-`git pull` wird `FRONTEND_CHANGED=1` gesetzt; Build laeuft nur wenn frische Commits reinkamen oder `dist/` fehlt
+    - `bun install` nur bei fehlendem/veraltetem `node_modules`
+    - Nach erfolgreichem Build: `scripts/deploy.sh` fuer Server-Neustart
+    - `merge_develop_to_main` bricht zusaetzlich bei dirty working tree sauber ab (statt `git checkout main` ins Leere laufen zu lassen)
+- **Smoketest erfolgreich:** `curl http://localhost:8080/app` → 200, React index.html, Assets unter `/assets/*` ausliefebar.
+- **Tests:** 9 neue in Sektion "Frontend-Migration /app 2026-04-21": pruefen dass `_open_dashboard` auf `/app` zeigt, dass `sync_all.sh` die Build-Logik enthaelt (FRONTEND_DIST, Funktionsname, bun run build, PATH-Setup, deploy.sh-Call, dirty-tree-Guard). Suite **980/980 gruen**.
+- **Noch offen:** `_open_messages`, `_open_admin`, `_open_docs`, `_open_changelog` zeigen weiter auf die alte UI — migrieren wenn die React-Gegenstuecke komplett sind. User muss Desktop-App einmal neu starten, damit die neue `/app`-URL greift.
+
 ### Feature: `scripts/sync_all.sh` — voll automatisierter Sync Backend + Lovable-Frontend
 - **Hintergrund:** `~/AssistantDev/frontend/` ist seit Commit `2bc4972` ein eigenes Repo (`moritzdagee/assistantdev-frontend`), geteilt mit Lovable. Zusammen mit dem Backend-Repo mussten bisher beide Seiten manuell gepullt/gepusht werden.
 - **Neues Skript `scripts/sync_all.sh`:**
