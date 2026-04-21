@@ -1,0 +1,202 @@
+#!/bin/bash
+# sync_all.sh — Voller Sync beider Repos (Backend + Lovable-Frontend)
+#
+# Was passiert:
+#   1. AssistantDev (Backend):
+#      - fetch/pull/push auf aktuellem Branch
+#      - develop -> main fast-forward-mergen wenn develop ahead ist (nur FF, bei
+#        echten Merges abbrechen damit Release-Entscheidung beim User bleibt)
+#      - gemergte Feature-Branches loeschen (lokal, nur wenn in develop oder main)
+#   2. assistantdev-frontend (Lovable):
+#      - fetch/pull/push auf main
+#      - gemergte Feature-Branches loeschen (lokal, nur wenn in main)
+#   3. Status-Report
+#
+# Sicherheitsregeln:
+#   - develop -> main merge ist FAST-FORWARD ONLY. Bei divergierenden Historien
+#     wird nicht gemergt (Release-Merges bleiben manuell).
+#   - Branch-Loeschung nur fuer Branches die git als --merged markiert (kein -D).
+#   - main / develop / aktuell-ausgecheckter Branch werden niemals geloescht.
+
+set -u
+
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+RED='\033[0;31m'
+BLUE='\033[0;34m'
+BOLD='\033[1m'
+NC='\033[0m'
+
+BACKEND="$HOME/AssistantDev"
+FRONTEND="$HOME/AssistantDev/frontend"
+
+info()  { echo -e "${BLUE}ℹ${NC}  $*"; }
+ok()    { echo -e "${GREEN}✓${NC}  $*"; }
+warn()  { echo -e "${YELLOW}⚠${NC}  $*"; }
+err()   { echo -e "${RED}✗${NC}  $*"; }
+head1() { echo -e "\n${BOLD}=== $* ===${NC}"; }
+
+# Sync a single repo's current branch (fetch + ff-pull + push).
+# Args: $1 repo dir, $2 repo label
+sync_current_branch() {
+    local dir="$1" label="$2"
+    cd "$dir" || { err "$label: Pfad $dir nicht vorhanden"; return 1; }
+    local branch
+    branch=$(git rev-parse --abbrev-ref HEAD)
+
+    info "$label ($branch): fetch"
+    git fetch --all --prune >/dev/null 2>&1 || warn "$label: fetch fehlgeschlagen (offline?)"
+
+    # Uncommitted changes?
+    if ! git diff-index --quiet HEAD -- 2>/dev/null; then
+        warn "$label: uncommitted changes auf $branch — pull/push uebersprungen"
+        git status -s
+        return 2
+    fi
+
+    # Pull fast-forward
+    local pull_out
+    pull_out=$(git pull --ff-only 2>&1) || { err "$label: pull nicht fast-forward-bar:\n$pull_out"; return 3; }
+    if echo "$pull_out" | grep -q "Already up to date"; then
+        ok "$label: $branch already up to date"
+    else
+        ok "$label: $branch fast-forwarded"
+    fi
+
+    # Push
+    local push_out
+    push_out=$(git push 2>&1) || { err "$label: push fehlgeschlagen:\n$push_out"; return 4; }
+    if echo "$push_out" | grep -q "Everything up-to-date"; then
+        :
+    else
+        ok "$label: $branch nach origin gepusht"
+    fi
+    return 0
+}
+
+# Merge develop -> main (Backend only).
+# Versucht Fast-Forward; wenn die Historien divergieren faellt auf einen
+# normalen Merge-Commit zurueck. Bei echten Konflikten: merge --abort, warnen.
+merge_develop_to_main() {
+    cd "$BACKEND" || return 1
+    local dev_sha main_sha
+    dev_sha=$(git rev-parse origin/develop 2>/dev/null) || { warn "Backend: origin/develop fehlt"; return 1; }
+    main_sha=$(git rev-parse origin/main 2>/dev/null)    || { warn "Backend: origin/main fehlt"; return 1; }
+
+    if [ "$dev_sha" = "$main_sha" ]; then
+        ok "Backend: main = develop (nichts zu mergen)"
+        return 0
+    fi
+
+    # Wenn main bereits alle develop-Commits enthaelt, nichts zu tun.
+    if git merge-base --is-ancestor "$dev_sha" "$main_sha"; then
+        ok "Backend: main enthaelt bereits develop (nichts zu mergen)"
+        return 0
+    fi
+
+    local current
+    current=$(git rev-parse --abbrev-ref HEAD)
+
+    git fetch origin main:main >/dev/null 2>&1 || true
+    git checkout main >/dev/null 2>&1 || { err "Backend: konnte main nicht auschecken"; git checkout "$current" >/dev/null 2>&1; return 3; }
+
+    local merge_mode="FF"
+    local merge_out
+    if git merge --ff-only origin/develop >/dev/null 2>&1; then
+        :
+    else
+        # Kein FF moeglich -> normaler Merge-Commit
+        merge_mode="no-ff"
+        merge_out=$(git merge --no-ff --no-edit -m "sync: develop -> main (via sync_all.sh)" origin/develop 2>&1)
+        if [ $? -ne 0 ]; then
+            err "Backend: Merge-Konflikt develop -> main:"
+            echo "$merge_out" | head -20
+            git merge --abort >/dev/null 2>&1 || true
+            git checkout "$current" >/dev/null 2>&1
+            warn "  -> bitte manuell aufloesen: git checkout main && git merge develop"
+            return 4
+        fi
+    fi
+
+    git push origin main >/dev/null 2>&1 || { err "Backend: push main fehlgeschlagen"; git checkout "$current" >/dev/null 2>&1; return 5; }
+    git checkout "$current" >/dev/null 2>&1
+    ok "Backend: develop -> main gemergt ($merge_mode) + gepusht"
+    return 0
+}
+
+# Prune local branches that are fully merged into one of the given integration
+# branches. NEVER force-deletes. NEVER deletes the currently checked-out branch
+# or the integration branches themselves.
+# Args: $1 repo dir, $2 label, $3...$N integration branches (z.B. main develop)
+prune_merged() {
+    local dir="$1" label="$2"; shift 2
+    local integrations=("$@")
+    cd "$dir" || return 1
+
+    local current
+    current=$(git rev-parse --abbrev-ref HEAD)
+
+    # Kandidaten: alle lokalen Branches ausser current + integrations
+    local to_delete=()
+    while IFS= read -r b; do
+        b=$(echo "$b" | sed 's/^[* ] *//' | awk '{print $1}')
+        [ -z "$b" ] && continue
+        [ "$b" = "$current" ] && continue
+        local is_integration=0
+        for i in "${integrations[@]}"; do
+            [ "$b" = "$i" ] && is_integration=1 && break
+        done
+        [ "$is_integration" = "1" ] && continue
+
+        # Branch muss in mindestens einer Integration --merged sein
+        local merged=0
+        for i in "${integrations[@]}"; do
+            if git rev-parse --verify "$i" >/dev/null 2>&1; then
+                if git branch --merged "$i" 2>/dev/null | grep -qE "^\s*\*?\s*${b}$"; then
+                    merged=1
+                    break
+                fi
+            fi
+        done
+        [ "$merged" = "1" ] && to_delete+=("$b")
+    done < <(git for-each-ref --format='%(refname:short)' refs/heads/)
+
+    if [ ${#to_delete[@]} -eq 0 ]; then
+        ok "$label: keine Zombie-Branches (alles aufgeraeumt)"
+        return 0
+    fi
+
+    for b in "${to_delete[@]}"; do
+        if git branch -d "$b" >/dev/null 2>&1; then
+            ok "$label: Branch '$b' geloescht (war gemergt)"
+        else
+            warn "$label: Branch '$b' konnte nicht geloescht werden (git -d abgelehnt)"
+        fi
+    done
+}
+
+##### RUN #####
+
+head1 "Backend: AssistantDev"
+sync_current_branch "$BACKEND" "Backend"
+merge_develop_to_main
+prune_merged "$BACKEND" "Backend" main develop
+
+head1 "Frontend: assistantdev-frontend"
+sync_current_branch "$FRONTEND" "Frontend"
+prune_merged "$FRONTEND" "Frontend" main
+
+head1 "Status"
+cd "$BACKEND"  && echo -e "${BOLD}Backend${NC}  $(git rev-parse --abbrev-ref HEAD) @ $(git rev-parse --short HEAD)  [origin: $(git rev-parse --short '@{u}' 2>/dev/null || echo n/a)]"
+cd "$FRONTEND" && echo -e "${BOLD}Frontend${NC} $(git rev-parse --abbrev-ref HEAD) @ $(git rev-parse --short HEAD)  [origin: $(git rev-parse --short '@{u}' 2>/dev/null || echo n/a)]"
+
+# Offene PRs falls gh verfuegbar
+if command -v gh >/dev/null 2>&1; then
+    echo ""
+    cd "$BACKEND"  && open_be=$(gh pr list --state open --json number 2>/dev/null | python3 -c 'import sys,json; print(len(json.load(sys.stdin)))' 2>/dev/null || echo "?")
+    cd "$FRONTEND" && open_fe=$(gh pr list --state open --json number 2>/dev/null | python3 -c 'import sys,json; print(len(json.load(sys.stdin)))' 2>/dev/null || echo "?")
+    echo "Offene PRs — Backend: $open_be | Frontend: $open_fe"
+fi
+
+echo ""
+ok "sync_all.sh fertig"

@@ -4,6 +4,22 @@ Format: [Datum] Änderung | Datei | Grund
 
 ---
 
+## 2026-04-21
+
+### Feature: `scripts/sync_all.sh` — voll automatisierter Sync Backend + Lovable-Frontend
+- **Hintergrund:** `~/AssistantDev/frontend/` ist seit Commit `2bc4972` ein eigenes Repo (`moritzdagee/assistantdev-frontend`), geteilt mit Lovable. Zusammen mit dem Backend-Repo mussten bisher beide Seiten manuell gepullt/gepusht werden.
+- **Neues Skript `scripts/sync_all.sh`:**
+  - Fetch/Pull (FF-only) + Push fuer AssistantDev und assistantdev-frontend
+  - **Auto-Merge develop -> main im Backend**: FF bevorzugt, Fallback auf Merge-Commit mit Message `"sync: develop -> main (via sync_all.sh)"`. Bei echten Konflikten: `git merge --abort` + Warnung, kein Zwangs-Merge.
+  - **Zombie-Branch-Cleanup**: loescht lokale Feature-Branches nur wenn `git branch --merged` sie als gemergt zu `main`/`develop` (Backend) bzw. `main` (Frontend) markiert. `git branch -d` (nicht `-D`) — sicher, Git weigert sich bei nicht-gemergten Branches.
+  - **Uncommitted-Changes-Schutz**: bei Working-Tree-Changes auf Integration-Branch wird pull/push uebersprungen statt ueberschrieben.
+  - Status-Report am Ende (Commit-SHAs, offene PRs via `gh`).
+- **Verwendung:** `bash ~/AssistantDev/scripts/sync_all.sh` — oder auf Zuruf „sync alles" an Claude.
+- **Nebenbei aufgeraeumt:** Zombie-Branch `feature/frontend-react-migration` geloescht (war schon in develop).
+- **Vorherige Entkopplung:** Commit `2bc4972` — `frontend/` aus AssistantDev-Index entfernt + `.gitignore` erweitert. Grund: Files waren doppelt getrackt (Parent + inneres .git), Lovable-Pushes (Command-Palette, ThemeProvider, bun.lock) fehlten lokal, typischer Nested-Repo-Drift.
+
+---
+
 ## 2026-04-20
 
 ### Feature: Receipt-only-Status fuer Kanaele ohne Read-Sync-Rueckkanal
