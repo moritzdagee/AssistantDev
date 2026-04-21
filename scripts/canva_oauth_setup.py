@@ -28,8 +28,19 @@ except ImportError:
 
 # ── Konfiguration ────────────────────────────────────────────────────────────
 
-CLIENT_ID = "OC-AZ2G7Oc4afr0"
-CLIENT_SECRET = "[REDACTED_CANVA_CLIENT_SECRET]"
+_MODELS_JSON = os.path.expanduser("~/AssistantDev/config/models.json")
+try:
+    with open(_MODELS_JSON, "r") as _f:
+        _canva_cfg = json.load(_f).get("canva", {})
+    CLIENT_ID = os.environ.get("CANVA_CLIENT_ID") or _canva_cfg.get("client_id", "")
+    CLIENT_SECRET = os.environ.get("CANVA_CLIENT_SECRET") or _canva_cfg.get("client_secret", "")
+except FileNotFoundError:
+    CLIENT_ID = os.environ.get("CANVA_CLIENT_ID", "")
+    CLIENT_SECRET = os.environ.get("CANVA_CLIENT_SECRET", "")
+
+if not CLIENT_ID or not CLIENT_SECRET:
+    print("FEHLER: CANVA_CLIENT_ID / CANVA_CLIENT_SECRET nicht gesetzt (weder in env noch config/models.json -> canva)")
+    sys.exit(1)
 
 REDIRECT_PORT = 8765
 REDIRECT_URI = f"http://127.0.0.1:{REDIRECT_PORT}/callback"

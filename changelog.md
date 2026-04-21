@@ -2,6 +2,8 @@
 
 Format: [Datum] Änderung | Datei | Grund
 
+[2026-04-21] SECURITY: Canva OAuth CLIENT_SECRET aus Source entfernt, liest jetzt aus config/models.json bzw. Env-Vars (CANVA_CLIENT_ID/CANVA_CLIENT_SECRET) | scripts/canva_oauth_setup.py | Secret war hardcoded und im PUBLIC-Repo exponiert — muss in Canva Developer Portal rotiert werden, History-Exposure bleibt bis filter-repo/BFG.
+
 ---
 
 ## 2026-04-21
@@ -343,7 +345,7 @@ Format: [Datum] Änderung | Datei | Grund
 - **Was der Nutzer beobachtete:** `/admin/permissions` und Access-Control-Matrix zeigten "E-Mail Inbox: 1 Datei", obwohl tausende E-Mails in den Agent-Memorys liegen. Gleichzeitig stand kChat auf 0 trotz laufender App.
 - **Ursachen:**
   1. `_source_status()` hat fuer `email_inbox` den Staging-Ordner `<datalake>/email_inbox/` gezaehlt. Der Email-Watcher verarbeitet Dateien und verschiebt sie in `email_inbox/processed/` (und indexiert in die Agent-Memorys als `<date>_IN_/_OUT_*.txt`) — der Staging-Ordner ist also fast immer leer. Das war kein echtes "0 E-Mails", sondern eine falsche Metrik.
-  2. kChat: Watcher laeuft korrekt als LaunchAgent, aber der `auth_token` in `config/models.json → kchat.auth_token` ist nur 16 Zeichen lang (`[REDACTED_KCHAT_TOKEN]`) und nicht valid — Mattermost-API liefert 401. `/tmp/kchat_watcher.log` zeigt `Token weiterhin ungueltig (401)` im 5-Minuten-Takt seit Stunden.
+  2. kChat: Watcher laeuft korrekt als LaunchAgent, aber der `auth_token` in `config/models.json → kchat.auth_token` ist nur 16 Zeichen lang (`[REDACTED]`) und nicht valid — Mattermost-API liefert 401. `/tmp/kchat_watcher.log` zeigt `Token weiterhin ungueltig (401)` im 5-Minuten-Takt seit Stunden.
 - **Fix in `src/web_server.py`:**
   - `_source_status(path, key="")` behandelt `key="email_inbox"` special: scannt `<agent>/memory/` ueber alle Agent-Ordner und zaehlt Dateien mit `_IN_` oder `_OUT_` im Namen.
   - `/admin/permissions`: "E-Mail Inbox"-Zeile durch "E-Mail Archive (IN_/OUT_)" ersetzt. Zeigt Gesamt + Per-Agent-Breakdown + Staging-Count als Zusatz.
@@ -1750,7 +1752,7 @@ Drei zusammenhaengende UI-/Stabilitaets-Fixes via konsolidiertem Patch-Skript `s
 **API-Analyse:**
 - Getestet: 19 Endpoint-/Auth-Varianten (ksuite.infomaniak.com, api.infomaniak.com, kchat.infomaniak.com, kyb-group-bv.kchat.infomaniak.com mit Bearer/X-Auth-Token/Cookie)
 - **Ergebnis:** kChat ist **Mattermost v4** Fork (Server meldet `x-version-id: 1.136.0`). Base URL: `https://kyb-group-bv.kchat.infomaniak.com/api/v4`. Auth-Header: `Authorization: Bearer <token>`
-- Der bereitgestellte Token `[REDACTED_KCHAT_TOKEN]` wird vom Server mit HTTP 401 abgelehnt (Endpoint existiert, Token ungueltig/abgelaufen). **Moritz muss einen frischen Bot-Token** in der kChat Integrations-Seite erzeugen und in `models.json['kchat']['auth_token']` eintragen.
+- Der bereitgestellte Token `[REDACTED]` wird vom Server mit HTTP 401 abgelehnt (Endpoint existiert, Token ungueltig/abgelaufen). **Moritz muss einen frischen Bot-Token** in der kChat Integrations-Seite erzeugen und in `models.json['kchat']['auth_token']` eintragen.
 - Referenz-Implementierung: https://github.com/Infomaniak/mcp-server-kchat (eigener MCP-Server von Infomaniak)
 
 **Neue Dateien:**
