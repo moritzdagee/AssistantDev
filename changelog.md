@@ -6,6 +6,23 @@ Format: [Datum] Änderung | Datei | Grund
 
 ## 2026-04-21
 
+### Feature: Frontend-Smoketest (Playwright / Chromium headless) als Teil von sync_all.sh
+- **Hintergrund:** Die Python-Unit-Tests in `tests/run_tests.py` arbeiten Grep-basiert gegen Source-Dateien und koennen **JS-Runtime-Fehler nicht fangen**. Konkret: Lovable hatte in einem Commit `CommandPaletteContext.tsx` + `useCommandPalette()` gebaut, den `<CommandPaletteProvider>` aber vergessen im Render-Tree zu mounten. Resultat: Topbar crasht beim Mount, React-Root bleibt leer, schwarzes Fenster — 981 Tests gruen, trotzdem komplett kaputt.
+- **Neuer Test `tests/test_frontend_smoke.py`:**
+  - Startet Chromium headless via Playwright, laedt `http://localhost:8080/app`
+  - Wartet bis zu 5s darauf, dass `document.getElementById('root')` Kinder bekommt
+  - Misst `document.body.offsetHeight` (zweiter Sanity-Check: >50px)
+  - Sammelt waehrend des Ladens: JS-Console-Errors, uncaught Page-Errors, fehlgeschlagene Requests, HTTP-≥400-Responses
+  - Exit-Code 0 bei allen Checks gruen, 1 sonst; `--quiet`-Flag fuer kompaktes Output
+  - Faellt der Check auf Fehler: Ausgabe der ersten 3 Errors je Kategorie mit Stichproben — sofort erkennbar, was im Bundle kaputt ist
+- **Integration in `scripts/sync_all.sh`:**
+  - Neue Funktion `run_frontend_smoketest()`, laeuft **nach** `build_frontend_and_redeploy`
+  - Skippt stillschweigend wenn `playwright` nicht importierbar ist (kein Hard-Dep-Zwang)
+  - Bei FAIL: Ausgabe der letzten 20 Zeilen, aber kein Abbruch des Skripts — Status-Report am Ende zeigt, was noch zu tun ist
+- **Setup (einmalig):** `python3 -m pip install --user playwright && python3 -m playwright install chromium` (~91 MB Chromium-Download nach `~/Library/Caches/ms-playwright/`).
+- **Tests:** 6 neue in Sektion "Frontend-Migration /app 2026-04-21": pruefen dass `test_frontend_smoke.py` existiert und die kritischen Check-Aspekte enthaelt (#root, Console-Errors, Failed-Requests), dass `sync_all.sh` den Smoketest aufruft, dass `dashboard_window.py` `debug=True` per Default hat. Suite **987/987 gruen**.
+- **Verifiziert:** Der Test bestaetigt dass der Fix fuer den `CommandPaletteProvider`-Bug (Lovable-Commit `d18f313`) korrekt greift — #root jetzt gefuellt, keine Console-Errors, body 720px hoch.
+
 ### Feature: Dashboard oeffnet React-Frontend unter /app (erste Lovable-Integration live)
 - **Was der Nutzer wollte:** Beim Oeffnen der Desktop-App soll das neue, in Lovable bearbeitbare React-Frontend (`~/AssistantDev/frontend/`) erscheinen — nicht mehr das alte eingebettete HTML aus `src/web_server.py`. Nach Lovable-`Publish` + Claude-`sync alles` soll der Nutzer das Ergebnis in der nativen App sehen.
 - **Gegeben (aus vorherigen Sessions, nicht in diesem Commit):**

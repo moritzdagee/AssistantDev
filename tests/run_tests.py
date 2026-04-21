@@ -3780,6 +3780,46 @@ try:
 except Exception as _e:
     test("macos_app/AssistantDev lesbar", False, str(_e))
 
+# Frontend-Smoketest-Infrastruktur
+_smoke = os.path.join(_REPO, "tests", "test_frontend_smoke.py")
+test("tests/test_frontend_smoke.py existiert", os.path.isfile(_smoke))
+if os.path.isfile(_smoke):
+    with open(_smoke, encoding="utf-8") as _fh:
+        _sm = _fh.read()
+    test(
+        "test_frontend_smoke.py prueft #root-Fuellung",
+        "children.length" in _sm and "rendered" in _sm,
+    )
+    test(
+        "test_frontend_smoke.py sammelt Console-Errors",
+        "console_errors" in _sm and 'msg.type == "error"' in _sm,
+    )
+    test(
+        "test_frontend_smoke.py sammelt Failed-Requests",
+        "failed_requests" in _sm and "requestfailed" in _sm,
+    )
+
+try:
+    with open(os.path.join(_REPO, "scripts", "sync_all.sh"), encoding="utf-8") as _fh:
+        _sa2 = _fh.read()
+    test(
+        "sync_all.sh: ruft Frontend-Smoketest nach Build auf",
+        "run_frontend_smoketest" in _sa2
+        and "test_frontend_smoke.py" in _sa2,
+    )
+except Exception as _e:
+    test("sync_all.sh smoke-Integration lesbar", False, str(_e))
+
+try:
+    with open(os.path.join(_REPO, "src", "dashboard_window.py"), encoding="utf-8") as _fh:
+        _dw2 = _fh.read()
+    test(
+        "dashboard_window.py: debug per default AN (DevTools verfuegbar)",
+        "ASSISTANTDEV_WEBVIEW_DEBUG" in _dw2 and 'debug=_DEBUG' in _dw2,
+    )
+except Exception as _e:
+    test("dashboard_window.py debug lesbar", False, str(_e))
+
 
 _cleanup_test_artifacts()
 

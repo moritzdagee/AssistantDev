@@ -242,6 +242,30 @@ build_frontend_and_redeploy() {
     fi
 }
 
+# Headless-Browser-Check nach dem Build: laedt /app und prueft dass React
+# in #root gerendert hat. Fangt Lovable-Bugs wie fehlende Context-Provider,
+# 404 auf Assets, JS-Runtime-Fehler — genau die Klasse Bugs, die die
+# Python-Grep-Tests NICHT sehen koennen.
+run_frontend_smoketest() {
+    local smoke="$BACKEND/tests/test_frontend_smoke.py"
+    [ ! -f "$smoke" ] && return 0
+    if ! python3 -c "import playwright" >/dev/null 2>&1; then
+        warn "Frontend-Smoketest uebersprungen (playwright nicht installiert)"
+        return 0
+    fi
+    info "Frontend-Smoketest (Chromium headless)"
+    local out
+    out=$(python3 "$smoke" --quiet 2>&1)
+    local rc=$?
+    if [ $rc -eq 0 ]; then
+        ok "Frontend rendert sauber (#root gefuellt, keine Console-Errors)"
+    else
+        err "Frontend-Smoketest FAIL:"
+        echo "$out" | tail -20
+        return 1
+    fi
+}
+
 ##### RUN #####
 
 head1 "Backend: AssistantDev"
@@ -255,6 +279,9 @@ prune_merged "$FRONTEND" "Frontend" main
 
 head1 "Frontend: Build + Deploy (wenn noetig)"
 build_frontend_and_redeploy
+
+head1 "Frontend: Smoketest"
+run_frontend_smoketest
 
 head1 "Status"
 cd "$BACKEND"  && echo -e "${BOLD}Backend${NC}  $(git rev-parse --abbrev-ref HEAD) @ $(git rev-parse --short HEAD)  [origin: $(git rev-parse --short '@{u}' 2>/dev/null || echo n/a)]"
