@@ -7383,6 +7383,19 @@ def api_oauth_status():
     def _file_exists(rel):
         return os.path.isfile(os.path.join(config_dir, rel))
 
+    # API-Keys liegen in config/models.json (load_models() liest das via
+    # MODELS_FILE aus dem iCloud-Datalake). Env-Vars sind NICHT die Quelle.
+    try:
+        _models_cfg = load_models()
+        _providers_cfg = _models_cfg.get('providers', {})
+    except Exception:
+        _providers_cfg = {}
+
+    def _key_configured(provider: str) -> bool:
+        prov = _providers_cfg.get(provider, {})
+        key = prov.get('api_key') if isinstance(prov, dict) else None
+        return bool(key and str(key).strip() and not str(key).startswith('YOUR_'))
+
     return jsonify({
         'oauth': [
             {
@@ -7405,10 +7418,11 @@ def api_oauth_status():
             },
         ],
         'api_keys': [
-            {'provider': 'anthropic', 'configured': bool(os.environ.get('ANTHROPIC_API_KEY'))},
-            {'provider': 'openai', 'configured': bool(os.environ.get('OPENAI_API_KEY'))},
-            {'provider': 'gemini', 'configured': bool(os.environ.get('GEMINI_API_KEY'))},
-            {'provider': 'mistral', 'configured': bool(os.environ.get('MISTRAL_API_KEY'))},
+            {'provider': 'anthropic', 'configured': _key_configured('anthropic')},
+            {'provider': 'openai', 'configured': _key_configured('openai')},
+            {'provider': 'gemini', 'configured': _key_configured('gemini')},
+            {'provider': 'mistral', 'configured': _key_configured('mistral')},
+            {'provider': 'perplexity', 'configured': _key_configured('perplexity')},
         ],
         'macos_automation': [
             {'target': 'Mail', 'note': 'Benoetigt AppleScript-Automation-Zugriff'},
