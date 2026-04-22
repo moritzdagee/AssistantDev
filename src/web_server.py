@@ -14209,18 +14209,82 @@ def api_messages_sources():
     return jsonify({"ok": True, "sources": out})
 
 
+# ── Email-Work-Domains (BACKEND_TODO_EMAIL_OTHER_DOMAIN_FILTER) ────────────
+_EMAIL_WORK_DOMAINS = ("tangerina.me", "signicat.com", "trustedcarrier.net")
+
+
+def _msg_is_sent_by_user(m):
+    """Heuristik: ist die Nachricht vom User selbst gesendet?
+
+    email_*-Sources enthalten per Konvention nur Received-Mails (Outbound-Sync
+    fehlt noch). WhatsApp/iMessage haben keine klare Absender-Trennung ohne
+    weitere Infos. Rueckgabe False = "behandle als received" (sicherer Default).
+    """
+    # Source-Feld kennzeichnet typischerweise den Inbox-Typ, nicht die Richtung
+    # Wenn 'from_me' oder 'is_sent' im Message-Dict enthalten ist, nutzen wir das
+    if m.get('from_me') or m.get('is_sent') or m.get('direction') == 'sent':
+        return True
+    # email_*-Sources haben sender=nicht-User, also received
+    return False
+
+
+def _msg_email_recipients(m):
+    """Extrahiert Empfaenger-Adressen als Liste. `to` kann String oder Liste sein."""
+    out = []
+    for field in ('to', 'cc', 'bcc', 'recipient_addresses', 'recipients'):
+        v = m.get(field)
+        if not v:
+            continue
+        if isinstance(v, str):
+            # typ: "Name <mail@domain> , other <...>"
+            import re as _re
+            for addr in _re.findall(r'[\w.+-]+@[\w-]+(?:\.[\w-]+)+', v):
+                out.append(addr.lower())
+        elif isinstance(v, list):
+            for item in v:
+                if isinstance(item, str):
+                    import re as _re
+                    for addr in _re.findall(r'[\w.+-]+@[\w-]+(?:\.[\w-]+)+', item):
+                        out.append(addr.lower())
+                elif isinstance(item, dict):
+                    addr = item.get('email') or item.get('address') or ''
+                    if '@' in addr:
+                        out.append(addr.lower())
+    return out
+
+
+def _msg_is_work_email(m):
+    """True wenn IRGENDEIN Empfaenger auf einer Work-Domain sitzt."""
+    for addr in _msg_email_recipients(m):
+        for dom in _EMAIL_WORK_DOMAINS:
+            if addr.endswith('@' + dom):
+                return True
+    # Fallback: source-Key enthaelt die Work-Domain schon (email_signicat, etc.)
+    src = (m.get('source') or '').lower()
+    if 'signicat' in src or 'trustedcarrier' in src or 'tangerina' in src:
+        return True
+    return False
+
+
 @app.route("/api/messages")
 def api_messages():
     """Liefert alle Nachrichten (ohne full_content).
-    Optional: ?source=<key>&limit=<n>.
 
-    Limit-Semantik: PER SOURCE, nicht global. Rationale: Bei einem
-    globalen Cap fuellt die groesste Quelle (meist WhatsApp mit tausenden
-    Messages) alle Slots und verdraengt die kleineren Inbox-Spalten
-    (signicat, trustedcarrier, ...). Der Per-Source-Cap sorgt dafuer,
-    dass jede Dashboard-Spalte sinnvoll befuellt wird. Auf Scan-Ebene
-    ist bereits `_MSG_MAX_FILES_PER_SOURCE = 500` wirksam; das limit
-    hier ist die UI-seitige Obergrenze pro Spalte.
+    Query-Parameter:
+      ?source=<key>            — Nur Messages einer bestimmten Source
+      ?limit=<n>               — Per-Source-Cap (default 500)
+      ?direction=received|sent|all — NEU (BACKEND_TODO_MESSAGES_DIRECTION_TOGGLE).
+          Default fuer email-Sources = 'received', sonst 'all'.
+      ?bucket=inbox|other      — NEU (BACKEND_TODO_EMAIL_OTHER_DOMAIN_FILTER).
+          'other' filtert alle email-Sources, bei denen KEIN Empfaenger auf
+          einer Work-Domain (tangerina.me/signicat.com/trustedcarrier.net)
+          sitzt. Default = 'inbox'.
+      ?group=conversation      — NEU (BACKEND_TODO_WHATSAPP_CONVERSATION_GROUPING).
+          Aggregiert Messages per conversation_id, liefert {conversation_id,
+          kind, title, participants, last_message, unread_count}-Items statt
+          flat messages. Default fuer whatsapp/imessage/kchat = 'conversation'.
+
+    Limit-Semantik bleibt PER SOURCE.
     """
     try:
         messages = _msg_get_all(force=(request.args.get("refresh") == "1"))
@@ -14229,17 +14293,91 @@ def api_messages():
     source_filter = request.args.get("source")
     if source_filter:
         messages = [m for m in messages if m["source"] == source_filter]
+
+    # ── direction-Filter ─────────────────────────────────────────────────
+    direction = (request.args.get("direction") or "").lower()
+    if not direction:
+        # Default: received fuer email, all sonst
+        if source_filter and source_filter.startswith("email"):
+            direction = "received"
+        else:
+            direction = "all"
+    if direction == "received":
+        messages = [m for m in messages if not _msg_is_sent_by_user(m)]
+    elif direction == "sent":
+        messages = [m for m in messages if _msg_is_sent_by_user(m)]
+    # "all" -> kein Filter
+
+    # ── bucket-Filter (nur email) ────────────────────────────────────────
+    bucket = (request.args.get("bucket") or "inbox").lower()
+    if bucket == "other":
+        messages = [m for m in messages
+                    if (m.get("type") == "email") and not _msg_is_work_email(m)]
+    # 'inbox' -> kein Filter
+
     try:
         per_source_limit = int(request.args.get("limit", "500"))
     except Exception:
         per_source_limit = 500
 
-    # Sortierung: ungelesen zuerst (aelteste oben), dann gelesen (neueste oben)
+    # ── group=conversation ───────────────────────────────────────────────
+    group_mode = (request.args.get("group") or "").lower()
+    if not group_mode and source_filter in ("whatsapp", "imessage", "kchat"):
+        group_mode = "conversation"
+
     def _sort_key(m):
         return (
             0 if not m["read"] else 1,
             m["timestamp_epoch"] if not m["read"] else -m["timestamp_epoch"],
         )
+
+    if group_mode == "conversation":
+        # Aggregiere per conversation_id
+        from collections import defaultdict as _dd
+        by_conv = _dd(list)
+        for m in messages:
+            cid = m.get("conversation_id") or m.get("id")
+            by_conv[cid].append(m)
+        items = []
+        for cid, msgs in by_conv.items():
+            msgs.sort(key=lambda x: x.get("timestamp_epoch", 0), reverse=True)
+            last = msgs[0]
+            unread_count = sum(1 for x in msgs if not x.get("read"))
+            # Title aus last_message ableiten
+            title = last.get("sender_name") or last.get("subject") or cid
+            items.append({
+                "conversation_id": cid,
+                "kind": "1to1",  # Group-Erkennung braucht Metadaten die hier fehlen
+                "title": title,
+                "participants": [
+                    {"id": last.get("sender_address") or "",
+                     "name": last.get("sender_name") or "",
+                     "handle": last.get("sender_address") or ""},
+                ],
+                "last_message": {
+                    "id": last.get("id"),
+                    "sender": {"id": last.get("sender_address"),
+                               "name": last.get("sender_name")},
+                    "snippet": (last.get("preview") or "")[:200],
+                    "timestamp": last.get("timestamp"),
+                    "attachment_kind": None,
+                },
+                "unread_count": unread_count,
+                "pinned": False,
+                "muted": False,
+                "source": last.get("source"),
+            })
+        items.sort(key=lambda x: x["last_message"]["timestamp"] or "", reverse=True)
+        items = items[:per_source_limit]
+        return jsonify({
+            "ok": True,
+            "source": source_filter,
+            "direction": direction,
+            "bucket": bucket,
+            "group": "conversation",
+            "items": items,
+            "total": len(items),
+        })
 
     # Per-Source-Cap: gruppieren, pro Gruppe sortieren und auf limit kuerzen.
     from collections import defaultdict as _dd
@@ -14253,7 +14391,17 @@ def api_messages():
     # Gesamt-Sortierung fuer konsistente Reihenfolge auf Client-Seite
     capped.sort(key=_sort_key)
     slim = [{k: v for k, v in m.items() if k != "full_content"} for m in capped]
-    return jsonify({"ok": True, "messages": slim, "count": len(slim)})
+    extras = {}
+    if bucket == "other":
+        extras["excluded_domains"] = list(_EMAIL_WORK_DOMAINS)
+    return jsonify({
+        "ok": True,
+        "messages": slim,
+        "count": len(slim),
+        "direction": direction,
+        "bucket": bucket,
+        **extras,
+    })
 
 
 @app.route("/messages/view/<msg_id>")
@@ -14465,6 +14613,390 @@ def _apple_mail_bulk_set_read(email_msgs, read: bool):
                   stdout=_sp.DEVNULL, stderr=_sp.DEVNULL, start_new_session=True)
     except Exception as e:
         print(f"[APPLE-MAIL-WRITEBACK bulk] Popen-Fehler: {e}")
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# Lovable Messages-Batch 2026-04-22 (6 neue BACKEND_TODOs)
+# ──────────────────────────────────────────────────────────────────────────
+#   /api/messages/search        — PER_SOURCE_SEARCHBAR
+#   /api/messages/<id>/thread   — MESSAGE_DETAIL_AND_AGENT_REPLY (Read)
+#   /api/messages/<id>/reply    — MESSAGE_DETAIL_AND_AGENT_REPLY (Send)
+#   /api/messages/conversation/<cid> — WHATSAPP_CONVERSATION_GROUPING (Detail)
+#   /api/contacts               — ADDRESS_BOOK
+#   /api/agents/<name>/sessions — MESSAGE_DETAIL_AND_AGENT_REPLY (Agent-Draft)
+# ══════════════════════════════════════════════════════════════════════════
+
+
+@app.route("/api/messages/search")
+def api_messages_search():
+    """Search innerhalb einer Source. Highlightet Matches mit <mark>.
+
+    Query: ?source=<key>&q=<freitext>&limit=50&offset=0&sort=date_desc|date_asc
+    """
+    source_filter = request.args.get("source") or ""
+    query = (request.args.get("q") or "").strip()
+    try:
+        limit = int(request.args.get("limit", "50"))
+        offset = int(request.args.get("offset", "0"))
+    except Exception:
+        limit, offset = 50, 0
+    sort_mode = (request.args.get("sort") or "date_desc").lower()
+    if not query:
+        return jsonify({"ok": True, "source": source_filter, "query": "",
+                        "total": 0, "results": []})
+
+    try:
+        messages = _msg_get_all()
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+    if source_filter:
+        messages = [m for m in messages if m.get("source") == source_filter]
+
+    ql = query.lower()
+
+    def _matches(m):
+        for field in ("subject", "preview", "sender_name", "sender_address"):
+            v = m.get(field) or ""
+            if ql in str(v).lower():
+                return True
+        return False
+
+    hits = [m for m in messages if _matches(m)]
+
+    if sort_mode == "date_asc":
+        hits.sort(key=lambda m: m.get("timestamp_epoch", 0))
+    else:
+        hits.sort(key=lambda m: m.get("timestamp_epoch", 0), reverse=True)
+
+    def _highlight(text, q):
+        if not text or not q:
+            return text or ""
+        # case-insensitive replace — behalte Original-Case im Match
+        import re as _re
+        pat = _re.compile(_re.escape(q), _re.IGNORECASE)
+        return pat.sub(lambda m: f"<mark>{m.group(0)}</mark>", str(text))
+
+    total = len(hits)
+    paged = hits[offset:offset + limit]
+    results = []
+    for m in paged:
+        preview = m.get("preview") or m.get("subject") or ""
+        snippet = _highlight(preview[:300], query)
+        results.append({
+            "id": m.get("id"),
+            "conversation_id": m.get("conversation_id"),
+            "sender": {
+                "id": m.get("sender_address"),
+                "name": m.get("sender_name") or m.get("sender_address"),
+                "handle": m.get("sender_address"),
+            },
+            "subject": m.get("subject"),
+            "snippet": snippet,
+            "timestamp": m.get("timestamp"),
+            "unread": not m.get("read", False),
+            "source": m.get("source"),
+        })
+    return jsonify({
+        "ok": True, "source": source_filter, "query": query,
+        "total": total, "results": results,
+        "limit": limit, "offset": offset,
+    })
+
+
+@app.route("/api/messages/<msg_id>/thread")
+def api_message_thread(msg_id):
+    """Thread- bzw. Conversation-Ansicht einer Message.
+
+    - Email: Messages mit gleicher `conversation_id` (Subject-basiert o.ae.)
+    - Chat (whatsapp/imessage/kchat): Messages mit gleicher `conversation_id`
+    Keine DB — wir filtern die aggregierten Messages-Liste.
+    """
+    try:
+        messages = _msg_get_all()
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+    target = next((m for m in messages if m.get("id") == msg_id), None)
+    if not target:
+        return jsonify({"ok": False, "error": "not found"}), 404
+
+    conv_id = target.get("conversation_id") or msg_id
+    thread_msgs = [m for m in messages if (m.get("conversation_id") or m.get("id")) == conv_id]
+    thread_msgs.sort(key=lambda m: m.get("timestamp_epoch", 0))
+
+    is_email = target.get("type") == "email"
+    kind = "email_thread" if is_email else "chat_conversation"
+
+    # Participants: unique senders
+    seen = set()
+    participants = []
+    for m in thread_msgs:
+        addr = m.get("sender_address") or ""
+        if addr and addr not in seen:
+            seen.add(addr)
+            participants.append({
+                "id": addr, "name": m.get("sender_name") or addr,
+                "email": addr if is_email else None,
+                "handle": addr, "avatar_url": None,
+            })
+
+    # Format messages
+    formatted = []
+    for m in thread_msgs:
+        formatted.append({
+            "id": m.get("id"),
+            "direction": "sent" if _msg_is_sent_by_user(m) else "received",
+            "from": {
+                "name": m.get("sender_name") or m.get("sender_address"),
+                "email": m.get("sender_address") if is_email else None,
+                "handle": m.get("sender_address"),
+            },
+            "to": _msg_email_recipients(m) if is_email else [],
+            "timestamp": m.get("timestamp"),
+            "body_text": m.get("full_content") or m.get("preview") or "",
+            "body_html": None,
+            "attachments": m.get("attachments") or [],
+            "in_reply_to": m.get("in_reply_to"),
+        })
+
+    return jsonify({
+        "ok": True,
+        "source": target.get("source"),
+        "thread_id": conv_id,
+        "kind": kind,
+        "subject": target.get("subject") if is_email else None,
+        "participants": participants,
+        "messages": formatted,
+        "pagination": {"has_more": False},
+    })
+
+
+@app.route("/api/messages/conversation/<conv_id>")
+def api_conversation_detail(conv_id):
+    """Alias fuer /api/messages/<id>/thread mit conversation_id als Key."""
+    try:
+        messages = _msg_get_all()
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 500
+    in_conv = [m for m in messages if m.get("conversation_id") == conv_id]
+    if not in_conv:
+        return jsonify({"ok": False, "error": "conversation not found"}), 404
+    # Delegate an thread-Handler via erste Message
+    first = in_conv[0]
+    return api_message_thread(first.get("id"))
+
+
+@app.route("/api/messages/<msg_id>/reply", methods=["POST"])
+def api_message_reply(msg_id):
+    """Direct-Reply auf eine Message.
+
+    Email -> wrappet /send_email_draft fuer Entwurf oder direkt senden.
+    Chat  -> fuer jetzt 501 (WhatsApp/iMessage-Write-API nicht einheitlich).
+    """
+    try:
+        messages = _msg_get_all()
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 500
+    target = next((m for m in messages if m.get("id") == msg_id), None)
+    if not target:
+        return jsonify({"ok": False, "error": "not found"}), 404
+
+    body = request.get_json(silent=True) or {}
+    body_text = body.get("body_text") or body.get("body") or ""
+    if not body_text.strip():
+        return jsonify({"ok": False, "error": "body_text required"}), 400
+
+    if target.get("type") != "email":
+        return jsonify({
+            "ok": False,
+            "error": f"reply for type={target.get('type')} not supported yet",
+            "hint": "Nur Email-Replies sind aktuell unterstuetzt.",
+        }), 501
+
+    # Email-Reply: Subject mit Re: , To=Original-Sender
+    to_addr = target.get("sender_address") or ""
+    subject = target.get("subject") or ""
+    if not subject.lower().startswith("re:"):
+        subject = "Re: " + subject
+
+    # Fire-and-forget: neuen Draft in Apple Mail erstellen (ohne User-Action
+    # absenden — reply_all etc. ist noch TODO)
+    try:
+        queued_id = _apple_mail_create_draft(
+            to=to_addr, subject=subject, body=body_text,
+            in_reply_to=target.get("message_id") or "",
+        )
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 500
+    return jsonify({
+        "ok": True,
+        "queued_message_id": queued_id or msg_id,
+        "status": "queued",
+    }), 202
+
+
+def _apple_mail_create_draft(to, subject, body, in_reply_to=""):
+    """Erzeugt einen AppleScript-Draft in Apple Mail. Minimal — keine
+    echte Thread-Verknuepfung (In-Reply-To/References wird durch
+    Original-Mail-Selection in Mail.app bereits gesetzt, wenn der User
+    'Antworten' drueckt). Rueckgabe: Pseudo-ID."""
+    import subprocess, uuid
+    script = f'''
+tell application "Mail"
+    set newMessage to make new outgoing message with properties {{subject:"{subject}", content:"{body}", visible:true}}
+    tell newMessage
+        make new to recipient at end of to recipients with properties {{address:"{to}"}}
+    end tell
+end tell
+'''
+    try:
+        subprocess.Popen(['osascript', '-e', script],
+                         stdout=subprocess.DEVNULL,
+                         stderr=subprocess.DEVNULL)
+    except Exception as e:
+        print(f"[REPLY-DRAFT] Fehler: {e}")
+    return "draft_" + uuid.uuid4().hex[:12]
+
+
+@app.route("/api/agents/<agent>/sessions", methods=["POST"])
+def api_agent_sessions(agent):
+    """Startet eine neue Agent-Session, optional mit Message-Kontext.
+
+    Body:
+      { intent: "reply_to_message", source_message_id, source_kind,
+        initial_draft? }
+    Response:
+      { session_id, agent_id, initial_messages[], suggested_action }
+    """
+    if not _agent_exists(agent):
+        return jsonify({"ok": False, "error": f"agent '{agent}' not found"}), 404
+    body = request.get_json(silent=True) or {}
+    intent = body.get("intent") or "generic"
+    src_msg_id = body.get("source_message_id")
+    src_kind = body.get("source_kind") or "chat_conversation"
+    initial_draft = body.get("initial_draft") or ""
+
+    # Neue Session-ID anlegen (zufaellig)
+    import uuid
+    session_id = f"sess_{uuid.uuid4().hex[:12]}"
+
+    initial_messages = []
+    if intent == "reply_to_message" and src_msg_id:
+        # Kontext aus Thread laden
+        try:
+            messages = _msg_get_all()
+            target = next((m for m in messages if m.get("id") == src_msg_id), None)
+        except Exception:
+            target = None
+        if target:
+            conv_id = target.get("conversation_id") or src_msg_id
+            thread_msgs = [m for m in messages
+                           if (m.get("conversation_id") or m.get("id")) == conv_id]
+            thread_msgs.sort(key=lambda m: m.get("timestamp_epoch", 0))
+            ctx_lines = []
+            for m in thread_msgs[-10:]:  # Letzte 10 Messages reichen
+                who = m.get("sender_name") or m.get("sender_address") or "?"
+                preview = (m.get("full_content") or m.get("preview") or "")[:500]
+                ctx_lines.append(f"[{m.get('timestamp', '')}] {who}: {preview}")
+            initial_messages.append({
+                "role": "system_context",
+                "content": f"Konversations-Kontext ({src_kind}):\n" + "\n".join(ctx_lines),
+            })
+
+    if initial_draft:
+        initial_messages.append({"role": "assistant_draft", "content": initial_draft})
+
+    return jsonify({
+        "ok": True,
+        "session_id": session_id,
+        "agent_id": agent,
+        "initial_messages": initial_messages,
+        "suggested_action": "send_reply" if intent == "reply_to_message" else "chat",
+    }), 201
+
+
+@app.route("/api/contacts")
+def api_contacts():
+    """Adressbuch aus E-Mail-Verkehr ableiten.
+
+    Scannt alle E-Mail-Messages, extrahiert unique Sender-Adressen und liefert
+    eine Kontakt-Liste mit first_seen/last_seen/message_count. Kein
+    separater DB-Table — die Daten kommen aus dem Message-Cache.
+    """
+    view = (request.args.get("view") or "recent").lower()
+    query = (request.args.get("q") or "").strip().lower()
+    try:
+        limit = int(request.args.get("limit", "100"))
+        offset = int(request.args.get("offset", "0"))
+    except Exception:
+        limit, offset = 100, 0
+
+    try:
+        messages = _msg_get_all()
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+    # Nur Email-Messages (WhatsApp/iMessage haben keine stabile E-Mail-Adresse)
+    email_msgs = [m for m in messages if m.get("type") == "email"]
+
+    by_email = {}  # email -> dict
+    for m in email_msgs:
+        addr = (m.get("sender_address") or "").strip().lower()
+        if not addr or "@" not in addr:
+            continue
+        name = m.get("sender_name") or ""
+        ts_epoch = m.get("timestamp_epoch", 0)
+        ts_iso = m.get("timestamp") or ""
+        if addr not in by_email:
+            by_email[addr] = {
+                "id": addr,
+                "email": addr,
+                "name": name or None,
+                "source": "apple_mail_inbox",
+                "first_seen_at": ts_iso,
+                "first_seen_epoch": ts_epoch,
+                "last_seen_at": ts_iso,
+                "last_seen_epoch": ts_epoch,
+                "message_count": 0,
+                "avatar_url": None,
+            }
+        c = by_email[addr]
+        c["message_count"] += 1
+        # name update: bevorzuge den nicht-leeren
+        if name and (not c["name"] or len(name) > len(c["name"] or "")):
+            c["name"] = name
+        # first/last-seen update
+        if ts_epoch and ts_epoch < (c["first_seen_epoch"] or ts_epoch):
+            c["first_seen_at"] = ts_iso
+            c["first_seen_epoch"] = ts_epoch
+        if ts_epoch and ts_epoch > (c["last_seen_epoch"] or 0):
+            c["last_seen_at"] = ts_iso
+            c["last_seen_epoch"] = ts_epoch
+
+    contacts = list(by_email.values())
+
+    # Filter: query
+    if query:
+        def _matches(c):
+            return (query in (c.get("name") or "").lower()
+                    or query in (c.get("email") or "").lower())
+        contacts = [c for c in contacts if _matches(c)]
+
+    # Sort
+    if view == "all":
+        contacts.sort(key=lambda c: ((c.get("name") or c.get("email")) or "").lower())
+    else:  # recent
+        contacts.sort(key=lambda c: c.get("first_seen_epoch", 0), reverse=True)
+
+    total = len(contacts)
+    paged = contacts[offset:offset + limit]
+    # Epoch-Felder ausfiltern (intern)
+    for c in paged:
+        c.pop("first_seen_epoch", None)
+        c.pop("last_seen_epoch", None)
+    return jsonify({"ok": True, "items": paged, "total": total,
+                    "view": view, "limit": limit, "offset": offset})
 
 
 @app.route("/messages")

@@ -3982,6 +3982,80 @@ try:
 except Exception as _e:
     test("Agent-CRUD grep", False, str(_e))
 
+# Lovable Messages-Batch 2026-04-22 (6 neue TODOs)
+section("Lovable Messages-Batch 2026-04-22")
+try:
+    import requests
+    _base = "http://localhost:8080"
+
+    # DIRECTION-Filter
+    r = requests.get(f"{_base}/api/messages?source=email_privat&direction=received&limit=3", timeout=5)
+    test("GET /api/messages?direction=received → 200", r.status_code == 200)
+    test("Response enthaelt direction-Feld", r.json().get("direction") == "received")
+
+    r = requests.get(f"{_base}/api/messages?source=email_privat&direction=sent&limit=3", timeout=5)
+    test("GET /api/messages?direction=sent → 200", r.status_code == 200)
+
+    # BUCKET=other
+    r = requests.get(f"{_base}/api/messages?source=email_privat&bucket=other&limit=3", timeout=5)
+    _body = r.json() if r.status_code == 200 else {}
+    test("GET /api/messages?bucket=other → 200", r.status_code == 200)
+    test("excluded_domains enthaelt Work-Domains",
+         "tangerina.me" in (_body.get("excluded_domains") or []) and
+         "signicat.com" in (_body.get("excluded_domains") or []))
+
+    # GROUP=conversation
+    r = requests.get(f"{_base}/api/messages?source=whatsapp&group=conversation&limit=3", timeout=5)
+    _body = r.json() if r.status_code == 200 else {}
+    test("GET /api/messages?group=conversation → 200", r.status_code == 200)
+    test("group=conversation liefert items (nicht messages)",
+         "items" in _body and "messages" not in _body)
+    if _body.get("items"):
+        first = _body["items"][0]
+        test("conversation-item hat conversation_id+last_message+unread_count",
+             "conversation_id" in first and "last_message" in first and "unread_count" in first)
+
+    # /api/messages/search
+    r = requests.get(f"{_base}/api/messages/search?source=email_privat&q=test&limit=3", timeout=5)
+    test("GET /api/messages/search → 200", r.status_code == 200)
+    test("search-Response hat query+total+results",
+         "query" in r.json() and "total" in r.json() and "results" in r.json())
+
+    # /api/contacts
+    r = requests.get(f"{_base}/api/contacts?limit=3", timeout=5)
+    _body = r.json() if r.status_code == 200 else {}
+    test("GET /api/contacts → 200", r.status_code == 200)
+    test("contacts hat items+total", "items" in _body and "total" in _body)
+    if _body.get("items"):
+        first = _body["items"][0]
+        test("contact hat email+first_seen_at+message_count",
+             "email" in first and "first_seen_at" in first and "message_count" in first)
+
+    # /api/messages/<id>/thread
+    r = requests.get(f"{_base}/api/messages?limit=1", timeout=5)
+    first_id = r.json().get("messages", [{}])[0].get("id") if r.status_code == 200 else None
+    if first_id:
+        r = requests.get(f"{_base}/api/messages/{first_id}/thread", timeout=5)
+        test("GET /api/messages/<id>/thread → 200", r.status_code == 200)
+        _body = r.json() if r.status_code == 200 else {}
+        test("thread-Response hat kind+participants+messages",
+             "kind" in _body and "participants" in _body and "messages" in _body)
+
+    # POST /api/agents/<name>/sessions (reply_to_message)
+    if first_id:
+        r = requests.post(
+            f"{_base}/api/agents/privat/sessions", timeout=5,
+            json={"intent": "reply_to_message",
+                  "source_message_id": first_id,
+                  "source_kind": "email_thread"},
+        )
+        test("POST /api/agents/privat/sessions → 201", r.status_code == 201)
+        _body = r.json() if r.status_code == 201 else {}
+        test("session-Response hat session_id+initial_messages",
+             "session_id" in _body and "initial_messages" in _body)
+except Exception as _e:
+    test("Messages-Batch live-Tests", False, str(_e))
+
 
 _cleanup_test_artifacts()
 
