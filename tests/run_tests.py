@@ -4057,6 +4057,54 @@ except Exception as _e:
     test("Messages-Batch live-Tests", False, str(_e))
 
 
+# System-Prompt-Editor: strukturierte Response-Shape (BACKEND_TODO_SYSTEM_PROMPT_SECTIONS)
+section("System-Prompt strukturiert 2026-04-22")
+try:
+    import requests
+    _base = "http://localhost:8080"
+    r = requests.get(_base + "/api/system_prompt/privat", timeout=5)
+    _sp = r.json() if r.status_code == 200 else {}
+    test("GET /api/system_prompt/privat → 200", r.status_code == 200)
+    test("Shape: user/generated/prompt/sections vorhanden",
+         all(k in _sp for k in ("user", "generated", "prompt", "sections")))
+    test("sections[] ist Liste", isinstance(_sp.get("sections"), list))
+    test("user + generated ergibt (teil-)prompt",
+         isinstance(_sp.get("user"), str) and isinstance(_sp.get("generated"), str)
+         and _sp["user"] and _sp["generated"])
+    r2 = requests.get(_base + "/api/system_prompt/signicat/lamp", timeout=5)
+    _sp2 = r2.json() if r2.status_code == 200 else {}
+    test("Sub-Agent /api/system_prompt/<agent>/<sub> → 200", r2.status_code == 200)
+    test("Sub-Agent hat sub-Key im Response", _sp2.get("sub") == "lamp")
+    r3 = requests.get(_base + "/api/system_prompt/__nonexistent__", timeout=5)
+    test("Unbekannter Agent → 404", r3.status_code == 404)
+except Exception as _e:
+    test("System-Prompt strukturiert", False, str(_e))
+
+# Service-Restart-Endpoint (TODO(API) aus AdminHealth.tsx)
+try:
+    import requests
+    _base = "http://localhost:8080"
+    r = requests.post(_base + "/api/health/unknown_svc/restart",
+                      json={"op": "restart"}, timeout=5)
+    test("POST /api/health/<unknown>/restart → 404", r.status_code == 404)
+    r = requests.post(_base + "/api/health/web_clipper/restart",
+                      json={"op": "invalid"}, timeout=5)
+    test("POST /api/health/<svc>/restart {op:invalid} → 400", r.status_code == 400)
+except Exception as _e:
+    test("Health-Restart live-Tests", False, str(_e))
+
+try:
+    _ws_sp = open(os.path.join(_REPO, "src", "web_server.py"), encoding="utf-8").read()
+    test("api_system_prompt nutzt _split_system_prompt",
+         "_split_system_prompt" in _ws_sp)
+    test("_parse_generated_sections vorhanden", "_parse_generated_sections" in _ws_sp)
+    test("api_health_service_restart vorhanden", "api_health_service_restart" in _ws_sp)
+    test("Restart-Route: POST /api/health/<service>/restart",
+         "/api/health/<service>/restart" in _ws_sp)
+except Exception as _e:
+    test("System-Prompt/Restart grep", False, str(_e))
+
+
 _cleanup_test_artifacts()
 
 # ============================================================

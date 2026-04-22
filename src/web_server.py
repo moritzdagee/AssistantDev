@@ -7571,6 +7571,67 @@ def api_health_v2():
     return jsonify({'services': services, 'overall': overall, 'checked_at': now})
 
 
+# ── /api/health/<service>/restart ──────────────────────────────────────────
+# Frontend-Marker (AdminHealth.tsx): POST /api/health/<service>/restart
+# {op: "restart"|"stop"} → {ok}. Nutzt launchctl kickstart -k fuer Services
+# mit LaunchAgent, sonst pkill-Fallback. Localhost-exempt durch Bearer-Auth
+# Middleware — externe Calls brauchen Token.
+_SERVICE_LAUNCHAGENTS = {
+    'web_server':    'com.assistantdev.webserver',
+    'email_watcher': 'com.moritz.emailwatcher',
+    # web_clipper hat keinen LaunchAgent — Restart via pkill+spawn
+}
+
+
+@app.route('/api/health/<service>/restart', methods=['POST'])
+def api_health_service_restart(service):
+    import subprocess
+    body = request.get_json(silent=True) or {}
+    op = (body.get('op') or 'restart').strip().lower()
+    if op not in ('restart', 'stop'):
+        return jsonify({'ok': False, 'error': 'op must be "restart" or "stop"'}), 400
+    if service not in ('web_server', 'web_clipper', 'email_watcher'):
+        return jsonify({'ok': False, 'error': f'unknown service {service}'}), 404
+    uid = os.getuid()
+    label = _SERVICE_LAUNCHAGENTS.get(service)
+    try:
+        if label:
+            domain = f'gui/{uid}/{label}'
+            if op == 'stop':
+                subprocess.run(['launchctl', 'bootout', domain], check=False, timeout=5)
+                return jsonify({'ok': True, 'service': service, 'op': op, 'via': 'launchctl'})
+            # restart: kickstart -k startet neu, laedt den Agent falls noetig.
+            res = subprocess.run(
+                ['launchctl', 'kickstart', '-k', domain],
+                check=False, capture_output=True, text=True, timeout=5,
+            )
+            if res.returncode != 0:
+                # Fallback: explizites bootstrap + kickstart
+                plist = os.path.expanduser(f'~/Library/LaunchAgents/{label}.plist')
+                subprocess.run(['launchctl', 'bootstrap', f'gui/{uid}', plist],
+                               check=False, timeout=5)
+                subprocess.run(['launchctl', 'kickstart', '-k', domain],
+                               check=False, timeout=5)
+            return jsonify({'ok': True, 'service': service, 'op': op, 'via': 'launchctl'})
+        # Kein LaunchAgent: web_clipper via pkill (+ spawn bei restart)
+        if service == 'web_clipper':
+            subprocess.run(['pkill', '-f', 'web_clipper_server.py'], check=False, timeout=5)
+            if op == 'restart':
+                clipper = os.path.join(os.path.dirname(__file__), 'web_clipper_server.py')
+                if os.path.isfile(clipper):
+                    subprocess.Popen(
+                        ['/usr/bin/python3', '-u', clipper],
+                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                        start_new_session=True,
+                    )
+            return jsonify({'ok': True, 'service': service, 'op': op, 'via': 'pkill'})
+        return jsonify({'ok': False, 'error': 'no restart strategy configured'}), 501
+    except subprocess.TimeoutExpired:
+        return jsonify({'ok': False, 'error': 'timeout'}), 504
+    except Exception as e:  # noqa: BLE001
+        return jsonify({'ok': False, 'error': str(e)}), 500
+
+
 # ── /api/docs (flache Liste, /api/docs/<slug> Detail) ──────────────────────
 @app.route('/api/docs')
 def api_docs_v2():
@@ -7876,10 +7937,66 @@ def api_capabilities():
 
 
 # ── /api/system_prompt/<agent>[/<sub>] ─────────────────────────────────────
+# Strukturierter Split zwischen editierbarem User-Teil und auto-generierten
+# Capabilities. Marker wird in allen Agent-.txt-Files konsistent genutzt.
+# Siehe FIXED_SYSTEM_PROMPT_SECTIONS.md im Frontend-Repo.
+SYSTEM_PROMPT_SPLIT_MARKER = '--- SYSTEM CAPABILITIES (AUTO-GENERATED - DO NOT EDIT BELOW) ---'
+
+
+def _split_system_prompt(raw):
+    """Spaltet den Rohtext in user (editierbar) + generated (auto).
+
+    Rueckgabe: (user_text, generated_text). Fehlt der Marker, landet
+    alles in user_text und generated_text ist leer.
+    """
+    idx = raw.find(SYSTEM_PROMPT_SPLIT_MARKER)
+    if idx == -1:
+        return raw.rstrip('\n'), ''
+    user_part = raw[:idx].rstrip('\n')
+    # Marker-Zeile selbst ueberspringen (inkl. Zeilenumbruch danach)
+    after = raw[idx + len(SYSTEM_PROMPT_SPLIT_MARKER):]
+    # Fuehrenden Newline hinter Marker entfernen
+    if after.startswith('\n'):
+        after = after[1:]
+    return user_part, after.rstrip('\n')
+
+
+def _parse_generated_sections(generated):
+    """Zerlegt den generated-Teil entlang '## Heading'-Marker in Sections.
+
+    Rueckgabe: [{'name': str, 'content': str}, ...]. Content vor der
+    ersten Heading landet in einer Section 'Einleitung', falls vorhanden.
+    """
+    if not generated.strip():
+        return []
+    sections = []
+    current_name = None
+    current_lines = []
+    for line in generated.split('\n'):
+        if line.startswith('## '):
+            if current_name is not None or current_lines:
+                sections.append({
+                    'name': current_name or 'Einleitung',
+                    'content': '\n'.join(current_lines).strip('\n'),
+                })
+            current_name = line[3:].strip()
+            current_lines = []
+        else:
+            current_lines.append(line)
+    if current_name is not None or current_lines:
+        sections.append({
+            'name': current_name or 'Einleitung',
+            'content': '\n'.join(current_lines).strip('\n'),
+        })
+    # Leere Sections (z.B. Heading ohne Inhalt) rausfiltern
+    return [s for s in sections if s['content'].strip()]
+
+
 @app.route('/api/system_prompt/<agent>')
 @app.route('/api/system_prompt/<agent>/<sub>')
 def api_system_prompt(agent, sub=None):
-    """Liest das System-Prompt .txt eines Agents oder Sub-Agents."""
+    """Liefert den System-Prompt strukturiert: user (editierbar) + generated
+    (auto) + sections[]. Siehe BACKEND_TODO_SYSTEM_PROMPT_SECTIONS.md."""
     if sub:
         fname = f'{agent}_{sub}.txt'
         key = f'{agent}/{sub}'
@@ -7894,7 +8011,15 @@ def api_system_prompt(agent, sub=None):
             prompt = fh.read()
     except OSError as e:
         return jsonify({'error': str(e)}), 500
-    result = {'agent': agent, 'prompt': prompt}
+    user_part, generated_part = _split_system_prompt(prompt)
+    sections = _parse_generated_sections(generated_part)
+    result = {
+        'agent': agent,
+        'prompt': prompt,
+        'user': user_part,
+        'generated': generated_part,
+        'sections': sections,
+    }
     if sub:
         result['sub'] = sub
     return jsonify(result)
