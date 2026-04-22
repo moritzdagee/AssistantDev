@@ -8,6 +8,30 @@ Format: [Datum] Änderung | Datei | Grund
 
 ## 2026-04-21
 
+### Feature: Oeffentliche API via Cloudflare Tunnel + Bearer-Token-Auth + CORS (Lovable arbeitet live gegen Backend)
+- **Hintergrund:** User-Workflow „Lovable-Design -> Claude-Commit -> Testen" ist zu langsam. Neuer Flow: Lovable-Preview spricht live gegen `api.bios.love` (Cloudflare-Tunnel auf `localhost:8080`), Iterationen gehen direkt in der Lovable-Preview. Claude wird aufgerufen, wenn neue Backend-Endpoints gebraucht werden (Lovable markiert im Code mit `TODO(API):`).
+- **Security-Kern:**
+  - `config/api_auth.json` (gitignored) enthaelt einen 43-Char-urlsafe-Token
+  - `.gitignore` erweitert: `config/api_auth.json`, `config/*_oauth.json`, `config/*_token.json`
+  - Backend `src/web_server.py`:
+    - neue Helfer-Funktion `_configure_cors_and_auth(flask_app)` kapselt CORS + Token-Middleware
+    - Wird **auf beiden `app = Flask(__name__)`-Instanzen** aufgerufen (duplizierte Bloecke, siehe CLAUDE.md)
+    - Token-Check via `before_request`: Host-Header-basiert (nicht `remote_addr`, weil Tunnel auf 127.0.0.1 proxyt). Localhost-Host → exempt, externer Host → Bearer-Token Pflicht
+    - Fehlender Token in Config → 503 extern (statt Fallback durchlassen, Security-Default)
+    - CORS via `flask-cors`: erlaubt `*.lovable.app`, `*.lovable.dev`, `*.bios.love`, `localhost:5173/:8080`
+- **Frontend (`assistantdev-frontend`):**
+  - `src/lib/api.ts` liest `VITE_API_BASE_URL` + `VITE_API_TOKEN` aus Env. Lokal (leer) = same-origin, Lovable (gesetzt) = Prefix + Bearer-Header
+  - `src/vite-env.d.ts` mit TypeScript-Typen fuer die Env-Variablen
+- **Ops:**
+  - `cloudflared` via brew installiert
+  - `scripts/com.assistantdev.cloudflared.plist.optional` vorbereitet fuer LaunchAgent-Dauerlauf
+  - `docs/tunnel_setup.md` — Schritt-fuer-Schritt-Anleitung (Browser-OAuth, Tunnel-Create, DNS-Route, Config, LaunchAgent, Lovable-Env-Setup)
+- **Neues Tool `scripts/scan_api_todos.sh`:**
+  - Greppt `frontend/src/**/*.{ts,tsx,js,jsx}` nach `TODO(API):`, `NEEDS_BACKEND`, `// @api`
+  - Gibt strukturierte Liste aus → wenn Claude wieder dran ist, weiss er sofort was am Backend fehlt
+- **Tests:** 15 neue in Sektion "Frontend-Migration /app 2026-04-21": pruefen CORS+Auth-Middleware-Struktur, gitignore-Schutz, Scan-Script, plus 4 Live-Auth-Tests (localhost vs. Host: api.bios.love, mit/ohne Token). Suite-Status: **1011/1012 gruen** (1 Pre-existing `/api/canva Token`-Fail).
+- **Noch zu tun (User-Aktion):** Cloudflare-Tunnel einmalig im Browser autorisieren, DNS-Route setzen, LaunchAgent laden (`docs/tunnel_setup.md` Schritte 2-6). In Lovable `VITE_API_BASE_URL=https://api.bios.love` + `VITE_API_TOKEN=<token>` setzen.
+
 ### Feature: Alle Platzhalter-Seiten migriert (Memory, Messages, Docs, Changelog, Permissions) + 4 neue JSON-APIs
 - **Backend-APIs (`src/web_server.py`):**
   - `/api/docs/list` — enumeriert Whitelist (architecture.md, install.md, troubleshooting.md, README.md, COLLABORATION.md, CLAUDE.md) mit slug/title/preview

@@ -1,0 +1,55 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!-- LaunchAgent fuer Cloudflare Tunnel (assistantdev-api -> api.bios.love)
+
+     Installation:
+       1. Tunnel einmalig anlegen (siehe docs/tunnel_setup.md):
+            cloudflared tunnel login
+            cloudflared tunnel create assistantdev-api
+            cloudflared tunnel route dns assistantdev-api api.bios.love
+       2. ~/.cloudflared/config.yml schreiben:
+            tunnel: assistantdev-api
+            credentials-file: /Users/moritzcremer/.cloudflared/<UUID>.json
+            ingress:
+              - hostname: api.bios.love
+                service: http://localhost:8080
+              - service: http_status:404
+       3. Dieses Plist kopieren + aktivieren:
+            cp scripts/com.assistantdev.cloudflared.plist.optional \
+               ~/Library/LaunchAgents/com.assistantdev.cloudflared.plist
+            launchctl load ~/Library/LaunchAgents/com.assistantdev.cloudflared.plist
+       4. Log-Check:
+            tail -f ~/AssistantDev/logs/cloudflared.log
+-->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.assistantdev.cloudflared</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/opt/homebrew/bin/cloudflared</string>
+        <string>tunnel</string>
+        <string>run</string>
+        <string>assistantdev-api</string>
+    </array>
+
+    <key>RunAtLoad</key>
+    <true/>
+
+    <key>KeepAlive</key>
+    <true/>
+
+    <key>StandardOutPath</key>
+    <string>/Users/moritzcremer/AssistantDev/logs/cloudflared.log</string>
+
+    <key>StandardErrorPath</key>
+    <string>/Users/moritzcremer/AssistantDev/logs/cloudflared.log</string>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>/opt/homebrew/bin:/usr/bin:/bin</string>
+    </dict>
+</dict>
+</plist>

@@ -391,7 +391,70 @@ BASE = os.path.expanduser("~/Library/Mobile Documents/com~apple~CloudDocs/Downlo
 AGENTS_DIR = os.path.join(BASE, "config/agents")
 MODELS_FILE = os.path.join(BASE, "config/models.json")
 
+# ── API-Auth-Token fuer externen Zugriff (Cloudflare Tunnel / Lovable) ──────
+# Liegt in ~/AssistantDev/config/api_auth.json (gitignored). Localhost-Requests
+# sind exempted — die Desktop-App und Claude-Tooling arbeiten weiter ohne
+# Header. Externe Requests brauchen Authorization: Bearer <token>.
+_API_AUTH_CFG = os.path.join(
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+    "config", "api_auth.json",
+)
+try:
+    with open(_API_AUTH_CFG, encoding="utf-8") as _fh:
+        _API_TOKEN = json.load(_fh).get("api_token") or None
+except Exception:
+    _API_TOKEN = None
+
+def _configure_cors_and_auth(flask_app):
+    """CORS + Token-Auth auf einer Flask-App registrieren. Wird auf BEIDEN
+    app-Instanzen aufgerufen (web_server.py hat duplizierte Blocke; die zweite
+    Init ueberschreibt die Routen der ersten, siehe CLAUDE.md)."""
+    try:
+        from flask_cors import CORS
+        CORS(
+            flask_app,
+            resources={r"/*": {"origins": [
+                r"https://.*\.lovable\.app",
+                r"https://.*\.lovable\.dev",
+                r"https://.*\.bios\.love",
+                "http://localhost:5173",
+                "http://localhost:8080",
+            ]}},
+            supports_credentials=False,
+            allow_headers=["Content-Type", "Authorization"],
+            expose_headers=["Content-Type"],
+            max_age=86400,
+        )
+    except ImportError:
+        pass
+
+    @flask_app.before_request
+    def _require_api_token_for_external():
+        """Externe Requests brauchen Bearer-Token. Lokaler Zugriff (Desktop-
+        App, Tests, Claude) bleibt frei. Unterscheidung ueber Host-Header,
+        weil der Cloudflare-Tunnel an 127.0.0.1 proxyt (remote_addr reicht
+        also nicht)."""
+        if request.method == "OPTIONS":
+            return None
+        host = (request.headers.get("Host") or "").split(":")[0].lower()
+        if host in ("localhost", "127.0.0.1", "::1", ""):
+            return None
+        if not _API_TOKEN:
+            return jsonify({
+                "error": "backend_not_configured",
+                "hint": "config/api_auth.json fehlt — externer Zugriff blockiert.",
+            }), 503
+        auth = request.headers.get("Authorization", "")
+        if auth.startswith("Bearer ") and auth[7:].strip() == _API_TOKEN:
+            return None
+        return jsonify({
+            "error": "unauthorized",
+            "hint": "Authorization: Bearer <token> required for external access",
+        }), 401
+
+
 app = Flask(__name__)
+_configure_cors_and_auth(app)
 
 def cleanup_agent_files():
     """Clean old memory content from agent txt files on startup."""
@@ -1844,6 +1907,7 @@ def execute_delegation(sub_agent_name, original_msg, kontext_items, state=None):
 
 
 app = Flask(__name__)
+_configure_cors_and_auth(app)
 
 def cleanup_agent_files():
     """Clean old memory content from agent txt files on startup."""

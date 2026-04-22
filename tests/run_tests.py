@@ -3886,6 +3886,60 @@ try:
 except Exception as _e:
     test("/api/oauth-status live", False, str(_e))
 
+# CORS + Token-Auth Middleware
+try:
+    _ws4 = open(os.path.join(_REPO, "src", "web_server.py"), encoding="utf-8").read()
+    test("web_server.py: _configure_cors_and_auth definiert",
+         "_configure_cors_and_auth" in _ws4)
+    test("web_server.py: Middleware auf BEIDEN app-Instanzen aktiviert",
+         _ws4.count("_configure_cors_and_auth(app)") >= 2)
+    test("web_server.py: _API_TOKEN wird aus config/api_auth.json geladen",
+         "_API_TOKEN" in _ws4 and "api_auth.json" in _ws4)
+    test("web_server.py: CORS-Origins enthalten lovable + bios",
+         "lovable" in _ws4 and "bios" in _ws4)
+    test("web_server.py: Host-basierter Localhost-Check (nicht remote_addr)",
+         'request.headers.get("Host"' in _ws4 or "request.headers.get('Host'" in _ws4)
+except Exception as _e:
+    test("web_server.py auth/cors lesbar", False, str(_e))
+
+# gitignore schuetzt api_auth.json
+try:
+    _gi = open(os.path.join(_REPO, ".gitignore"), encoding="utf-8").read()
+    test("gitignore ignoriert config/api_auth.json", "config/api_auth.json" in _gi)
+    test("gitignore ignoriert config/*_oauth.json", "config/*_oauth.json" in _gi)
+except Exception as _e:
+    test("gitignore lesbar", False, str(_e))
+
+# scan_api_todos.sh
+_scan = os.path.join(_REPO, "scripts", "scan_api_todos.sh")
+test("scripts/scan_api_todos.sh existiert", os.path.isfile(_scan))
+test("scripts/scan_api_todos.sh ist executable",
+     os.path.isfile(_scan) and os.access(_scan, os.X_OK))
+if os.path.isfile(_scan):
+    _sc = open(_scan, encoding="utf-8").read()
+    test("scan_api_todos.sh kennt alle 3 Marker",
+         "TODO(API)" in _sc and "NEEDS_BACKEND" in _sc and "@api" in _sc)
+
+# Live-Auth-Flow (4 Szenarien)
+try:
+    import requests, json as _json
+    _tok = _json.load(open(os.path.join(_REPO, "config", "api_auth.json")))["api_token"]
+    r1 = requests.get("http://localhost:8080/api/oauth-status", timeout=3)
+    r2 = requests.get("http://localhost:8080/api/oauth-status",
+                      headers={"Host": "api.bios.love"}, timeout=3)
+    r3 = requests.get("http://localhost:8080/api/oauth-status",
+                      headers={"Host": "api.bios.love", "Authorization": "Bearer wrong"},
+                      timeout=3)
+    r4 = requests.get("http://localhost:8080/api/oauth-status",
+                      headers={"Host": "api.bios.love", "Authorization": f"Bearer {_tok}"},
+                      timeout=3)
+    test("Auth: localhost ohne Token → 200", r1.status_code == 200)
+    test("Auth: externer Host ohne Token → 401", r2.status_code == 401)
+    test("Auth: externer Host + falscher Token → 401", r3.status_code == 401)
+    test("Auth: externer Host + korrekter Token → 200", r4.status_code == 200)
+except Exception as _e:
+    test("Auth live-Tests", False, str(_e))
+
 
 _cleanup_test_artifacts()
 
