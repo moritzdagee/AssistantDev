@@ -2,6 +2,8 @@
 
 Format: [Datum] Änderung | Datei | Grund
 
+[2026-04-22] FEATURE: Lovable LIVE_API_QA Backend-Batch — 13 neue JSON-Endpoints + Agent-CRUD | src/web_server.py | Lovable hat in 17 BACKEND_TODO_*.md-Dateien die Frontend-Erwartung gegen das Live-Backend dokumentiert (Endpoints 404, HTML statt JSON, fehlende CRUD). Dieser Commit bringt: /api/health (Service-Flatlist mit overall-Status), /api/docs + /api/docs/<slug> (JSON statt HTML), /api/changelog (strukturiert mit id/version/title/body_markdown/type), /api/permissions (flach mit fix_kind + instructions_markdown), /api/permissions_matrix + /api/memory/access_matrix (Agent x Scope Cells), /api/custom_sources, /api/commands (24 Slash-Commands), /api/capabilities, /api/system_prompt/<agent>[/<sub>] (liest .txt aus Datalake), /api/conversations + /api/conversations/<id>/messages (Alias zu /get_history). Agent-CRUD: POST /agents, PATCH /agents/<name>, DELETE /agents/<name> (move to .deleted_<timestamp>, nie wirklich loeschen — CLAUDE.md konform), Subagent-Varianten /agents/<parent>/subagents. Slug-Regel spiegelt Frontend: lower → [^a-z0-9]+ -> _, strip _. 12 neue Live-Tests + 5 Grep-Tests, 1028/1029 gruen (1 pre-existing Canva-Token-Fail).
+
 [2026-04-21] SECURITY: Canva OAuth CLIENT_SECRET aus Source entfernt, liest jetzt aus config/models.json bzw. Env-Vars (CANVA_CLIENT_ID/CANVA_CLIENT_SECRET) | scripts/canva_oauth_setup.py | Secret war hardcoded und im PUBLIC-Repo exponiert — muss in Canva Developer Portal rotiert werden, History-Exposure bleibt bis filter-repo/BFG.
 
 ---

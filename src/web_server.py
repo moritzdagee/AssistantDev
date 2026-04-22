@@ -7498,6 +7498,615 @@ def api_oauth_status():
     })
 
 
+# ═════════════════════════════════════════════════════════════════════════
+# Lovable LIVE_API_QA 2026-04-22 Endpoints
+# ═════════════════════════════════════════════════════════════════════════
+# Lovables Frontend erwartet stabile JSON-Endpoints unter /api/*.
+# Aliase zu bestehenden Routes + neue Endpoints (health, permissions,
+# commands, system_prompt, conversations, memory_access_matrix).
+# ═════════════════════════════════════════════════════════════════════════
+
+
+def _slugify_agent_name(label: str) -> str:
+    """Spiegelt BACKEND_TODO_AGENT_MANAGER Slug-Regeln."""
+    import re as _re
+    slug = label.lower().strip()
+    slug = _re.sub(r'[^a-z0-9]+', '_', slug)
+    slug = slug.strip('_')
+    return slug
+
+
+def _agent_exists(name: str) -> bool:
+    return os.path.isfile(os.path.join(AGENTS_DIR, name + '.txt'))
+
+
+# ── /api/health (Schema laut LIVE_API_QA §7) ───────────────────────────────
+@app.route('/api/health')
+def api_health_v2():
+    """Flache Service-Liste fuer Lovables Health-Page."""
+    import socket, subprocess
+    def _port_open(port):
+        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        s.settimeout(0.3)
+        try:
+            return s.connect_ex(('127.0.0.1', port)) == 0
+        finally:
+            s.close()
+    def _pgrep(pat):
+        try:
+            out = subprocess.check_output(['pgrep', '-f', pat], text=True, timeout=1)
+            return [int(p) for p in out.strip().split('\n') if p.strip().isdigit()]
+        except Exception:
+            return []
+
+    now = datetime.datetime.now(datetime.timezone.utc).isoformat().replace('+00:00', 'Z')
+    services = []
+    # Web Server
+    web_ok = _port_open(8080) or bool(_pgrep('web_server.py|AssistantDev WebServer'))
+    services.append({
+        'name': 'web_server', 'label': 'Web Server',
+        'status': 'ok' if web_ok else 'down',
+        'detail': 'Port 8080',
+        'since': now,
+    })
+    # Web Clipper
+    clipper_ok = _port_open(8081) or bool(_pgrep('web_clipper_server.py'))
+    services.append({
+        'name': 'web_clipper', 'label': 'Web Clipper',
+        'status': 'ok' if clipper_ok else 'down',
+        'detail': 'Port 8081',
+        'since': now,
+    })
+    # Email Watcher
+    ew_ok = bool(_pgrep('email_watcher.py|AssistantDev EmailWatcher'))
+    services.append({
+        'name': 'email_watcher', 'label': 'Email Watcher',
+        'status': 'ok' if ew_ok else 'warning',
+        'detail': 'Hintergrund-Prozess',
+        'since': now,
+    })
+    overall = 'ok'
+    if any(s['status'] == 'down' for s in services): overall = 'degraded'
+    elif any(s['status'] == 'warning' for s in services): overall = 'degraded'
+    return jsonify({'services': services, 'overall': overall, 'checked_at': now})
+
+
+# ── /api/docs (flache Liste, /api/docs/<slug> Detail) ──────────────────────
+@app.route('/api/docs')
+def api_docs_v2():
+    """Flache Doc-Liste fuer Lovables AdminDocs. Alias zu /api/docs/list."""
+    items = []
+    for slug, filename in _DOCS_WHITELIST.items():
+        path = os.path.join(_REPO_ROOT_FOR_FRONTEND_APIS, filename)
+        if not os.path.isfile(path):
+            continue
+        try:
+            with open(path, encoding='utf-8') as fh:
+                first = fh.read(400)
+        except OSError:
+            continue
+        items.append({
+            'slug': slug,
+            'title': _DOCS_TITLES.get(slug, filename),
+            'summary': first.replace('\n', ' ').strip()[:150],
+            'group': 'admin',
+        })
+    return jsonify(items)
+
+
+@app.route('/api/docs/<slug>')
+def api_docs_detail_v2(slug):
+    """Detail-Doc. Alias zu /api/docs/read/<slug>."""
+    filename = _DOCS_WHITELIST.get(slug.lower())
+    if not filename:
+        return jsonify({'error': 'unknown slug'}), 404
+    path = os.path.join(_REPO_ROOT_FOR_FRONTEND_APIS, filename)
+    if not os.path.isfile(path):
+        return jsonify({'error': 'file missing'}), 404
+    with open(path, encoding='utf-8') as fh:
+        content = fh.read()
+    return jsonify({
+        'slug': slug,
+        'title': _DOCS_TITLES.get(slug, filename),
+        'markdown': content,
+    })
+
+
+# ── /api/changelog (parse changelog.md mit type-Guessing) ─────────────────
+@app.route('/api/changelog')
+def api_changelog_v2():
+    """Flache Liste [{id, version, date, title, body_markdown, type}].
+
+    Alias zu /api/changelog.json mit reicherer Shape fuer Lovables UI.
+    """
+    path = os.path.join(_REPO_ROOT_FOR_FRONTEND_APIS, 'changelog.md')
+    if not os.path.isfile(path):
+        return jsonify([])
+    with open(path, encoding='utf-8') as fh:
+        content = fh.read()
+    entries = []
+    current_date = None
+    current_body = []
+    eid = 0
+    for line in content.splitlines():
+        if line.startswith('## ') and len(line) >= 6:
+            cand = line[3:].strip()
+            is_date = (len(cand) >= 10 and cand[4] == '-' and cand[7] == '-'
+                       and cand[:4].isdigit() and cand[5:7].isdigit()
+                       and cand[8:10].isdigit())
+            if is_date:
+                if current_date:
+                    body = '\n'.join(current_body).strip()
+                    title_line = next((l for l in current_body if l.startswith('### ')), None)
+                    title = title_line[4:].strip() if title_line else current_date
+                    # type raten
+                    tlow = title.lower()
+                    if 'fix' in tlow: ctype = 'fix'
+                    elif 'feat' in tlow: ctype = 'feature'
+                    elif 'security' in tlow: ctype = 'security'
+                    elif 'docs' in tlow or 'chore' in tlow: ctype = 'chore'
+                    else: ctype = 'feature'
+                    eid += 1
+                    entries.append({
+                        'id': f'cl-{eid}',
+                        'version': current_date,
+                        'date': current_date,
+                        'title': title[:120],
+                        'body_markdown': body,
+                        'type': ctype,
+                    })
+                current_date = cand[:10]
+                current_body = []
+                continue
+        if current_date is not None:
+            current_body.append(line)
+    if current_date:
+        body = '\n'.join(current_body).strip()
+        title_line = next((l for l in current_body if l.startswith('### ')), None)
+        title = title_line[4:].strip() if title_line else current_date
+        tlow = title.lower()
+        ctype = ('fix' if 'fix' in tlow else 'feature' if 'feat' in tlow
+                 else 'security' if 'security' in tlow else 'feature')
+        eid += 1
+        entries.append({
+            'id': f'cl-{eid}',
+            'version': current_date,
+            'date': current_date,
+            'title': title[:120],
+            'body_markdown': body,
+            'type': ctype,
+        })
+    return jsonify(entries)
+
+
+# ── /api/permissions (flach, mit fix_kind + instructions) ──────────────────
+@app.route('/api/permissions')
+def api_permissions():
+    """Flache Liste von Permissions mit Action-URL / Instructions."""
+    try:
+        _models_cfg = load_models()
+        _providers = _models_cfg.get('providers', {})
+    except Exception:
+        _providers = {}
+
+    def _key_ok(p):
+        prov = _providers.get(p, {})
+        k = prov.get('api_key') if isinstance(prov, dict) else None
+        return bool(k and str(k).strip() and not str(k).startswith('YOUR_'))
+
+    config_dir = os.path.join(_REPO_ROOT_FOR_FRONTEND_APIS, 'config')
+    def _cfg_exists(rel):
+        return os.path.isfile(os.path.join(config_dir, rel))
+
+    items = []
+    # API-Keys
+    for prov in ('anthropic', 'openai', 'gemini', 'mistral', 'perplexity'):
+        items.append({
+            'id': f'{prov}_api_key',
+            'label': f'{prov.capitalize()} API Key',
+            'status': 'ok' if _key_ok(prov) else 'missing',
+            'category': 'api_key',
+            'fix_kind': 'docs',
+            'fix_target': f'https://{prov}.com/settings',
+            'instructions_markdown': (
+                f'## {prov.capitalize()} API Key setzen\n\n'
+                f'1. Bei {prov.capitalize()} einloggen und API-Key generieren\n'
+                f'2. In `config/models.json` unter `providers.{prov}.api_key` eintragen\n'
+                f'3. Backend neu starten: `bash ~/AssistantDev/scripts/deploy.sh`'
+            ),
+        })
+    # OAuth
+    for svc, label, fixurl in [
+        ('slack', 'Slack', 'https://api.slack.com/apps'),
+        ('canva', 'Canva', 'https://www.canva.com/developers/apps'),
+        ('google_calendar', 'Google Calendar', 'https://console.cloud.google.com/'),
+    ]:
+        items.append({
+            'id': f'{svc}_oauth',
+            'label': f'{label} OAuth',
+            'status': 'ok' if _cfg_exists(f'{svc}_oauth.json') or _cfg_exists(f'{svc}_token.json') else 'missing',
+            'category': 'oauth',
+            'fix_kind': 'open_url',
+            'fix_target': fixurl,
+            'instructions_markdown': (
+                f'## {label} verbinden\n\n'
+                f'OAuth-Setup via `scripts/{svc}_oauth_setup.py` ausfuehren.'
+            ),
+        })
+    # macOS Automation
+    for tgt, label in [('mail', 'Mail'), ('contacts', 'Contacts'), ('calendar', 'Calendar')]:
+        items.append({
+            'id': f'macos_{tgt}',
+            'label': f'macOS {label} Access',
+            'status': 'unknown',
+            'category': 'macos_automation',
+            'fix_kind': 'open_settings',
+            'fix_target': 'x-apple.systempreferences:com.apple.preference.security?Privacy_Automation',
+            'instructions_markdown': (
+                f'## {label}-Zugriff freigeben\n\n'
+                f'Systemeinstellungen → Datenschutz & Sicherheit → Automation → '
+                f'Terminal/Python3 → {label} aktivieren.'
+            ),
+        })
+    return jsonify(items)
+
+
+# ── /api/permissions_matrix (Agent × Source) ───────────────────────────────
+@app.route('/api/permissions_matrix')
+def api_permissions_matrix():
+    """Alias zu /api/access-control mit UI-freundlicher Shape."""
+    try:
+        agents_cfg_path = os.path.join(_REPO_ROOT_FOR_FRONTEND_APIS, 'config', 'access_control.json')
+        if os.path.isfile(agents_cfg_path):
+            with open(agents_cfg_path, encoding='utf-8') as fh:
+                data = json.load(fh)
+        else:
+            data = {'agents': {}}
+    except Exception:
+        data = {'agents': {}}
+
+    agents_map = data.get('agents', {}) if isinstance(data, dict) else {}
+    agent_names = list(agents_map.keys()) or [
+        f.replace('.txt', '') for f in os.listdir(AGENTS_DIR)
+        if f.endswith('.txt') and '.backup_' not in f
+    ]
+    all_scopes = set()
+    for cfg in agents_map.values():
+        if isinstance(cfg, dict):
+            for s in (cfg.get('shared_memory') or []):
+                all_scopes.add(s)
+    scopes = sorted(all_scopes) or ['email_inbox', 'calendar', 'contacts', 'webclips']
+
+    cells = []
+    for agent in agent_names:
+        cfg = agents_map.get(agent, {}) if isinstance(agents_map.get(agent), dict) else {}
+        shared = set(cfg.get('shared_memory') or [])
+        own = cfg.get('own_memory', True)
+        for scope in scopes:
+            cells.append({
+                'agent': agent,
+                'scope': scope,
+                'read': scope in shared or own,
+                'write': False,
+            })
+    return jsonify({
+        'agents': agent_names,
+        'scopes': scopes,
+        'cells': cells,
+    })
+
+
+@app.route('/api/memory/access_matrix')
+def api_memory_access_matrix():
+    """Alias zu /api/permissions_matrix (Lovable nutzt beide Pfade)."""
+    return api_permissions_matrix()
+
+
+# ── /api/custom_sources ────────────────────────────────────────────────────
+@app.route('/api/custom_sources')
+def api_custom_sources():
+    """Custom-Source-Definitionen aus access_control.json."""
+    try:
+        path = os.path.join(_REPO_ROOT_FOR_FRONTEND_APIS, 'config', 'access_control.json')
+        if os.path.isfile(path):
+            with open(path, encoding='utf-8') as fh:
+                data = json.load(fh)
+        else:
+            data = {}
+    except Exception:
+        data = {}
+    custom = data.get('custom_sources') or data.get('custom') or []
+    # Falls dict, in Liste umwandeln
+    if isinstance(custom, dict):
+        custom = [{'key': k, **(v if isinstance(v, dict) else {'path': v})}
+                  for k, v in custom.items()]
+    return jsonify(custom if isinstance(custom, list) else [])
+
+
+# ── /api/commands (Slash-Commands) ─────────────────────────────────────────
+@app.route('/api/commands')
+def api_commands():
+    """Bekannte Slash-Commands — pragmatische Liste aus dem Datalake."""
+    commands = [
+        {'name': '/create-email', 'description': 'E-Mail-Draft erstellen', 'args': ['empfaenger', 'betreff?']},
+        {'name': '/create-email-reply', 'description': 'Antwort auf existierende E-Mail', 'args': ['nachricht_id']},
+        {'name': '/create-whatsapp', 'description': 'WhatsApp-Draft', 'args': ['kontakt', 'text?']},
+        {'name': '/create-slack', 'description': 'Slack-Message-Draft', 'args': ['kanal']},
+        {'name': '/calendar-today', 'description': 'Heutige Termine', 'args': []},
+        {'name': '/calendar-tomorrow', 'description': 'Termine morgen', 'args': []},
+        {'name': '/calendar-week', 'description': 'Termine diese Woche', 'args': []},
+        {'name': '/calendar-search', 'description': 'Kalender-Suche', 'args': ['query']},
+        {'name': '/create-image', 'description': 'Bild generieren (Gemini/OpenAI)', 'args': ['prompt']},
+        {'name': '/create-video', 'description': 'Video generieren', 'args': ['prompt']},
+        {'name': '/create-file-docx', 'description': 'Word-Dokument erstellen', 'args': ['titel', 'inhalt']},
+        {'name': '/create-file-xlsx', 'description': 'Excel-Datei erstellen', 'args': ['titel']},
+        {'name': '/create-file-pdf', 'description': 'PDF erstellen', 'args': ['titel']},
+        {'name': '/create-file-pptx', 'description': 'PowerPoint erstellen', 'args': ['titel']},
+        {'name': '/canva-search', 'description': 'Canva-Designs suchen', 'args': ['query']},
+        {'name': '/canva-create', 'description': 'Neues Canva-Design', 'args': ['titel']},
+        {'name': '/find', 'description': 'Agent-lokale Suche', 'args': ['query']},
+        {'name': '/find-email', 'description': 'E-Mail-Suche', 'args': ['query']},
+        {'name': '/find-whatsapp', 'description': 'WhatsApp-Suche', 'args': ['query']},
+        {'name': '/find-webclip', 'description': 'Webclip-Suche', 'args': ['query']},
+        {'name': '/find-document', 'description': 'Dokument-Suche', 'args': ['query']},
+        {'name': '/find-conversation', 'description': 'Konversations-Suche', 'args': ['query']},
+        {'name': '/find_global', 'description': 'Agent-uebergreifende Suche', 'args': ['query']},
+        {'name': '/reply', 'description': 'Auf E-Mail aus Suche antworten', 'args': ['query']},
+    ]
+    return jsonify(commands)
+
+
+# ── /api/capabilities ──────────────────────────────────────────────────────
+@app.route('/api/capabilities')
+def api_capabilities():
+    """Feature-Flags fuer UI."""
+    return jsonify({
+        'chat': True,
+        'memory': True,
+        'slash_commands': True,
+        'file_upload': True,
+        'url_fetch': True,
+        'calendar': True,
+        'slack': True,
+        'canva': True,
+        'whatsapp': True,
+        'imessage': True,
+        'kchat': True,
+    })
+
+
+# ── /api/system_prompt/<agent>[/<sub>] ─────────────────────────────────────
+@app.route('/api/system_prompt/<agent>')
+@app.route('/api/system_prompt/<agent>/<sub>')
+def api_system_prompt(agent, sub=None):
+    """Liest das System-Prompt .txt eines Agents oder Sub-Agents."""
+    if sub:
+        fname = f'{agent}_{sub}.txt'
+        key = f'{agent}/{sub}'
+    else:
+        fname = f'{agent}.txt'
+        key = agent
+    path = os.path.join(AGENTS_DIR, fname)
+    if not os.path.isfile(path):
+        return jsonify({'error': f'agent {key} not found'}), 404
+    try:
+        with open(path, encoding='utf-8') as fh:
+            prompt = fh.read()
+    except OSError as e:
+        return jsonify({'error': str(e)}), 500
+    result = {'agent': agent, 'prompt': prompt}
+    if sub:
+        result['sub'] = sub
+    return jsonify(result)
+
+
+# ── /api/conversations (flache Session-Liste) ──────────────────────────────
+@app.route('/api/conversations')
+def api_conversations():
+    """Konversations-Liste ueber alle Agenten. Alias zu /get_history."""
+    agent_filter = request.args.get('agent')
+    agent_names = [agent_filter] if agent_filter else [
+        f.replace('.txt', '') for f in os.listdir(AGENTS_DIR)
+        if f.endswith('.txt') and '.backup_' not in f
+    ]
+    result = []
+    for name in agent_names:
+        speicher = get_agent_speicher(name)
+        if not os.path.isdir(speicher):
+            continue
+        for fn in sorted(os.listdir(speicher)):
+            if not fn.startswith('konversation_') or not fn.endswith('.txt'):
+                continue
+            full = os.path.join(speicher, fn)
+            try:
+                stat = os.stat(full)
+                with open(full, encoding='utf-8', errors='replace') as fh:
+                    first_lines = fh.read(500)
+                title = first_lines.split('\n', 1)[0][:120].strip() or fn
+            except OSError:
+                continue
+            result.append({
+                'id': fn.replace('.txt', ''),
+                'agent': name,
+                'title': title,
+                'file': fn,
+                'modified': datetime.datetime.fromtimestamp(stat.st_mtime).isoformat(),
+                'size': stat.st_size,
+            })
+    result.sort(key=lambda x: x['modified'], reverse=True)
+    return jsonify(result)
+
+
+@app.route('/api/conversations/<conv_id>/messages')
+def api_conversations_messages(conv_id):
+    """Verlauf einer Konversation (parse konversation_*.txt)."""
+    # conv_id ist der Dateiname ohne .txt — wir muessen alle Agents scannen
+    fn = conv_id + '.txt'
+    agent_names = [f.replace('.txt', '') for f in os.listdir(AGENTS_DIR)
+                   if f.endswith('.txt') and '.backup_' not in f]
+    for name in agent_names:
+        speicher = get_agent_speicher(name)
+        full = os.path.join(speicher, fn)
+        if os.path.isfile(full):
+            verlauf = parse_konversation_file(full)
+            return jsonify({'id': conv_id, 'agent': name, 'messages': verlauf})
+    return jsonify({'error': 'conversation not found'}), 404
+
+
+# ═════════════════════════════════════════════════════════════════════════
+# Agent-CRUD (POST/PATCH/DELETE) — BACKEND_TODO_AGENT_MANAGER
+# ═════════════════════════════════════════════════════════════════════════
+
+
+@app.route('/agents', methods=['POST'])
+def api_agent_create():
+    body = request.get_json(silent=True) or {}
+    label = (body.get('label') or '').strip()
+    description = (body.get('description') or '').strip()
+    if not label:
+        return jsonify({'error': 'label required'}), 400
+    slug = _slugify_agent_name(label)
+    if not slug:
+        return jsonify({'error': 'invalid label (no slug)'}), 400
+    if _agent_exists(slug):
+        return jsonify({'error': f'Name "{slug}" existiert bereits.'}), 409
+    path = os.path.join(AGENTS_DIR, slug + '.txt')
+    prompt = description or f'Du bist {label}, ein hilfreicher Assistent.'
+    try:
+        with open(path, 'w', encoding='utf-8') as fh:
+            fh.write(prompt)
+        speicher = get_agent_speicher(slug)
+        os.makedirs(speicher, exist_ok=True)
+    except OSError as e:
+        return jsonify({'error': str(e)}), 500
+    return jsonify({
+        'name': slug, 'label': label, 'description': description,
+        'has_subagents': False, 'subagents': []
+    }), 201
+
+
+@app.route('/agents/<name>', methods=['PATCH'])
+def api_agent_update(name):
+    if not _agent_exists(name):
+        return jsonify({'error': f'agent "{name}" not found'}), 404
+    body = request.get_json(silent=True) or {}
+    path = os.path.join(AGENTS_DIR, name + '.txt')
+    new_label = body.get('label')
+    new_description = body.get('description')
+    # Rename ist komplexer (Dateiname aendert sich) — wir erlauben nur description-Update
+    # fuer jetzt; label-Rename erzeugt einen neuen Agent und migriert nicht.
+    if new_description is not None:
+        try:
+            with open(path, 'w', encoding='utf-8') as fh:
+                fh.write(new_description)
+        except OSError as e:
+            return jsonify({'error': str(e)}), 500
+    # Rename: wenn label einen anderen Slug ergeben wuerde
+    if new_label:
+        new_slug = _slugify_agent_name(new_label)
+        if new_slug and new_slug != name:
+            new_path = os.path.join(AGENTS_DIR, new_slug + '.txt')
+            if os.path.exists(new_path):
+                return jsonify({'error': f'Name "{new_slug}" existiert bereits.'}), 409
+            try:
+                os.rename(path, new_path)
+                name = new_slug
+            except OSError as e:
+                return jsonify({'error': str(e)}), 500
+    return jsonify({
+        'name': name, 'label': new_label or name,
+        'description': new_description or _agent_description(name),
+    })
+
+
+@app.route('/agents/<name>', methods=['DELETE'])
+def api_agent_delete(name):
+    path = os.path.join(AGENTS_DIR, name + '.txt')
+    if not os.path.isfile(path):
+        return jsonify({'error': f'agent "{name}" not found'}), 404
+    # Niemals loeschen — nach backup verschieben (CLAUDE.md-Regel)
+    stamp = datetime.datetime.now().strftime('%Y%m%d_%H%M%S')
+    backup_path = path + f'.deleted_{stamp}'
+    try:
+        os.rename(path, backup_path)
+    except OSError as e:
+        return jsonify({'error': str(e)}), 500
+    return jsonify({'ok': True, 'backup': os.path.basename(backup_path)})
+
+
+@app.route('/agents/<parent>/subagents', methods=['POST'])
+def api_subagent_create(parent):
+    if not _agent_exists(parent):
+        return jsonify({'error': f'parent agent "{parent}" not found'}), 404
+    body = request.get_json(silent=True) or {}
+    label = (body.get('label') or '').strip()
+    description = (body.get('description') or '').strip()
+    if not label:
+        return jsonify({'error': 'label required'}), 400
+    sub_slug = _slugify_agent_name(label)
+    if not sub_slug:
+        return jsonify({'error': 'invalid label (no slug)'}), 400
+    full_name = f'{parent}_{sub_slug}'
+    if _agent_exists(full_name):
+        return jsonify({'error': f'Name "{full_name}" existiert bereits.'}), 409
+    path = os.path.join(AGENTS_DIR, full_name + '.txt')
+    prompt = description or f'Du bist {label} (Sub-Agent von {parent}), ein hilfreicher Assistent.'
+    try:
+        with open(path, 'w', encoding='utf-8') as fh:
+            fh.write(prompt)
+    except OSError as e:
+        return jsonify({'error': str(e)}), 500
+    return jsonify({
+        'name': full_name, 'label': label, 'description': description, 'parent': parent,
+    }), 201
+
+
+@app.route('/agents/<parent>/subagents/<name>', methods=['PATCH'])
+def api_subagent_update(parent, name):
+    full_name = name if name.startswith(f'{parent}_') else f'{parent}_{name}'
+    if not _agent_exists(full_name):
+        return jsonify({'error': f'subagent "{full_name}" not found'}), 404
+    body = request.get_json(silent=True) or {}
+    path = os.path.join(AGENTS_DIR, full_name + '.txt')
+    new_description = body.get('description')
+    if new_description is not None:
+        try:
+            with open(path, 'w', encoding='utf-8') as fh:
+                fh.write(new_description)
+        except OSError as e:
+            return jsonify({'error': str(e)}), 500
+    new_label = body.get('label')
+    renamed = full_name
+    if new_label:
+        new_sub = _slugify_agent_name(new_label)
+        if new_sub and new_sub != full_name.split('_', 1)[1]:
+            new_full = f'{parent}_{new_sub}'
+            new_path = os.path.join(AGENTS_DIR, new_full + '.txt')
+            if os.path.exists(new_path):
+                return jsonify({'error': f'Name "{new_full}" existiert bereits.'}), 409
+            try:
+                os.rename(path, new_path)
+                renamed = new_full
+            except OSError as e:
+                return jsonify({'error': str(e)}), 500
+    return jsonify({'name': renamed, 'parent': parent, 'label': new_label or name})
+
+
+@app.route('/agents/<parent>/subagents/<name>', methods=['DELETE'])
+def api_subagent_delete(parent, name):
+    full_name = name if name.startswith(f'{parent}_') else f'{parent}_{name}'
+    path = os.path.join(AGENTS_DIR, full_name + '.txt')
+    if not os.path.isfile(path):
+        return jsonify({'error': f'subagent "{full_name}" not found'}), 404
+    stamp = datetime.datetime.now().strftime('%Y%m%d_%H%M%S')
+    backup_path = path + f'.deleted_{stamp}'
+    try:
+        os.rename(path, backup_path)
+    except OSError as e:
+        return jsonify({'error': str(e)}), 500
+    return jsonify({'ok': True, 'backup': os.path.basename(backup_path)})
+
+
 @app.route('/models')
 def get_models():
     config = load_models()

@@ -3940,6 +3940,48 @@ try:
 except Exception as _e:
     test("Auth live-Tests", False, str(_e))
 
+# Lovable LIVE_API_QA Endpoints (13 neue GET + Agent-CRUD)
+section("Lovable LIVE_API_QA Endpoints 2026-04-22")
+try:
+    import requests
+    _lovable_eps = [
+        ("/api/health", "overall"),
+        ("/api/docs", None),
+        ("/api/docs/readme", "slug"),
+        ("/api/changelog", None),
+        ("/api/permissions", None),
+        ("/api/permissions_matrix", "agents"),
+        ("/api/memory/access_matrix", "agents"),
+        ("/api/custom_sources", None),
+        ("/api/commands", None),
+        ("/api/capabilities", "chat"),
+        ("/api/system_prompt/privat", "prompt"),
+        ("/api/conversations", None),
+    ]
+    for ep, must_contain_key in _lovable_eps:
+        r = requests.get("http://localhost:8080" + ep, timeout=5)
+        ok = r.status_code == 200
+        if ok and must_contain_key:
+            body = r.json()
+            if isinstance(body, dict):
+                ok = must_contain_key in body
+        test(f"GET {ep} → 200 JSON", ok, f"code={r.status_code}")
+except Exception as _e:
+    test("Lovable-Endpoints live", False, str(_e))
+
+# Agent-CRUD spiegelt BACKEND_TODO_AGENT_MANAGER
+try:
+    import requests
+    _ws5 = open(os.path.join(_REPO, "src", "web_server.py"), encoding="utf-8").read()
+    test("Agent-CRUD: POST /agents Route", "methods=['POST']" in _ws5 and "api_agent_create" in _ws5)
+    test("Agent-CRUD: PATCH /agents/<name> Route", "api_agent_update" in _ws5)
+    test("Agent-CRUD: DELETE /agents/<name> Route", "api_agent_delete" in _ws5)
+    test("Agent-CRUD: POST subagents Route", "api_subagent_create" in _ws5)
+    test("Agent-CRUD: Slug-Regel spiegelt Frontend",
+         "_slugify_agent_name" in _ws5 and "[^a-z0-9]+" in _ws5)
+except Exception as _e:
+    test("Agent-CRUD grep", False, str(_e))
+
 
 _cleanup_test_artifacts()
 
