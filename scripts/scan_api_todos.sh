@@ -69,18 +69,48 @@ else
     done
 fi
 
+# ── 3. Claude → Lovable TODOs (im AssistantDev-Repo) ────────────────────────
+echo ""
+echo -e "${BOLD}─── Claude → Lovable TODOs (docs/lovable/FRONTEND_TODO_*.md) ───${NC}"
+LOVABLE_DIR="$HOME/AssistantDev/docs/lovable"
+total_c2l=0
+if [ -d "$LOVABLE_DIR" ]; then
+    shopt -s nullglob 2>/dev/null || true
+    c2l_files=( "$LOVABLE_DIR"/FRONTEND_TODO_*.md )
+    if [ ${#c2l_files[@]} -eq 0 ] || [ ! -f "${c2l_files[0]}" ]; then
+        echo "  (keine)"
+    else
+        for f in "${c2l_files[@]}"; do
+            total_c2l=$((total_c2l + 1))
+            found_any=1
+            lines=$(wc -l < "$f" | tr -d ' ')
+            title=$(grep -m1 '^#' "$f" 2>/dev/null | sed 's/^#\+\s*//')
+            [ -z "$title" ] && title=$(head -1 "$f")
+            echo ""
+            echo -e "${CYAN}▸ ${BOLD}$(basename "$f")${NC}  (${lines} Zeilen)"
+            echo -e "  ${title}"
+        done
+    fi
+else
+    echo "  (Ordner fehlt — docs/lovable/ nicht angelegt)"
+fi
+
 # ── Summary ──────────────────────────────────────────────────────────────────
 echo ""
 echo -e "${BOLD}─── Zusammenfassung ───${NC}"
 if [ "$found_any" = "0" ]; then
-    echo -e "${GREEN}✓ Keine offenen Backend-TODOs.${NC}"
+    echo -e "${GREEN}✓ Keine offenen TODOs in beide Richtungen.${NC}"
 else
-    echo -e "  Inline-Marker: ${total_inline}"
-    echo -e "  TODO-Dateien:  ${total_md}"
+    echo -e "  Lovable → Claude (Inline):      ${total_inline}"
+    echo -e "  Lovable → Claude (TODO-Files):  ${total_md}"
+    echo -e "  Claude → Lovable (FRONTEND):    ${total_c2l}"
     echo ""
-    echo "  Abarbeiten:"
-    echo "    • TODO-Datei lesen → neue Route in src/web_server.py implementieren"
-    echo "    • deploy.sh, testen, committen"
-    echo "    • TODO-Datei umbenennen in DONE_* oder loeschen (Lovable soll das nicht)"
-    echo "    • Frontend pullen (git pull im frontend/) fuer naechste Lovable-Arbeit"
+    echo "  Lovable → Claude abarbeiten (Backend-Arbeit):"
+    echo "    • TODO-Datei lesen → Route in src/web_server.py implementieren"
+    echo "    • deploy.sh + testen + committen"
+    echo "    • Datei umbenennen in FIXED_*.md (Frontend-Repo)"
+    echo ""
+    echo "  Claude → Lovable abarbeiten (Frontend-Arbeit, von Lovable):"
+    echo "    • Datei liegt public in docs/lovable/ auf github.com/moritzdagee/AssistantDev"
+    echo "    • Nach Fix: umbenennen in FIXED_*.md (docs/lovable/)"
 fi
