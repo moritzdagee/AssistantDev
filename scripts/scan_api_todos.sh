@@ -1,59 +1,86 @@
 #!/bin/bash
-# scan_api_todos.sh — Zeigt Backend-Requests die Lovable im Frontend-Code
-# als offene TODOs markiert hat.
+# scan_api_todos.sh — Zeigt alle Backend-Requests die Lovable im Frontend-Repo
+# offen gelassen hat. Zwei Formate:
 #
-# Konvention: Lovable (oder Claude im Frontend-Repo) markiert fehlende
-# Backend-Funktionalitaet mit einem der Marker:
-#
-#   TODO(API):    normaler TODO, mittlere Prio
-#   NEEDS_BACKEND relevant, blockiert ein Feature
-#   // @api       Doc-Tag fuer spaetere Abarbeitung
-#
-# Der Text nach dem Marker beschreibt was am Backend gebaut werden soll —
-# idealerweise mit Request/Response-Shape und Route.
-#
-# Beispiel (im Frontend-Code):
-#   // TODO(API): POST /api/chat {session_id, agent, message} -> {reply}
+#   1. Inline-Marker im Code: TODO(API): / NEEDS_BACKEND / // @api
+#      (idealerweise mit Request/Response-Shape)
+#   2. Dedizierte Markdown-Dateien: src/components/BACKEND_TODO_*.md
+#      (Lovables neuer Standard fuer umfangreichere TODOs)
 #
 # Aufruf:
 #   bash ~/AssistantDev/scripts/scan_api_todos.sh
 
 set -u
 
-FRONTEND="$HOME/AssistantDev/frontend/src"
+FRONTEND_SRC="$HOME/AssistantDev/frontend/src"
 GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
 BLUE='\033[0;34m'
+CYAN='\033[0;36m'
 BOLD='\033[1m'
 NC='\033[0m'
 
-if [ ! -d "$FRONTEND" ]; then
-    echo "Frontend-Verzeichnis fehlt: $FRONTEND"
+if [ ! -d "$FRONTEND_SRC" ]; then
+    echo "Frontend-Verzeichnis fehlt: $FRONTEND_SRC"
     exit 1
 fi
 
-cd "$FRONTEND"
+cd "$FRONTEND_SRC"
 
-total=0
+total_inline=0
+total_md=0
 found_any=0
 
+# ── 1. Inline-Marker im Code ────────────────────────────────────────────────
+echo -e "${BOLD}─── Inline-Marker im Code ───${NC}"
 for pattern in "TODO(API):" "NEEDS_BACKEND" "// @api"; do
     out=$(grep -rn --include='*.ts' --include='*.tsx' --include='*.js' \
                   --include='*.jsx' "$pattern" . 2>/dev/null || true)
     if [ -n "$out" ]; then
         count=$(echo "$out" | wc -l | tr -d ' ')
-        total=$((total + count))
+        total_inline=$((total_inline + count))
         found_any=1
-        echo -e "\n${BOLD}${YELLOW}== $pattern ==${NC}  ($count)"
+        echo -e "\n${YELLOW}== $pattern ==${NC}  ($count)"
         echo "$out" | sed 's/^/  /'
     fi
 done
+[ "$total_inline" = "0" ] && echo "  (keine)"
 
+# ── 2. BACKEND_TODO_*.md Dateien ────────────────────────────────────────────
 echo ""
-if [ "$found_any" = "0" ]; then
-    echo -e "${GREEN}✓ Keine offenen Backend-TODOs im Frontend-Code.${NC}"
+echo -e "${BOLD}─── Backend-TODO-Dateien (src/components/BACKEND_TODO_*.md) ───${NC}"
+shopt -s nullglob 2>/dev/null || true
+todos=( components/BACKEND_TODO_*.md )
+if [ ${#todos[@]} -eq 0 ] || [ ! -f "${todos[0]}" ]; then
+    echo "  (keine)"
 else
-    echo -e "${BLUE}→ Insgesamt $total Marker gefunden.${NC}"
-    echo "  Abarbeiten: neue Routes in src/web_server.py implementieren, danach"
-    echo "  Marker im Frontend-Code entfernen oder auf 'FIXED(API):' setzen."
+    for f in "${todos[@]}"; do
+        total_md=$((total_md + 1))
+        found_any=1
+        lines=$(wc -l < "$f" | tr -d ' ')
+        # erste Ueberschrift (# ...) als Titel, sonst erste Zeile
+        title=$(grep -m1 '^#' "$f" 2>/dev/null | sed 's/^#\+\s*//' || head -1 "$f")
+        [ -z "$title" ] && title=$(head -1 "$f")
+        echo ""
+        echo -e "${CYAN}▸ ${BOLD}${f#components/}${NC}  (${lines} Zeilen)"
+        echo -e "  ${title}"
+        # Erste ~8 Zeilen nicht-leer zeigen, eingerueckt
+        grep -v '^$' "$f" 2>/dev/null | head -8 | sed 's/^/    /' 2>/dev/null
+    done
+fi
+
+# ── Summary ──────────────────────────────────────────────────────────────────
+echo ""
+echo -e "${BOLD}─── Zusammenfassung ───${NC}"
+if [ "$found_any" = "0" ]; then
+    echo -e "${GREEN}✓ Keine offenen Backend-TODOs.${NC}"
+else
+    echo -e "  Inline-Marker: ${total_inline}"
+    echo -e "  TODO-Dateien:  ${total_md}"
+    echo ""
+    echo "  Abarbeiten:"
+    echo "    • TODO-Datei lesen → neue Route in src/web_server.py implementieren"
+    echo "    • deploy.sh, testen, committen"
+    echo "    • TODO-Datei umbenennen in DONE_* oder loeschen (Lovable soll das nicht)"
+    echo "    • Frontend pullen (git pull im frontend/) fuer naechste Lovable-Arbeit"
 fi
