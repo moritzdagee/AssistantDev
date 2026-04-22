@@ -414,9 +414,11 @@ def _configure_cors_and_auth(flask_app):
         CORS(
             flask_app,
             resources={r"/*": {"origins": [
-                r"https://.*\.lovable\.app",
-                r"https://.*\.lovable\.dev",
+                r"https://.*\.lovable\.app",      # Published-URL
+                r"https://.*\.lovable\.dev",      # Editor-URL
+                r"https://.*\.lovableproject\.com",  # Preview-Iframe-Sandbox
                 r"https://.*\.bios\.love",
+                r"https://.*\.trycloudflare\.com",   # ad-hoc Quick Tunnels
                 "http://localhost:5173",
                 "http://localhost:8080",
             ]}},
