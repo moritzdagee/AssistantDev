@@ -8219,6 +8219,55 @@ def close_session():
     close_current_session(state)
     return jsonify({'ok': True})
 
+
+# ── BACKEND_TODO_PARALLEL_SESSIONS — REST-Aliase ───────────────────────────
+# Lovables TODO erwartet RESTful-Pfade fuer Session-Lifecycle.
+# Die semantische Funktion ist jeweils schon da (/stop_queue, /close_session,
+# /remove_ctx), wir aliasen nur zu den Pfaden die das Frontend nutzt.
+
+@app.route('/chat/cancel', methods=['POST'])
+def api_chat_cancel():
+    """Alias zu /stop_queue — cancelt die laufende Chat-Verarbeitung."""
+    session_id = (request.json or {}).get('session_id', 'default') if request.is_json else 'default'
+    state = get_session(session_id)
+    # stop_queue setzt intern ein Cancel-Flag
+    state['stop_requested'] = True
+    state['processing'] = False
+    return jsonify({'ok': True, 'session_id': session_id, 'cancelled': True})
+
+
+@app.route('/session', methods=['DELETE'])
+def api_session_delete():
+    """Loescht eine Session aus dem In-Memory-State. Cleanup beim Tab-Close.
+    session_id kommt aus ?session_id=... (Query) oder JSON-Body."""
+    sid = request.args.get('session_id') or (
+        request.json.get('session_id') if request.is_json else None
+    )
+    if not sid:
+        return jsonify({'ok': False, 'error': 'session_id required'}), 400
+    if sid in sessions:
+        state = sessions[sid]
+        try:
+            close_current_session(state)
+        except Exception:
+            pass
+        sessions.pop(sid, None)
+        return jsonify({'ok': True, 'deleted': sid})
+    return jsonify({'ok': True, 'deleted': None, 'note': 'session was not active'})
+
+
+@app.route('/ctx', methods=['POST'])
+def api_ctx_set():
+    """Setzt/ersetzt Context-Items der Session.
+    Body: { session_id, items: [{...}] }"""
+    body = request.get_json(silent=True) or {}
+    sid = body.get('session_id', 'default')
+    items = body.get('items') or []
+    state = get_session(sid)
+    state['ctx_items'] = list(items)
+    return jsonify({'ok': True, 'session_id': sid, 'count': len(items)})
+
+
 def parse_konversation_file(pfad):
     """Parse a konversation_*.txt file into a verlauf list (list of dicts with role/content)."""
     try:
@@ -14193,6 +14242,10 @@ def api_messages_sources():
             "count": count,
             "unread": unread,
             "recommended_agent": _MSG_SOURCE_TO_AGENT.get(src["key"]),
+            # BACKEND_TODO_UNREAD_EMAIL_ONLY: Frontend rendert Read-Toggle +
+            # Unread-Badge NUR wenn supports_read=true. WhatsApp/iMessage/kChat
+            # haben keine Read-Write-API, daher false.
+            "supports_read": src["type"] in _MSG_BIDIRECTIONAL_SYNC_TYPES,
         }
         # iMessage: FDA-Status mitgeben, damit das Frontend eine klare
         # Fehlermeldung zeigen kann, wenn die Permission fehlt.
