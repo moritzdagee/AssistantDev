@@ -4190,6 +4190,65 @@ try:
 except Exception as _e:
     test("API-Gaps live-Tests", False, str(_e))
 
+# BACKEND_TODO_AUTH_REFACTOR — Supabase-JWT-Forwarding
+section("Auth-Refactor (Supabase JWT) 2026-04-23")
+try:
+    import requests
+    # Alle Auth-Tests gehen ueber den oeffentlichen Cloudflare-Tunnel,
+    # weil Localhost eh exempt ist.
+    _pub = "https://api.bios.love"
+
+    # Aktueller Shared-Token aus Config
+    _cfg = json.load(open(os.path.join(_REPO, "config", "api_auth.json")))
+    _tok = _cfg.get("api_token", "")
+
+    r = requests.get(_pub + "/agents", timeout=5)
+    test("extern ohne Auth → 401", r.status_code == 401)
+
+    r = requests.get(_pub + "/agents",
+                     headers={"Authorization": "Bearer bogus-not-a-jwt"}, timeout=5)
+    test("extern mit bogus Token → 401", r.status_code == 401)
+
+    r = requests.get(_pub + "/agents",
+                     headers={"Authorization": "Bearer eyJhbGciOiJSUzI1NiJ9.e30.fake"},
+                     timeout=5)
+    test("extern mit JWT-shaped-bogus → 401 invalid_token",
+         r.status_code == 401 and r.json().get("reason") == "invalid_token")
+
+    if _tok:
+        r = requests.get(_pub + "/agents",
+                         headers={"Authorization": f"Bearer {_tok}"}, timeout=5)
+        test("extern mit Shared-Token (Legacy-Flag an) → 200", r.status_code == 200)
+
+    r = requests.get(_pub + "/api/health", timeout=5)
+    test("/api/health bleibt unauthed", r.status_code == 200)
+    r = requests.get(_pub + "/api/health-status", timeout=5)
+    test("/api/health-status bleibt unauthed", r.status_code == 200)
+except Exception as _e:
+    test("Auth-Refactor live-Tests", False, str(_e))
+
+try:
+    _ws_auth = open(os.path.join(_REPO, "src", "web_server.py"), encoding="utf-8").read()
+    test("JWT-Verifikation: _verify_supabase_jwt vorhanden",
+         "_verify_supabase_jwt" in _ws_auth)
+    test("PyJWKClient fuer Supabase-Keys geladen",
+         "PyJWKClient" in _ws_auth)
+    test("Feature-Flag LEGACY_SHARED_TOKEN_ENABLED vorhanden",
+         "_LEGACY_SHARED_TOKEN_ENABLED" in _ws_auth)
+    test("Allowlist-Check im JWT-Pfad",
+         "not_allowlisted" in _ws_auth and "_SUPABASE_ALLOWLIST" in _ws_auth)
+    test("request.g.user_email/user_id gesetzt",
+         "g.user_email" in _ws_auth and "g.user_id" in _ws_auth)
+    _cfg_path = os.path.join(_REPO, "config", "supabase_auth.json")
+    test("config/supabase_auth.json existiert + gitignored",
+         os.path.isfile(_cfg_path))
+    _gi = open(os.path.join(_REPO, ".gitignore")).read()
+    test(".gitignore listet supabase_auth.json",
+         "supabase_auth.json" in _gi)
+except Exception as _e:
+    test("Auth-Refactor grep", False, str(_e))
+
+
 try:
     _ws_gaps = open(os.path.join(_REPO, "src", "web_server.py"), encoding="utf-8").read()
     test("CRUD: POST /custom_sources Route",

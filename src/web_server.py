@@ -34,7 +34,7 @@ except ImportError:
     update_all_indexes = None
     reindex_all_embeddings_async = None
 import requests
-from flask import Flask, request, jsonify, render_template_string, make_response, send_from_directory, abort
+from flask import Flask, request, jsonify, render_template_string, make_response, send_from_directory, abort, g
 from bs4 import BeautifulSoup
 
 try:
@@ -405,10 +405,94 @@ try:
 except Exception:
     _API_TOKEN = None
 
+# ── Supabase-JWT-Verifikation (BACKEND_TODO_AUTH_REFACTOR 2026-04-23) ──────
+# Config in config/supabase_auth.json (gitignored). Projekt-Ref + Allowlist
+# spiegeln die Edge-Function supabase/functions/auth-allowlist-check.
+_SUPABASE_AUTH_CFG = os.path.join(
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+    "config", "supabase_auth.json",
+)
+try:
+    with open(_SUPABASE_AUTH_CFG, encoding="utf-8") as _fh:
+        _SUPABASE_CFG = json.load(_fh)
+except Exception:
+    _SUPABASE_CFG = {}
+
+_SUPABASE_JWKS_URL = _SUPABASE_CFG.get("jwks_url")
+_SUPABASE_AUDIENCE = _SUPABASE_CFG.get("audience", "authenticated")
+_SUPABASE_ALLOWLIST = {
+    e.lower().strip()
+    for e in _SUPABASE_CFG.get("allowlist_emails", [])
+    if isinstance(e, str)
+}
+_LEGACY_SHARED_TOKEN_ENABLED = bool(_SUPABASE_CFG.get("legacy_shared_token_enabled", True))
+
+_JWKS_CLIENT = None
+_JWKS_LOCK = threading.Lock()
+
+
+def _get_jwks_client():
+    """Lazy PyJWKClient. Kein Fail beim Boot wenn JWKS unreachable ist —
+    dann faellt Auth auf Shared-Token zurueck (falls enabled)."""
+    global _JWKS_CLIENT
+    if _JWKS_CLIENT is not None:
+        return _JWKS_CLIENT
+    if not _SUPABASE_JWKS_URL:
+        return None
+    with _JWKS_LOCK:
+        if _JWKS_CLIENT is not None:
+            return _JWKS_CLIENT
+        try:
+            import jwt
+            _JWKS_CLIENT = jwt.PyJWKClient(_SUPABASE_JWKS_URL)
+        except Exception:
+            _JWKS_CLIENT = None
+        return _JWKS_CLIENT
+
+
+def _verify_supabase_jwt(token):
+    """Verifiziert einen Supabase-Session-JWT.
+
+    Rueckgabe: (claims_dict, None) bei Erfolg. (None, error_dict) sonst.
+    error_dict hat Feld 'reason' ∈ {'jwks_unavailable', 'invalid_token',
+    'not_allowlisted'}.
+    """
+    try:
+        import jwt
+    except ImportError:
+        return None, {"reason": "pyjwt_not_installed"}
+    client = _get_jwks_client()
+    if client is None:
+        return None, {"reason": "jwks_unavailable"}
+    try:
+        signing_key = client.get_signing_key_from_jwt(token).key
+        claims = jwt.decode(
+            token,
+            signing_key,
+            algorithms=["RS256", "ES256"],
+            audience=_SUPABASE_AUDIENCE,
+            options={"require": ["exp", "sub"]},
+        )
+    except Exception as e:  # noqa: BLE001
+        return None, {"reason": "invalid_token", "detail": str(e)}
+    email = (claims.get("email") or "").lower().strip()
+    if _SUPABASE_ALLOWLIST and email not in _SUPABASE_ALLOWLIST:
+        return None, {"reason": "not_allowlisted", "email": email or None}
+    return claims, None
+
+
 def _configure_cors_and_auth(flask_app):
     """CORS + Token-Auth auf einer Flask-App registrieren. Wird auf BEIDEN
     app-Instanzen aufgerufen (web_server.py hat duplizierte Blocke; die zweite
-    Init ueberschreibt die Routen der ersten, siehe CLAUDE.md)."""
+    Init ueberschreibt die Routen der ersten, siehe CLAUDE.md).
+
+    Auth-Reihenfolge fuer externe Requests:
+      1. Supabase-JWT (RS256, aud=authenticated, Allowlist-Check)
+      2. Shared-Token (nur wenn LEGACY_SHARED_TOKEN_ENABLED=true)
+      3. 401
+
+    Ungeauthed Endpoints (Health-Probes): /api/health, /api/health-status.
+    """
     try:
         from flask_cors import CORS
         CORS(
@@ -432,26 +516,68 @@ def _configure_cors_and_auth(flask_app):
 
     @flask_app.before_request
     def _require_api_token_for_external():
-        """Externe Requests brauchen Bearer-Token. Lokaler Zugriff (Desktop-
-        App, Tests, Claude) bleibt frei. Unterscheidung ueber Host-Header,
-        weil der Cloudflare-Tunnel an 127.0.0.1 proxyt (remote_addr reicht
-        also nicht)."""
+        """Externe Requests brauchen Bearer-Token oder Supabase-JWT. Lokaler
+        Zugriff (Desktop-App, Tests, Claude) bleibt frei. Unterscheidung
+        ueber Host-Header — Cloudflare-Tunnel proxyt an 127.0.0.1."""
         if request.method == "OPTIONS":
             return None
         host = (request.headers.get("Host") or "").split(":")[0].lower()
         if host in ("localhost", "127.0.0.1", "::1", ""):
             return None
-        if not _API_TOKEN:
+        # Health bleibt unauth fuer externe Monitore
+        path = request.path or ""
+        if path in ("/api/health", "/api/health-status"):
+            return None
+        auth = request.headers.get("Authorization", "")
+        if not auth.startswith("Bearer "):
+            return jsonify({
+                "error": "unauthorized",
+                "hint": "Authorization: Bearer <supabase-jwt-or-shared-token> required",
+            }), 401
+        token = auth[7:].strip()
+        # 1) Supabase-JWT — Fast-Path Unterscheidung per Dot-Count
+        if token.count(".") == 2 and _SUPABASE_JWKS_URL:
+            claims, err = _verify_supabase_jwt(token)
+            if claims:
+                try:
+                    g.user_id = claims.get("sub")
+                    g.user_email = (claims.get("email") or "").lower()
+                    g.auth_source = "supabase_jwt"
+                except Exception:
+                    pass
+                return None
+            if err and err.get("reason") == "not_allowlisted":
+                return jsonify({
+                    "error": "forbidden",
+                    "reason": "not_allowlisted",
+                    "email": err.get("email"),
+                }), 403
+            # JWT formal, aber ungueltig oder Signatur-Fehler → nicht in
+            # Shared-Token-Branch fallthrough (das waere ein Downgrade).
+            if err and err.get("reason") == "invalid_token":
+                return jsonify({
+                    "error": "unauthorized",
+                    "reason": "invalid_token",
+                    "detail": err.get("detail", "")[:200],
+                }), 401
+            # Bei jwks_unavailable / pyjwt_not_installed: degradiere auf
+            # Shared-Token (falls enabled), damit die Plattform nicht
+            # komplett offline geht.
+        # 2) Shared-Token (Legacy, Feature-Flag)
+        if _LEGACY_SHARED_TOKEN_ENABLED and _API_TOKEN and token == _API_TOKEN:
+            try:
+                g.auth_source = "shared_token"
+            except Exception:
+                pass
+            return None
+        if not _API_TOKEN and not _SUPABASE_JWKS_URL:
             return jsonify({
                 "error": "backend_not_configured",
-                "hint": "config/api_auth.json fehlt — externer Zugriff blockiert.",
+                "hint": "weder api_auth.json noch supabase_auth.json konfiguriert",
             }), 503
-        auth = request.headers.get("Authorization", "")
-        if auth.startswith("Bearer ") and auth[7:].strip() == _API_TOKEN:
-            return None
         return jsonify({
             "error": "unauthorized",
-            "hint": "Authorization: Bearer <token> required for external access",
+            "hint": "Bearer token did not match any valid credential",
         }), 401
 
 

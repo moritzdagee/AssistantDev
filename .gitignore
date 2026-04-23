@@ -3,6 +3,7 @@
 __pycache__
 config/models.json
 config/api_auth.json
+config/supabase_auth.json
 config/*_oauth.json
 config/*_token.json
 config/agents/
