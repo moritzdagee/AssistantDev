@@ -508,11 +508,24 @@ def _configure_cors_and_auth(flask_app):
             ]}},
             supports_credentials=False,
             allow_headers=["Content-Type", "Authorization"],
-            expose_headers=["Content-Type"],
+            expose_headers=["Content-Type", "X-Auth-Source"],
             max_age=86400,
         )
     except ImportError:
         pass
+
+    @flask_app.after_request
+    def _expose_auth_source(response):
+        """X-Auth-Source Header fuer Frontend-DevTools (siehe
+        BACKEND_TODO_AUTH_REFACTOR). Nur gesetzt wenn Auth stattgefunden
+        hat — localhost-Requests haben kein g.auth_source."""
+        try:
+            src = getattr(g, 'auth_source', None)
+            if src:
+                response.headers['X-Auth-Source'] = src
+        except Exception:
+            pass
+        return response
 
     @flask_app.before_request
     def _require_api_token_for_external():
