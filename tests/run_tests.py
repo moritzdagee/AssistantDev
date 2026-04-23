@@ -4105,6 +4105,109 @@ except Exception as _e:
     test("System-Prompt/Restart grep", False, str(_e))
 
 
+# BACKEND_TODO_API_GAPS_2026-04-22 — 7 gaps in einem Batch
+section("API-Gaps 2026-04-22")
+try:
+    import requests
+    _base = "http://localhost:8080"
+
+    # §2 Mark-as-read: id-Alias + conversation_id-Mode
+    r = requests.post(_base + "/api/messages/mark-read", json={"id": "__nope__"}, timeout=5)
+    test("mark-read {id:nope} → 404 (nicht 400)", r.status_code == 404)
+    r = requests.post(_base + "/api/messages/mark-read", json={}, timeout=5)
+    test("mark-read ohne ids → 400", r.status_code == 400)
+    _mr_body = r.json() if r.status_code == 400 else {}
+    test("mark-read 400-Error nennt message_id+conversation_id",
+         "conversation_id" in (_mr_body.get("error") or ""))
+    r = requests.post(_base + "/api/messages/mark-read",
+                      json={"conversation_id": "__nope__"}, timeout=5)
+    test("mark-read {conversation_id:...} wird akzeptiert (404 weil bogus)",
+         r.status_code == 404)
+
+    # §3 Changelog-Parser: one-liner + legacy gemischt
+    r = requests.get(_base + "/api/changelog", timeout=5)
+    _cl = r.json() if r.status_code == 200 else []
+    test("changelog parst one-liner-Format (≥5 Eintraege nach 2026-04-22)",
+         sum(1 for e in _cl if e.get("date", "") >= "2026-04-22") >= 5)
+    test("changelog ist nach date absteigend sortiert",
+         len(_cl) < 2 or _cl[0].get("date", "") >= _cl[-1].get("date", ""))
+
+    # §5 Health: jetzt 8 services
+    r = requests.get(_base + "/api/health", timeout=5)
+    _h = r.json() if r.status_code == 200 else {}
+    test("/api/health listet ≥7 Services",
+         len(_h.get("services", [])) >= 7)
+    _names = {s["name"] for s in _h.get("services", [])}
+    test("Health enthaelt cloudflared+kchat_watcher",
+         {"cloudflared", "kchat_watcher"} <= _names)
+
+    # §6 /api/memory/all — Aggregations-Endpoint
+    r = requests.get(_base + "/api/memory/all?flat=1", timeout=10)
+    test("/api/memory/all?flat=1 → 200 Liste",
+         r.status_code == 200 and isinstance(r.json(), list))
+    r = requests.get(_base + "/api/memory/all", timeout=10)
+    test("/api/memory/all → 200 dict{agent:[...]}",
+         r.status_code == 200 and isinstance(r.json(), dict))
+
+    # §7 Conversations in Memory-List
+    r = requests.get(_base + "/api/memory/list/privat?include=conversations", timeout=10)
+    _ml = r.json() if r.status_code == 200 else []
+    test("memory/list include=conversations → mind. 1 Entry mit kind='conversation'",
+         any(f.get("kind") == "conversation" for f in _ml))
+
+    # §8 Docs dual-path: beide geben content + markdown
+    r1 = requests.get(_base + "/api/docs/readme", timeout=5)
+    r2 = requests.get(_base + "/api/docs/read/readme", timeout=5)
+    test("/api/docs/<slug> hat content+markdown",
+         r1.status_code == 200 and all(k in r1.json() for k in ("content", "markdown")))
+    test("/api/docs/read/<slug> hat content+markdown",
+         r2.status_code == 200 and all(k in r2.json() for k in ("content", "markdown")))
+
+    # §1 Custom-Sources CRUD-Zyklus
+    r = requests.post(_base + "/custom_sources",
+                      json={"label": "QA-Test", "agent": "privat", "kind": "folder", "url": "~/Downloads"},
+                      timeout=5)
+    test("POST /custom_sources → 201", r.status_code == 201)
+    _created = r.json() if r.status_code == 201 else {}
+    _sid = _created.get("id")
+    r = requests.get(_base + "/custom_sources", timeout=5)
+    _cs = r.json() if r.status_code == 200 else {}
+    test("GET /custom_sources → {sources:[...]}",
+         isinstance(_cs, dict) and isinstance(_cs.get("sources"), list))
+    if _sid:
+        r = requests.put(_base + f"/custom_sources/{_sid}", json={"enabled": False}, timeout=5)
+        test("PUT /custom_sources/:id toggle enabled", r.status_code == 200
+             and r.json().get("enabled") is False)
+        r = requests.post(_base + f"/custom_sources/{_sid}/sync", timeout=10)
+        test("POST /custom_sources/:id/sync → ok", r.status_code == 200 and r.json().get("ok"))
+        r = requests.delete(_base + f"/custom_sources/{_sid}", timeout=5)
+        test("DELETE /custom_sources/:id → ok", r.status_code == 200 and r.json().get("ok"))
+    r = requests.post(_base + "/custom_sources/validate",
+                      json={"url": "~/Downloads", "kind": "folder"}, timeout=5)
+    _vs = r.json() if r.status_code == 200 else {}
+    test("validate: status+message+itemCount+sample vorhanden",
+         all(k in _vs for k in ("status", "message", "itemCount", "sample")))
+except Exception as _e:
+    test("API-Gaps live-Tests", False, str(_e))
+
+try:
+    _ws_gaps = open(os.path.join(_REPO, "src", "web_server.py"), encoding="utf-8").read()
+    test("CRUD: POST /custom_sources Route",
+         "api_custom_sources_create" in _ws_gaps)
+    test("CRUD: PUT /custom_sources/<id>", "api_custom_sources_update" in _ws_gaps)
+    test("CRUD: DELETE /custom_sources/<id>", "api_custom_sources_delete" in _ws_gaps)
+    test("CRUD: /custom_sources/<id>/sync", "api_custom_sources_sync" in _ws_gaps)
+    test("CRUD: /custom_sources/validate", "api_custom_sources_validate" in _ws_gaps)
+    test("_cs_validate kennt folder/rss/url/notion/gist",
+         "_VALID_SOURCE_KINDS" in _ws_gaps and "'folder'" in _ws_gaps and "'rss'" in _ws_gaps)
+    test("memory/all Route vorhanden",
+         "api_memory_all" in _ws_gaps and "/api/memory/all" in _ws_gaps)
+    test("_collect_memory_files include_conversations",
+         "include_conversations" in _ws_gaps)
+except Exception as _e:
+    test("API-Gaps grep", False, str(_e))
+
+
 _cleanup_test_artifacts()
 
 # ============================================================

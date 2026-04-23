@@ -7317,6 +7317,7 @@ def api_docs_read(slug):
         'name': filename,
         'title': _DOCS_TITLES.get(slug, filename),
         'content': content,
+        'markdown': content,
     })
 
 
@@ -7539,6 +7540,15 @@ def api_health_v2():
         except Exception:
             return []
 
+    def _launchagent_loaded(label):
+        try:
+            out = subprocess.check_output(['launchctl', 'list', label],
+                                          text=True, timeout=1,
+                                          stderr=subprocess.DEVNULL)
+            return bool(out.strip())
+        except Exception:
+            return False
+
     now = datetime.datetime.now(datetime.timezone.utc).isoformat().replace('+00:00', 'Z')
     services = []
     # Web Server
@@ -7565,6 +7575,46 @@ def api_health_v2():
         'detail': 'Hintergrund-Prozess',
         'since': now,
     })
+    # Cloudflared Tunnel (externes API-Gateway an api.bios.love)
+    tunnel_ok = bool(_pgrep('cloudflared')) or _launchagent_loaded('com.assistantdev.cloudflared')
+    services.append({
+        'name': 'cloudflared', 'label': 'Cloudflare Tunnel',
+        'status': 'ok' if tunnel_ok else 'warning',
+        'detail': 'api.bios.love → :8080',
+        'since': now,
+    })
+    # kChat-Watcher
+    kchat_ok = bool(_pgrep('kchat_watcher')) or _launchagent_loaded('com.assistantdev.kchat_watcher')
+    services.append({
+        'name': 'kchat_watcher', 'label': 'kChat Watcher',
+        'status': 'ok' if kchat_ok else 'warning',
+        'detail': 'Hintergrund-Prozess',
+        'since': now,
+    })
+    # WhatsApp-Import
+    wa_ok = bool(_pgrep('whatsapp-import|whatsapp_import')) or _launchagent_loaded('com.assistantdev.whatsapp-import')
+    services.append({
+        'name': 'whatsapp_import', 'label': 'WhatsApp Import',
+        'status': 'ok' if wa_ok else 'warning',
+        'detail': 'Hintergrund-Prozess',
+        'since': now,
+    })
+    # Contacts-Watchdog (Adressbuch-Sync)
+    cw_ok = bool(_pgrep('contactwatchdog|contact_watchdog')) or _launchagent_loaded('com.assistantdev.contactwatchdog')
+    services.append({
+        'name': 'contact_watchdog', 'label': 'Contacts Watchdog',
+        'status': 'ok' if cw_ok else 'warning',
+        'detail': 'Adressbuch-Sync',
+        'since': now,
+    })
+    # Calendar-Export
+    cal_ok = bool(_pgrep('calendar-export|calendar_export')) or _launchagent_loaded('com.assistantdev.calendar-export')
+    services.append({
+        'name': 'calendar_export', 'label': 'Calendar Export',
+        'status': 'ok' if cal_ok else 'warning',
+        'detail': 'Fantastical → Datalake',
+        'since': now,
+    })
     overall = 'ok'
     if any(s['status'] == 'down' for s in services): overall = 'degraded'
     elif any(s['status'] == 'warning' for s in services): overall = 'degraded'
@@ -7577,10 +7627,16 @@ def api_health_v2():
 # mit LaunchAgent, sonst pkill-Fallback. Localhost-exempt durch Bearer-Auth
 # Middleware — externe Calls brauchen Token.
 _SERVICE_LAUNCHAGENTS = {
-    'web_server':    'com.assistantdev.webserver',
-    'email_watcher': 'com.moritz.emailwatcher',
+    'web_server':       'com.assistantdev.webserver',
+    'email_watcher':    'com.moritz.emailwatcher',
+    'cloudflared':      'com.assistantdev.cloudflared',
+    'kchat_watcher':    'com.assistantdev.kchat_watcher',
+    'whatsapp_import':  'com.assistantdev.whatsapp-import',
+    'contact_watchdog': 'com.assistantdev.contactwatchdog',
+    'calendar_export':  'com.assistantdev.calendar-export',
     # web_clipper hat keinen LaunchAgent — Restart via pkill+spawn
 }
+_KNOWN_SERVICES = set(_SERVICE_LAUNCHAGENTS.keys()) | {'web_clipper'}
 
 
 @app.route('/api/health/<service>/restart', methods=['POST'])
@@ -7590,7 +7646,7 @@ def api_health_service_restart(service):
     op = (body.get('op') or 'restart').strip().lower()
     if op not in ('restart', 'stop'):
         return jsonify({'ok': False, 'error': 'op must be "restart" or "stop"'}), 400
-    if service not in ('web_server', 'web_clipper', 'email_watcher'):
+    if service not in _KNOWN_SERVICES:
         return jsonify({'ok': False, 'error': f'unknown service {service}'}), 404
     uid = os.getuid()
     label = _SERVICE_LAUNCHAGENTS.get(service)
@@ -7657,7 +7713,9 @@ def api_docs_v2():
 
 @app.route('/api/docs/<slug>')
 def api_docs_detail_v2(slug):
-    """Detail-Doc. Alias zu /api/docs/read/<slug>."""
+    """Detail-Doc. Unifiziert mit /api/docs/read/<slug> — liefert beide
+    Feldnamen (content + markdown), damit alte + neue Clients matchen
+    (BACKEND_TODO_API_GAPS §8)."""
     filename = _DOCS_WHITELIST.get(slug.lower())
     if not filename:
         return jsonify({'error': 'unknown slug'}), 404
@@ -7668,7 +7726,9 @@ def api_docs_detail_v2(slug):
         content = fh.read()
     return jsonify({
         'slug': slug,
+        'name': filename,
         'title': _DOCS_TITLES.get(slug, filename),
+        'content': content,
         'markdown': content,
     })
 
@@ -7679,6 +7739,9 @@ def api_changelog_v2():
     """Flache Liste [{id, version, date, title, body_markdown, type}].
 
     Alias zu /api/changelog.json mit reicherer Shape fuer Lovables UI.
+    Parst zwei Formate:
+      1. One-Liner am Kopf: `[YYYY-MM-DD] TYPE: title | file | reason`
+      2. Legacy: `## YYYY-MM-DD` Section mit `### Feature: ...`-Unterheadings
     """
     path = os.path.join(_REPO_ROOT_FOR_FRONTEND_APIS, 'changelog.md')
     if not os.path.isfile(path):
@@ -7686,9 +7749,43 @@ def api_changelog_v2():
     with open(path, encoding='utf-8') as fh:
         content = fh.read()
     entries = []
+    eid = 0
+
+    def _infer_type(title):
+        tlow = (title or '').lower()
+        if 'fix' in tlow: return 'fix'
+        if 'feat' in tlow: return 'feature'
+        if 'security' in tlow: return 'security'
+        if 'docs' in tlow or 'chore' in tlow: return 'chore'
+        return 'feature'
+
+    # Format 1: One-Liner am Kopf (neues Format seit 2026-04-22)
+    oneliner_re = re.compile(
+        r'^\[(\d{4}-\d{2}-\d{2})\]\s+([A-Z]+):\s*(.+?)(?:\s*\|\s*(.+?))?(?:\s*\|\s*(.+))?\s*$'
+    )
+    for line in content.splitlines():
+        m = oneliner_re.match(line)
+        if not m:
+            continue
+        date, kind, title, files, reason = m.group(1), m.group(2), m.group(3), m.group(4), m.group(5)
+        eid += 1
+        body_parts = [title]
+        if files:
+            body_parts.append(f'\n\n**Files:** `{files}`')
+        if reason:
+            body_parts.append(f'\n\n{reason}')
+        entries.append({
+            'id': f'cl-{eid}',
+            'version': date,
+            'date': date,
+            'title': title[:120],
+            'body_markdown': ''.join(body_parts),
+            'type': _infer_type(kind + ' ' + title),
+        })
+
+    # Format 2: Legacy-Sections (## YYYY-MM-DD + ### Feature:)
     current_date = None
     current_body = []
-    eid = 0
     for line in content.splitlines():
         if line.startswith('## ') and len(line) >= 6:
             cand = line[3:].strip()
@@ -7737,6 +7834,11 @@ def api_changelog_v2():
             'body_markdown': body,
             'type': ctype,
         })
+    # Nach Datum absteigend sortieren (One-Liner + Legacy-Mix stabilisieren)
+    entries.sort(key=lambda e: e.get('date', ''), reverse=True)
+    # IDs neu vergeben, damit sie nach Sortierung stabil zaehlen
+    for i, e in enumerate(entries, 1):
+        e['id'] = f'cl-{i}'
     return jsonify(entries)
 
 
@@ -7866,7 +7968,7 @@ def api_memory_access_matrix():
 # ── /api/custom_sources ────────────────────────────────────────────────────
 @app.route('/api/custom_sources')
 def api_custom_sources():
-    """Custom-Source-Definitionen aus access_control.json."""
+    """Legacy: Custom-Source-Definitionen aus access_control.json."""
     try:
         path = os.path.join(_REPO_ROOT_FOR_FRONTEND_APIS, 'config', 'access_control.json')
         if os.path.isfile(path):
@@ -7882,6 +7984,232 @@ def api_custom_sources():
         custom = [{'key': k, **(v if isinstance(v, dict) else {'path': v})}
                   for k, v in custom.items()]
     return jsonify(custom if isinstance(custom, list) else [])
+
+
+# ── /custom_sources CRUD (BACKEND_TODO_API_GAPS_2026-04-22 §1) ─────────────
+# Persistiert in config/custom_sources.json im Datalake. Shape pro Source:
+#   {id, agent, label, kind, url, enabled, lastSync, items}
+# kind ∈ folder | rss | url | notion | gist
+_CUSTOM_SOURCES_PATH = os.path.join(
+    _REPO_ROOT_FOR_FRONTEND_APIS, 'config', 'custom_sources.json',
+)
+_CUSTOM_SOURCES_LOCK = threading.Lock()
+_VALID_SOURCE_KINDS = {'folder', 'rss', 'url', 'notion', 'gist'}
+
+
+def _cs_load():
+    try:
+        if os.path.isfile(_CUSTOM_SOURCES_PATH):
+            with open(_CUSTOM_SOURCES_PATH, encoding='utf-8') as fh:
+                raw = json.load(fh)
+            if isinstance(raw, list):
+                return raw
+            if isinstance(raw, dict) and isinstance(raw.get('sources'), list):
+                return raw['sources']
+    except Exception:
+        pass
+    return []
+
+
+def _cs_save(sources):
+    os.makedirs(os.path.dirname(_CUSTOM_SOURCES_PATH), exist_ok=True)
+    tmp = _CUSTOM_SOURCES_PATH + '.tmp'
+    with open(tmp, 'w', encoding='utf-8') as fh:
+        json.dump({'sources': sources}, fh, ensure_ascii=False, indent=2)
+    os.replace(tmp, _CUSTOM_SOURCES_PATH)
+
+
+def _cs_new_id():
+    return 'src_' + datetime.datetime.now().strftime('%Y%m%d%H%M%S') + '_' + os.urandom(3).hex()
+
+
+def _cs_detect_kind(url):
+    u = (url or '').strip().lower()
+    if not u:
+        return None
+    if u.startswith(('/', '~', 'file://')) or ('\\' in u) or (len(u) > 1 and u[1:2] == ':'):
+        return 'folder'
+    if 'notion.so' in u or 'notion.site' in u:
+        return 'notion'
+    if 'gist.github.com' in u:
+        return 'gist'
+    if u.endswith(('.rss', '.xml', '/feed', '/rss')) or '/feed/' in u or '/rss/' in u:
+        return 'rss'
+    if u.startswith(('http://', 'https://')):
+        return 'url'
+    return None
+
+
+def _cs_validate(draft):
+    """Gibt validation-report dict zurueck (status/message/itemCount/sample/
+    warnings/detectedKind)."""
+    url = (draft.get('url') or '').strip()
+    kind = (draft.get('kind') or '').strip().lower() or None
+    warnings = []
+    detected = _cs_detect_kind(url)
+    if kind and detected and kind != detected:
+        warnings.append(f'URL sieht nach "{detected}" aus, kind ist aber "{kind}"')
+    if not url:
+        return {'status': 'error', 'message': 'URL fehlt', 'itemCount': None,
+                'sample': [], 'warnings': warnings, 'detectedKind': detected}
+    if not kind and not detected:
+        return {'status': 'error', 'message': 'kind unbekannt — bitte folder|rss|url|notion|gist',
+                'itemCount': None, 'sample': [], 'warnings': warnings, 'detectedKind': None}
+    effective = kind or detected
+
+    sample = []
+    item_count = None
+    status = 'ok'
+    message = 'OK'
+
+    try:
+        if effective == 'folder':
+            expanded = os.path.expanduser(url if not url.startswith('file://') else url[7:])
+            if not os.path.isdir(expanded):
+                return {'status': 'error', 'message': f'Ordner nicht gefunden: {expanded}',
+                        'itemCount': 0, 'sample': [], 'warnings': warnings,
+                        'detectedKind': detected}
+            entries = [e for e in sorted(os.listdir(expanded))
+                       if not e.startswith('.')][:10]
+            item_count = len(os.listdir(expanded))
+            sample = [{'title': e,
+                       'meta': 'dir' if os.path.isdir(os.path.join(expanded, e)) else 'file'}
+                      for e in entries]
+        elif effective in ('rss', 'url', 'notion', 'gist'):
+            if not url.startswith(('http://', 'https://')):
+                return {'status': 'error', 'message': 'URL muss mit http(s):// beginnen',
+                        'itemCount': None, 'sample': [], 'warnings': warnings,
+                        'detectedKind': detected}
+            try:
+                import urllib.request
+                req = urllib.request.Request(url, headers={'User-Agent': 'AssistantDev/1.0'})
+                with urllib.request.urlopen(req, timeout=5) as resp:
+                    code = resp.getcode()
+                    body = resp.read(8192).decode('utf-8', errors='replace')
+                if code >= 400:
+                    status = 'warn'
+                    message = f'HTTP {code}'
+                else:
+                    message = f'HTTP {code} — {len(body)} Bytes Preview'
+                if effective == 'rss':
+                    import re as _re
+                    titles = _re.findall(r'<title[^>]*>(.*?)</title>', body, flags=_re.I | _re.S)
+                    titles = [t.strip()[:100] for t in titles if t.strip()][:5]
+                    item_count = len(titles)
+                    sample = [{'title': t} for t in titles]
+                else:
+                    item_count = 1
+                    sample = [{'title': url, 'meta': f'{len(body)} B'}]
+            except Exception as e:
+                status = 'warn'
+                message = f'Fetch fehlgeschlagen: {e}'
+    except Exception as e:
+        status = 'error'
+        message = str(e)
+
+    return {
+        'status': status,
+        'message': message,
+        'itemCount': item_count,
+        'sample': sample,
+        'warnings': warnings,
+        'detectedKind': detected or effective,
+    }
+
+
+@app.route('/custom_sources', methods=['GET'])
+def api_custom_sources_list():
+    with _CUSTOM_SOURCES_LOCK:
+        return jsonify({'sources': _cs_load()})
+
+
+@app.route('/custom_sources', methods=['POST'])
+def api_custom_sources_create():
+    body = request.get_json(silent=True) or {}
+    label = (body.get('label') or '').strip()
+    url = (body.get('url') or '').strip()
+    agent = (body.get('agent') or '').strip()
+    kind = (body.get('kind') or '').strip().lower() or _cs_detect_kind(url) or 'url'
+    if not label or not url or not agent:
+        return jsonify({'error': 'label, url und agent sind erforderlich'}), 400
+    if kind not in _VALID_SOURCE_KINDS:
+        return jsonify({'error': f'kind muss einer von {sorted(_VALID_SOURCE_KINDS)} sein'}), 400
+    now_iso = datetime.datetime.now(datetime.timezone.utc).isoformat().replace('+00:00', 'Z')
+    new_src = {
+        'id': _cs_new_id(),
+        'agent': agent,
+        'label': label,
+        'kind': kind,
+        'url': url,
+        'enabled': bool(body.get('enabled', True)),
+        'lastSync': None,
+        'items': 0,
+    }
+    with _CUSTOM_SOURCES_LOCK:
+        sources = _cs_load()
+        sources.append(new_src)
+        _cs_save(sources)
+    del now_iso
+    return jsonify(new_src), 201
+
+
+@app.route('/custom_sources/<src_id>', methods=['PUT', 'PATCH'])
+def api_custom_sources_update(src_id):
+    body = request.get_json(silent=True) or {}
+    with _CUSTOM_SOURCES_LOCK:
+        sources = _cs_load()
+        idx = next((i for i, s in enumerate(sources) if s.get('id') == src_id), -1)
+        if idx == -1:
+            return jsonify({'error': 'not found'}), 404
+        src = dict(sources[idx])
+        for key in ('label', 'url', 'agent', 'kind', 'enabled'):
+            if key in body:
+                src[key] = body[key]
+        if src.get('kind') and src['kind'] not in _VALID_SOURCE_KINDS:
+            return jsonify({'error': f'invalid kind {src["kind"]}'}), 400
+        sources[idx] = src
+        _cs_save(sources)
+    return jsonify(src)
+
+
+@app.route('/custom_sources/<src_id>', methods=['DELETE'])
+def api_custom_sources_delete(src_id):
+    with _CUSTOM_SOURCES_LOCK:
+        sources = _cs_load()
+        new_list = [s for s in sources if s.get('id') != src_id]
+        if len(new_list) == len(sources):
+            return jsonify({'error': 'not found'}), 404
+        _cs_save(new_list)
+    return jsonify({'ok': True, 'id': src_id})
+
+
+@app.route('/custom_sources/<src_id>/sync', methods=['POST'])
+def api_custom_sources_sync(src_id):
+    """Triggert einen Re-Validate + aktualisiert items/lastSync am Source."""
+    with _CUSTOM_SOURCES_LOCK:
+        sources = _cs_load()
+        idx = next((i for i, s in enumerate(sources) if s.get('id') == src_id), -1)
+        if idx == -1:
+            return jsonify({'error': 'not found'}), 404
+        src = sources[idx]
+    report = _cs_validate(src)
+    now_iso = datetime.datetime.now(datetime.timezone.utc).isoformat().replace('+00:00', 'Z')
+    with _CUSTOM_SOURCES_LOCK:
+        sources = _cs_load()
+        idx = next((i for i, s in enumerate(sources) if s.get('id') == src_id), -1)
+        if idx != -1:
+            sources[idx]['lastSync'] = now_iso
+            if isinstance(report.get('itemCount'), int):
+                sources[idx]['items'] = report['itemCount']
+            _cs_save(sources)
+            src = sources[idx]
+    return jsonify({'ok': report.get('status') != 'error', 'source': src, 'report': report})
+
+
+@app.route('/custom_sources/validate', methods=['POST'])
+def api_custom_sources_validate():
+    draft = request.get_json(silent=True) or {}
+    return jsonify(_cs_validate(draft))
 
 
 # ── /api/commands (Slash-Commands) ─────────────────────────────────────────
@@ -12678,37 +13006,112 @@ def api_docs():
 
 # ── MEMORY MANAGEMENT UI ─────────────────────────────────────────────────────
 
+def _memory_file_entry(fpath, agent_name, kind='memory'):
+    """Einheitliche Shape fuer Memory-Files (BACKEND_TODO_API_GAPS §6/§7).
+
+    Altfeldnamen (file/mtime/preview) bleiben aus Kompatibilitaetsgruenden
+    bestehen — neu: path/name/modified/agent/kind fuer das React-Frontend.
+    """
+    stat = os.stat(fpath)
+    preview = ''
+    try:
+        with open(fpath, 'r', encoding='utf-8', errors='replace') as f:
+            preview = f.read(200)
+    except Exception:
+        pass
+    fname = os.path.basename(fpath)
+    mtime = datetime.datetime.fromtimestamp(stat.st_mtime)
+    return {
+        'file': fname,
+        'name': fname,
+        'path': fpath,
+        'size': stat.st_size,
+        'mtime': mtime.strftime('%Y-%m-%d %H:%M'),
+        'modified': mtime.isoformat(),
+        'preview': preview,
+        'agent': agent_name,
+        'kind': kind,
+    }
+
+
+def _collect_memory_files(agent_name, include_conversations=False):
+    """Aggregiert memory/-Files und optional konversation_*.txt pro Agent."""
+    speicher = get_agent_speicher(agent_name)
+    if not speicher or not os.path.isdir(speicher):
+        return []
+    result = []
+    memory_dir = os.path.join(speicher, 'memory')
+    if os.path.isdir(memory_dir):
+        for fname in sorted(os.listdir(memory_dir)):
+            fpath = os.path.join(memory_dir, fname)
+            if not os.path.isfile(fpath):
+                continue
+            try:
+                result.append(_memory_file_entry(fpath, agent_name, 'memory'))
+            except Exception:
+                continue
+    if include_conversations:
+        # konversation_*.txt liegen direkt im Speicher-Root (siehe
+        # get_agent_speicher/System-Prompt-Konvention).
+        try:
+            for fname in sorted(os.listdir(speicher)):
+                if not fname.startswith('konversation_') or not fname.endswith('.txt'):
+                    continue
+                fpath = os.path.join(speicher, fname)
+                if not os.path.isfile(fpath):
+                    continue
+                result.append(_memory_file_entry(fpath, agent_name, 'conversation'))
+        except OSError:
+            pass
+    return result
+
+
+def _list_known_agents():
+    """Alle Agent-Namen aus config/agents/*.txt (ohne Backups/Deleted)."""
+    try:
+        names = []
+        for f in os.listdir(AGENTS_DIR):
+            if not f.endswith('.txt'):
+                continue
+            if '.backup_' in f or '.deleted_' in f:
+                continue
+            names.append(f[:-4])
+        return sorted(names)
+    except OSError:
+        return []
+
+
 @app.route('/api/memory/list/<agent>', methods=['GET'])
 def api_memory_list(agent):
-    """List all memory files for an agent with metadata."""
-    speicher = get_agent_speicher(agent)
-    if not speicher:
-        return jsonify([])
-    memory_dir = os.path.join(speicher, 'memory')
-    if not os.path.isdir(memory_dir):
-        return jsonify([])
-    result = []
-    for fname in sorted(os.listdir(memory_dir)):
-        fpath = os.path.join(memory_dir, fname)
-        if not os.path.isfile(fpath):
-            continue
-        try:
-            stat = os.stat(fpath)
-            preview = ''
-            try:
-                with open(fpath, 'r', encoding='utf-8', errors='replace') as f:
-                    preview = f.read(200)
-            except Exception:
-                pass
-            result.append({
-                'file': fname,
-                'size': stat.st_size,
-                'mtime': datetime.fromtimestamp(stat.st_mtime).strftime('%Y-%m-%d %H:%M'),
-                'preview': preview,
-            })
-        except Exception:
-            continue
-    return jsonify(result)
+    """List all memory files for an agent with metadata.
+
+    Query: ?include=conversations schliesst konversation_*.txt mit ein
+    (BACKEND_TODO_API_GAPS §7).
+    """
+    include = (request.args.get('include') or '').lower()
+    include_conv = 'conversations' in include or 'conversation' in include
+    return jsonify(_collect_memory_files(agent, include_conversations=include_conv))
+
+
+@app.route('/api/memory/all', methods=['GET'])
+def api_memory_all():
+    """Sammel-Endpoint ueber alle Agenten (BACKEND_TODO_API_GAPS §6).
+
+    Response:  { agent_name: [MemoryFile, ...], ... }
+    Query:     ?include=conversations,  ?flat=1 fuer [...] mit agent-Feld.
+    """
+    include = (request.args.get('include') or '').lower()
+    include_conv = 'conversations' in include or 'conversation' in include
+    flat = request.args.get('flat', '').lower() in ('1', 'true', 'yes')
+    by_agent = {}
+    for name in _list_known_agents():
+        by_agent[name] = _collect_memory_files(name, include_conversations=include_conv)
+    if flat:
+        flattened = []
+        for files in by_agent.values():
+            flattened.extend(files)
+        return jsonify(flattened)
+    return jsonify(by_agent)
 
 
 @app.route('/memory')
@@ -14604,39 +15007,81 @@ def api_messages_detail(msg_id):
 
 @app.route("/api/messages/mark-read", methods=["POST"])
 def api_messages_mark_read():
+    """Markiert eine Nachricht (oder eine ganze Conversation) als gelesen/ungelesen.
+
+    Akzeptierte Request-Shapes (BACKEND_TODO_API_GAPS_2026-04-22 §2):
+      - {message_id: "..."}                — strikt eine Nachricht
+      - {id: "..."}                        — Alias zu message_id
+      - {conversation_id: "..."}           — markiert ALLE Messages der Conv
+      - {id: "<conv_id>", mode: "conversation"}  — explizit Conversation-Mode
+
+    Wenn nur 'id' geliefert wird, versuchen wir zuerst Message-Match,
+    fallen bei Miss auf Conversation-Match (falls 'id' einer conversation_id
+    entspricht) zurueck. Das matched Frontend-Shape wo conv.id manchmal die
+    conversation_id ist.
+    """
     data = request.get_json(silent=True) or {}
-    mid = (data.get("message_id") or "").strip()
     read = bool(data.get("read", True))
-    if not mid:
-        return jsonify({"ok": False, "error": "message_id required"}), 400
-    # Message-Details fuer Write-Back holen (vor dem State-Update)
-    target_msg = None
+    raw_id = (data.get("message_id") or data.get("id") or "").strip()
+    conv_id = (data.get("conversation_id") or "").strip()
+    mode = (data.get("mode") or "").strip().lower()
+    if not raw_id and not conv_id:
+        return jsonify({"ok": False, "error": "message_id or conversation_id required"}), 400
+
     try:
-        for m in _msg_get_all():
-            if m.get("id") == mid:
-                target_msg = m
-                break
+        all_msgs = _msg_get_all()
     except Exception:
-        pass
+        all_msgs = []
+
+    # Target-Resolution: wenn conv_id explizit oder mode=='conversation',
+    # alle Messages der Conv markieren. Sonst strict message-ID-Match;
+    # bei Miss Fallback auf Conv-ID-Match.
+    target_msgs = []
+    effective_cid = conv_id or (raw_id if mode == 'conversation' else '')
+    if effective_cid:
+        target_msgs = [m for m in all_msgs if m.get("conversation_id") == effective_cid]
+    elif raw_id:
+        hit = next((m for m in all_msgs if m.get("id") == raw_id), None)
+        if hit:
+            target_msgs = [hit]
+        else:
+            # Fallback: 'id' kann conversation_id sein (Frontend-Shape)
+            conv_matches = [m for m in all_msgs if m.get("conversation_id") == raw_id]
+            if conv_matches:
+                target_msgs = conv_matches
+                effective_cid = raw_id
+
+    if not target_msgs:
+        return jsonify({"ok": False, "error": "no messages matched"}), 404
+
+    mids = [m["id"] for m in target_msgs if m.get("id")]
     with _MSG_STATE_LOCK:
         state = _msg_load_state()
-        read_list = state.get("read_messages", [])
-        read_set = set(read_list)
+        read_set = set(state.get("read_messages", []))
         if read:
-            read_set.add(mid)
+            read_set |= set(mids)
         else:
-            read_set.discard(mid)
+            read_set -= set(mids)
         state["read_messages"] = sorted(read_set)
         _msg_save_state(state)
-    # Write-Back zur Quelle: nur E-Mail (WhatsApp/iMessage haben keine
-    # Schreib-API). Fire-and-forget, blockiert nicht.
-    if target_msg and target_msg.get("type") == "email":
-        _apple_mail_set_read_state_async(
-            target_msg.get("sender_address", ""),
-            target_msg.get("subject", ""),
-            read,
-        )
-    return jsonify({"ok": True, "read": read, "message_id": mid})
+
+    # Write-Back zur Quelle (nur E-Mail, fire-and-forget).
+    for m in target_msgs:
+        if m.get("type") == "email":
+            _apple_mail_set_read_state_async(
+                m.get("sender_address", ""),
+                m.get("subject", ""),
+                read,
+            )
+
+    return jsonify({
+        "ok": True,
+        "read": read,
+        "message_id": mids[0] if len(mids) == 1 else None,
+        "message_ids": mids,
+        "conversation_id": effective_cid or None,
+        "count": len(mids),
+    })
 
 
 @app.route("/api/messages/sync-from-apple-mail", methods=["POST"])
