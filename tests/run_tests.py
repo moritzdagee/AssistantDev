@@ -3933,10 +3933,23 @@ try:
     r4 = requests.get("http://localhost:8080/api/oauth-status",
                       headers={"Host": "api.bios.love", "Authorization": f"Bearer {_tok}"},
                       timeout=3)
+    # Shared-Token-Pfad ist seit 2026-04-24 hinter legacy_shared_token_enabled-Flag.
+    # Test-Erwartung richtet sich danach.
+    _sb_cfg_path2 = os.path.join(_REPO, "config", "supabase_auth.json")
+    _legacy_flag = True
+    if os.path.isfile(_sb_cfg_path2):
+        try:
+            _legacy_flag = bool(_json.load(open(_sb_cfg_path2)).get(
+                "legacy_shared_token_enabled", True))
+        except Exception:
+            pass
     test("Auth: localhost ohne Token → 200", r1.status_code == 200)
     test("Auth: externer Host ohne Token → 401", r2.status_code == 401)
     test("Auth: externer Host + falscher Token → 401", r3.status_code == 401)
-    test("Auth: externer Host + korrekter Token → 200", r4.status_code == 200)
+    if _legacy_flag:
+        test("Auth: externer Host + Shared-Token (Legacy an) → 200", r4.status_code == 200)
+    else:
+        test("Auth: externer Host + Shared-Token (Legacy aus) → 401", r4.status_code == 401)
 except Exception as _e:
     test("Auth live-Tests", False, str(_e))
 
@@ -4198,7 +4211,10 @@ try:
     # weil Localhost eh exempt ist.
     _pub = "https://api.bios.love"
 
-    # Aktueller Shared-Token aus Config
+    # Legacy-Flag aus supabase_auth.json
+    _sb_cfg_path = os.path.join(_REPO, "config", "supabase_auth.json")
+    _sb_cfg = json.load(open(_sb_cfg_path)) if os.path.isfile(_sb_cfg_path) else {}
+    _legacy_on = bool(_sb_cfg.get("legacy_shared_token_enabled", True))
     _cfg = json.load(open(os.path.join(_REPO, "config", "api_auth.json")))
     _tok = _cfg.get("api_token", "")
 
@@ -4218,7 +4234,10 @@ try:
     if _tok:
         r = requests.get(_pub + "/agents",
                          headers={"Authorization": f"Bearer {_tok}"}, timeout=5)
-        test("extern mit Shared-Token (Legacy-Flag an) → 200", r.status_code == 200)
+        if _legacy_on:
+            test("extern mit Shared-Token (Legacy-Flag an) → 200", r.status_code == 200)
+        else:
+            test("extern mit Shared-Token (Legacy-Flag aus) → 401", r.status_code == 401)
 
     r = requests.get(_pub + "/api/health", timeout=5)
     test("/api/health bleibt unauthed", r.status_code == 200)
@@ -4226,6 +4245,89 @@ try:
     test("/api/health-status bleibt unauthed", r.status_code == 200)
 except Exception as _e:
     test("Auth-Refactor live-Tests", False, str(_e))
+
+# BACKEND_TODOs 2026-04-24 — 3 neue Spezifikationen
+section("Agents/Memory/Thread 2026-04-24")
+try:
+    import requests
+    _base = "http://localhost:8080"
+
+    # §1 AGENTS_FULL_DESCRIPTION — description voll, preview truncated
+    r = requests.get(_base + "/agents", timeout=5)
+    _agents = r.json() if r.status_code == 200 else []
+    _a = next((a for a in _agents if a.get("name") == "privat"), (_agents or [{}])[0])
+    test("GET /agents → description voll (>180 chars)",
+         len(_a.get("description", "")) > 180)
+    test("GET /agents → description_preview truncated (<=180 chars)",
+         len(_a.get("description_preview", "")) <= 180)
+
+    r = requests.get(_base + "/agents/privat", timeout=5)
+    _ad = r.json() if r.status_code == 200 else {}
+    test("GET /agents/<name> → 200 + Detail-Shape",
+         r.status_code == 200 and "description" in _ad and "subagents" in _ad)
+
+    r = requests.get(_base + "/agents/__nonexistent__", timeout=5)
+    test("GET /agents/<unknown> → 404", r.status_code == 404)
+
+    # §2 MEMORY_AND_CONVERSATIONS §1 — kind-Classification
+    r = requests.get(_base + "/api/memory/list/privat", timeout=10)
+    _mem = r.json() if r.status_code == 200 else []
+    from collections import Counter as _Cnt
+    _kinds = _Cnt(f.get("kind") for f in _mem)
+    test("/api/memory/list/privat → nicht leer", len(_mem) > 0)
+    test("/api/memory/list mit E-Mails (>=1 kind='email')",
+         _kinds.get("email", 0) >= 1)
+    test("/api/memory/list klassifiziert images",
+         _kinds.get("image", 0) >= 0)
+
+    # §2 MEMORY_AND_CONVERSATIONS §2 — Conversations Shape
+    r = requests.get(_base + "/api/conversations?agent=privat", timeout=10)
+    _convs = r.json() if r.status_code == 200 else []
+    if _convs:
+        _c = _convs[0]
+        test("/api/conversations Eintrag hat preview + updated_at + message_count",
+             all(k in _c for k in ("preview", "updated_at", "message_count", "title")))
+        test("/api/conversations updated_at und updatedAt sind identisch",
+             _c.get("updated_at") == _c.get("updatedAt"))
+        r2 = requests.get(_base + f"/api/conversations/{_c['id']}/messages", timeout=5)
+        _conv_detail = r2.json() if r2.status_code == 200 else {}
+        test("/api/conversations/<id>/messages → 200 mit messages[]",
+             r2.status_code == 200 and isinstance(_conv_detail.get("messages"), list))
+        if _conv_detail.get("messages"):
+            _m = _conv_detail["messages"][0]
+            test("Messages haben id + role + content + at",
+                 all(k in _m for k in ("id", "role", "content", "at")))
+
+    # §3 EMAIL_THREAD_RECONSTRUCTION — Thread aggregiert via Subject + Header-Walk
+    # Hole eine Email, triggere thread, pruefe dass >= 1 Message
+    r = requests.get(_base + "/api/messages", timeout=10)
+    _msgs = r.json().get("messages", []) if r.status_code == 200 else []
+    _email = next((m for m in _msgs if m.get("type") == "email"), None)
+    if _email:
+        r = requests.get(_base + f"/api/messages/{_email['id']}/thread", timeout=5)
+        _thread = r.json() if r.status_code == 200 else {}
+        test("/api/messages/<id>/thread → ok",
+             _thread.get("ok") is True)
+        test("Thread enthaelt mind. die Ursprungs-Message",
+             len(_thread.get("messages", [])) >= 1)
+except Exception as _e:
+    test("Agents/Memory/Thread 2026-04-24 live-Tests", False, str(_e))
+
+try:
+    _ws_new = open(os.path.join(_REPO, "src", "web_server.py"), encoding="utf-8").read()
+    test("_agent_description_full splittet am SYSTEM-CAPABILITIES-Marker",
+         "_agent_description_full" in _ws_new and "_split_system_prompt" in _ws_new)
+    test("Detail-Route /agents/<name> vorhanden",
+         "def get_agent_detail" in _ws_new)
+    test("_classify_memory_filename erkennt email/webclip/contacts/image",
+         "_classify_memory_filename" in _ws_new
+         and "'email'" in _ws_new and "'webclip'" in _ws_new)
+    test("_email_thread_members walkt In-Reply-To-Graph",
+         "_email_thread_members" in _ws_new and "in_reply_to" in _ws_new)
+    test("_normalize_subject fuer thread-aggregation",
+         "_normalize_subject" in _ws_new)
+except Exception as _e:
+    test("Agents/Memory/Thread 2026-04-24 grep", False, str(_e))
 
 try:
     _ws_auth = open(os.path.join(_REPO, "src", "web_server.py"), encoding="utf-8").read()

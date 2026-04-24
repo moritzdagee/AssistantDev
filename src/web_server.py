@@ -8495,16 +8495,21 @@ def api_system_prompt(agent, sub=None):
 # ── /api/conversations (flache Session-Liste) ──────────────────────────────
 @app.route('/api/conversations')
 def api_conversations():
-    """Konversations-Liste ueber alle Agenten. Alias zu /get_history."""
+    """Konversations-Liste ueber alle Agenten (BACKEND_TODO_MEMORY_AND_CONVERSATIONS §2).
+
+    Response pro Eintrag: {id, agent, title, preview, updated_at, updatedAt,
+    message_count, file, modified, size}. Aliase updated_at/updatedAt/modified
+    zeigen alle auf denselben ISO-Timestamp — Frontend kann wahlen.
+    """
     agent_filter = request.args.get('agent')
     agent_names = [agent_filter] if agent_filter else [
         f.replace('.txt', '') for f in os.listdir(AGENTS_DIR)
-        if f.endswith('.txt') and '.backup_' not in f
+        if f.endswith('.txt') and '.backup_' not in f and '.deleted_' not in f
     ]
     result = []
     for name in agent_names:
         speicher = get_agent_speicher(name)
-        if not os.path.isdir(speicher):
+        if not speicher or not os.path.isdir(speicher):
             continue
         for fn in sorted(os.listdir(speicher)):
             if not fn.startswith('konversation_') or not fn.endswith('.txt'):
@@ -8513,35 +8518,78 @@ def api_conversations():
             try:
                 stat = os.stat(full)
                 with open(full, encoding='utf-8', errors='replace') as fh:
-                    first_lines = fh.read(500)
-                title = first_lines.split('\n', 1)[0][:120].strip() or fn
+                    head = fh.read(2000)
             except OSError:
                 continue
+            # Title: erste Zeile des Files, oder erste User-Message, oder Filename-Date
+            title = ''
+            first_user = ''
+            for line in head.split('\n'):
+                if not title and line.strip() and not line.startswith('['):
+                    title = line.strip()[:120]
+                if line.startswith('Du: ') and not first_user:
+                    first_user = line[4:].strip()
+                if title and first_user:
+                    break
+            if not title:
+                # Ableitung aus Filename "konversation_2026-04-22_18-30-12_<agent>"
+                parts = fn.replace('.txt', '').split('_')
+                title = f'{parts[1]} {parts[2].replace("-", ":")}' if len(parts) >= 3 else fn
+            # Approx message count: zaehle "Du: " + "Assistant: " ohne ganzes Parsen
+            msg_count = head.count('Du: ') + head.count('Assistant: ')
+            mtime_iso = datetime.datetime.fromtimestamp(stat.st_mtime).isoformat()
+            preview = (first_user or head.replace('\n', ' ').strip())[:160]
             result.append({
                 'id': fn.replace('.txt', ''),
                 'agent': name,
                 'title': title,
+                'preview': preview,
+                'updated_at': mtime_iso,
+                'updatedAt': mtime_iso,
+                'last_message_at': mtime_iso,
+                'message_count': msg_count,
+                # Legacy-Felder
                 'file': fn,
-                'modified': datetime.datetime.fromtimestamp(stat.st_mtime).isoformat(),
+                'modified': mtime_iso,
                 'size': stat.st_size,
             })
-    result.sort(key=lambda x: x['modified'], reverse=True)
+    result.sort(key=lambda x: x['updated_at'], reverse=True)
     return jsonify(result)
 
 
 @app.route('/api/conversations/<conv_id>/messages')
 def api_conversations_messages(conv_id):
-    """Verlauf einer Konversation (parse konversation_*.txt)."""
-    # conv_id ist der Dateiname ohne .txt — wir muessen alle Agents scannen
+    """Verlauf einer Konversation (parse konversation_*.txt).
+
+    Response: {id, agent, messages: [{id, role, content, at}]}. Messages sind
+    in chronologischer Reihenfolge (wie im File). `at` leitet sich aus der
+    File-mtime ab — die einzelnen Messages tragen selbst keinen Timestamp.
+    """
     fn = conv_id + '.txt'
     agent_names = [f.replace('.txt', '') for f in os.listdir(AGENTS_DIR)
-                   if f.endswith('.txt') and '.backup_' not in f]
+                   if f.endswith('.txt') and '.backup_' not in f and '.deleted_' not in f]
     for name in agent_names:
         speicher = get_agent_speicher(name)
+        if not speicher:
+            continue
         full = os.path.join(speicher, fn)
-        if os.path.isfile(full):
-            verlauf = parse_konversation_file(full)
-            return jsonify({'id': conv_id, 'agent': name, 'messages': verlauf})
+        if not os.path.isfile(full):
+            continue
+        verlauf = parse_konversation_file(full)
+        try:
+            mtime = datetime.datetime.fromtimestamp(os.stat(full).st_mtime).isoformat()
+        except OSError:
+            mtime = ''
+        messages = [
+            {
+                'id': f'm{i + 1}',
+                'role': m.get('role', 'user'),
+                'content': m.get('content', ''),
+                'at': mtime,
+            }
+            for i, m in enumerate(verlauf)
+        ]
+        return jsonify({'id': conv_id, 'agent': name, 'messages': messages})
     return jsonify({'error': 'conversation not found'}), 404
 
 
@@ -8737,22 +8785,19 @@ def get_agent_display_name(name):
         return parent + ' \u203a ' + sub
     return name
 
-def _agent_description(name):
-    """TOOLTIPS_V1: Liest die ersten zwei Saetze aus dem Agent-System-Prompt
-    als knappe Beschreibung fuer Frontend-Tooltips. Max 180 Zeichen."""
+def _agent_description_preview(name):
+    """TOOLTIPS_V1: Kurze Preview (max 180 chars) fuer Tooltips."""
     try:
         fpath = os.path.join(AGENTS_DIR, name + '.txt')
         if not os.path.exists(fpath):
             return ''
         with open(fpath, 'r', encoding='utf-8', errors='ignore') as f:
             raw = f.read(800)
-        # Memory-/System-Marker entfernen
         for marker in ['--- GEDAECHTNIS:', '--- DATEI-ERSTELLUNG ---', '--- WEITERE FAEHIGKEITEN ---', 'VERGANGENE KONVERSATIONEN:']:
             idx = raw.find(marker)
             if idx != -1:
                 raw = raw[:idx]
         raw = raw.strip()
-        # Erste ~2 Saetze / 180 Zeichen
         snippet = raw.split('\n\n')[0] if '\n\n' in raw else raw
         snippet = ' '.join(snippet.split())
         if len(snippet) > 180:
@@ -8762,47 +8807,119 @@ def _agent_description(name):
         return ''
 
 
+def _agent_description_full(name):
+    """Vollstaendiger user-editierbarer Prompt-Teil (vor SYSTEM_CAPABILITIES-Marker).
+
+    BACKEND_TODO_AGENTS_FULL_DESCRIPTION: frueher lieferte description nur
+    die truncated Preview, was beim PATCH zu Datenverlust fuehrte. Hier die
+    vollstaendige Version; Preview steht weiter in description_preview.
+    """
+    try:
+        fpath = os.path.join(AGENTS_DIR, name + '.txt')
+        if not os.path.exists(fpath):
+            return ''
+        with open(fpath, 'r', encoding='utf-8') as f:
+            raw = f.read()
+        user_part, _ = _split_system_prompt(raw)
+        return user_part
+    except Exception:
+        return ''
+
+
+# Kurzalias — alte Callers rufen _agent_description auf
+_agent_description = _agent_description_preview
+
+
+def _agent_entry(name, *, full=True):
+    """Baut ein Agent-Dict mit full/preview-Description fuer /agents-Listen."""
+    return {
+        'name': name,
+        'label': name.split('_', 1)[1] if '_' in name else name,
+        'description': _agent_description_full(name) if full else '',
+        'description_preview': _agent_description_preview(name),
+    }
+
+
 @app.route('/agents')
 def get_agents():
     files = sorted([f.replace('.txt','') for f in os.listdir(AGENTS_DIR) if f.endswith('.txt')])
-    # Group: parents first, then sub-agents nested
     parents = []
-    children = {}  # parent_name -> [sub_agent_names]
+    children = {}
     for name in files:
         parent = get_parent_agent(name)
         if parent:
             children.setdefault(parent, []).append(name)
         else:
             parents.append(name)
-    # Build hierarchical structure
     result = []
     for p in parents:
         subs = []
         for c in children.get(p, []):
             sub_label = c.split('_', 1)[1] if '_' in c else c
-            subs.append({'name': c, 'label': sub_label, 'description': _agent_description(c)})
+            subs.append({
+                'name': c, 'label': sub_label,
+                'description': _agent_description_full(c),
+                'description_preview': _agent_description_preview(c),
+            })
         result.append({
             'name': p,
             'label': p,
-            'description': _agent_description(p),
+            'description': _agent_description_full(p),
+            'description_preview': _agent_description_preview(p),
             'has_subagents': len(subs) > 0,
-            'subagents': subs
+            'subagents': subs,
         })
-    # Orphan sub-agents (parent has no .txt)
     orphan_parents = set(children.keys()) - set(parents)
     for op in sorted(orphan_parents):
         subs = []
         for c in children[op]:
             sub_label = c.split('_', 1)[1] if '_' in c else c
-            subs.append({'name': c, 'label': sub_label, 'description': _agent_description(c)})
+            subs.append({
+                'name': c, 'label': sub_label,
+                'description': _agent_description_full(c),
+                'description_preview': _agent_description_preview(c),
+            })
         result.append({
             'name': op,
             'label': op,
             'description': '',
+            'description_preview': '',
             'has_subagents': True,
-            'subagents': subs
+            'subagents': subs,
         })
     return jsonify(result)
+
+
+@app.route('/agents/<name>')
+def get_agent_detail(name):
+    """Detail-Endpoint pro Agent (BACKEND_TODO_AGENTS_FULL_DESCRIPTION §2)."""
+    fpath = os.path.join(AGENTS_DIR, name + '.txt')
+    if not os.path.isfile(fpath):
+        return jsonify({'error': f'agent {name} not found'}), 404
+    parent = get_parent_agent(name)
+    subs = []
+    if not parent:
+        # Parent: Sub-Agents auflisten
+        for f in sorted(os.listdir(AGENTS_DIR)):
+            if not f.endswith('.txt') or '.backup_' in f or '.deleted_' in f:
+                continue
+            child = f[:-4]
+            if get_parent_agent(child) == name:
+                sub_label = child.split('_', 1)[1] if '_' in child else child
+                subs.append({
+                    'name': child, 'label': sub_label,
+                    'description': _agent_description_full(child),
+                    'description_preview': _agent_description_preview(child),
+                })
+    return jsonify({
+        'name': name,
+        'label': name.split('_', 1)[1] if '_' in name else name,
+        'parent': parent,
+        'description': _agent_description_full(name),
+        'description_preview': _agent_description_preview(name),
+        'has_subagents': len(subs) > 0,
+        'subagents': subs,
+    })
 
 @app.route('/close_session', methods=['POST'])
 def close_session():
@@ -13145,20 +13262,56 @@ def api_docs():
 
 # ── MEMORY MANAGEMENT UI ─────────────────────────────────────────────────────
 
-def _memory_file_entry(fpath, agent_name, kind='memory'):
+def _classify_memory_filename(fname):
+    """Ordnet Filename zu einem Content-Kind zu — fuer Frontend-Filter.
+
+    Kinds (BACKEND_TODO_MEMORY_AND_CONVERSATIONS §1):
+      email | webclip | doc | conversation | contacts | image | memory
+
+    Email-Patterns (aus Watcher-History):
+      - `<date>_<time>_IN_<sender>_<subject>.txt`
+      - `<date>_<time>_OUT_<sender>_<subject>.txt`
+      - `email_<date>_<time>_<subject>.txt` (neueres Format)
+    """
+    low = fname.lower()
+    if low.startswith('konversation_'):
+        return 'conversation'
+    if low.startswith('web_') or low.startswith('webclip'):
+        return 'webclip'
+    if low == 'contacts.json' or low.startswith('contacts'):
+        return 'contacts'
+    # Email-Patterns — entweder email_-Prefix oder _IN_/_OUT_ im Dateinamen
+    if low.startswith('email_') or '_in_' in low or '_out_' in low:
+        return 'email'
+    if any(low.endswith(ext) for ext in ('.png', '.jpg', '.jpeg', '.gif', '.webp', '.heic')):
+        return 'image'
+    if any(low.endswith(ext) for ext in ('.docx', '.pdf', '.xlsx', '.pptx', '.md')):
+        return 'doc'
+    if low.endswith('.txt'):
+        return 'doc'
+    return 'memory'
+
+
+def _memory_file_entry(fpath, agent_name, kind=None):
     """Einheitliche Shape fuer Memory-Files (BACKEND_TODO_API_GAPS §6/§7).
 
     Altfeldnamen (file/mtime/preview) bleiben aus Kompatibilitaetsgruenden
     bestehen — neu: path/name/modified/agent/kind fuer das React-Frontend.
+    kind wird anhand des Dateinamens klassifiziert (email/webclip/doc/
+    conversation/contacts/image/memory), sofern nicht explizit uebergeben.
     """
     stat = os.stat(fpath)
-    preview = ''
-    try:
-        with open(fpath, 'r', encoding='utf-8', errors='replace') as f:
-            preview = f.read(200)
-    except Exception:
-        pass
     fname = os.path.basename(fpath)
+    if kind is None:
+        kind = _classify_memory_filename(fname)
+    preview = ''
+    # Nur fuer Text-Files lohnt sich ein Preview-Read
+    if kind in ('conversation', 'email', 'doc', 'memory', 'contacts'):
+        try:
+            with open(fpath, 'r', encoding='utf-8', errors='replace') as f:
+                preview = f.read(200)
+        except Exception:
+            pass
     mtime = datetime.datetime.fromtimestamp(stat.st_mtime)
     return {
         'file': fname,
@@ -13173,8 +13326,17 @@ def _memory_file_entry(fpath, agent_name, kind='memory'):
     }
 
 
-def _collect_memory_files(agent_name, include_conversations=False):
-    """Aggregiert memory/-Files und optional konversation_*.txt pro Agent."""
+def _collect_memory_files(agent_name, include_conversations=True):
+    """Aggregiert alle Memory-relevanten Dateien pro Agent.
+
+    Scant:
+      1. <speicher>/memory/* — klassische Memory-Files (kind wird aus Filename
+         geraten: email / webclip / doc / image / contacts / memory)
+      2. <speicher>/konversation_*.txt — Session-Archive (kind='conversation')
+         nur wenn include_conversations=True (Default: True, siehe
+         BACKEND_TODO_MEMORY_AND_CONVERSATIONS §1)
+      3. <speicher>/contacts.json — falls an der Agent-Wurzel
+    """
     speicher = get_agent_speicher(agent_name)
     if not speicher or not os.path.isdir(speicher):
         return []
@@ -13186,22 +13348,27 @@ def _collect_memory_files(agent_name, include_conversations=False):
             if not os.path.isfile(fpath):
                 continue
             try:
-                result.append(_memory_file_entry(fpath, agent_name, 'memory'))
+                # kind via Filename-Pattern (default 'memory' fuer UUIDs etc.)
+                result.append(_memory_file_entry(fpath, agent_name))
             except Exception:
                 continue
-    if include_conversations:
-        # konversation_*.txt liegen direkt im Speicher-Root (siehe
-        # get_agent_speicher/System-Prompt-Konvention).
-        try:
-            for fname in sorted(os.listdir(speicher)):
-                if not fname.startswith('konversation_') or not fname.endswith('.txt'):
+    # Agent-Root scannen: konversation_*.txt, contacts.json, evtl. Top-Level-Memory
+    try:
+        for fname in sorted(os.listdir(speicher)):
+            fpath = os.path.join(speicher, fname)
+            if not os.path.isfile(fpath):
+                continue
+            is_conv = fname.startswith('konversation_') and fname.endswith('.txt')
+            is_contacts = fname == 'contacts.json'
+            if is_conv and not include_conversations:
+                continue
+            if is_conv or is_contacts:
+                try:
+                    result.append(_memory_file_entry(fpath, agent_name))
+                except Exception:
                     continue
-                fpath = os.path.join(speicher, fname)
-                if not os.path.isfile(fpath):
-                    continue
-                result.append(_memory_file_entry(fpath, agent_name, 'conversation'))
-        except OSError:
-            pass
+    except OSError:
+        pass
     return result
 
 
@@ -13616,21 +13783,25 @@ _APPLE_MAIL_READ_CACHE = {"keys": set(), "ts": 0.0, "error": None}
 _APPLE_MAIL_READ_TTL = 90
 
 
-def _apple_mail_match_key(sender_email: str, subject: str) -> str:
-    """Stabiler Match-Key Subject+Absender. Case-insensitive, Whitespace
-    normalisiert, 'Re:' / 'Fwd:' Prefix gestrippt — so matchen auch
-    Thread-Antworten."""
+def _normalize_subject(subject: str) -> str:
+    """Normalisiert E-Mail-Subject: lowercase, 'Re:'/'Fwd:'/'AW:' Prefix
+    wiederholt gestrippt, Whitespace zusammengefaltet. Gemeinsame Basis
+    fuer thread-weite Aggregation (richtungsunabhaengig)."""
     import re as _re_mmk
-    se = (sender_email or "").strip().lower()
     su = (subject or "").strip().lower()
-    # Re:/Fwd:/AW: wiederholt strippen
     for _ in range(5):
         new = _re_mmk.sub(r'^(re|fwd|fw|aw|wg)\s*:\s*', '', su, flags=_re_mmk.IGNORECASE)
         if new == su:
             break
         su = new
-    su = _re_mmk.sub(r'\s+', ' ', su).strip()
-    return f"{se}|{su}"
+    return _re_mmk.sub(r'\s+', ' ', su).strip()
+
+
+def _apple_mail_match_key(sender_email: str, subject: str) -> str:
+    """Stabiler Match-Key Subject+Absender fuer Read-State-Write-Back.
+    Bleibt sender-scoped, damit pro Absender eindeutig."""
+    se = (sender_email or "").strip().lower()
+    return f"{se}|{_normalize_subject(subject)}"
 
 
 def _apple_mail_load_unread_keys() -> set:
@@ -15466,11 +15637,71 @@ def api_messages_search():
     })
 
 
+def _email_thread_members(messages, target):
+    """Findet alle Messages im selben E-Mail-Thread wie `target`.
+
+    Aggregation (BACKEND_TODO_EMAIL_THREAD_RECONSTRUCTION):
+      1. Gleicher `conversation_id` (sender+subject-basiert — erfasst
+         alle Mails vom gleichen Absender im selben Thread)
+      2. Gleicher normalisierter Subject-Key (erfasst Antworten von
+         anderen Teilnehmern, richtungsunabhaengig)
+      3. Header-Walk: In-Reply-To/Message-ID-Graph, transitiv
+
+    Sent-Mails werden mit aufgenommen, sobald das Backend sie indexiert
+    (derzeit Limitation — direction=sent ist nicht in _msg_get_all).
+    """
+    target_conv = target.get("conversation_id")
+    target_subject_key = _normalize_subject(target.get("subject") or "")
+    email_msgs = [m for m in messages if m.get("type") == "email"]
+
+    members = set()
+    if target_conv:
+        for m in email_msgs:
+            if m.get("conversation_id") == target_conv:
+                members.add(m.get("id"))
+    if target_subject_key:
+        for m in email_msgs:
+            if _normalize_subject(m.get("subject") or "") == target_subject_key:
+                members.add(m.get("id"))
+
+    # Header-Walk: Message-ID / In-Reply-To-Graph transitiv expandieren
+    by_mid = {m.get("message_id"): m for m in email_msgs if m.get("message_id")}
+    frontier = [target.get("id")] + list(members)
+    seen_ids = set(members)
+    id_to_msg = {m.get("id"): m for m in email_msgs}
+    while frontier:
+        cur_id = frontier.pop()
+        cur = id_to_msg.get(cur_id)
+        if not cur:
+            continue
+        in_reply = cur.get("in_reply_to")
+        if in_reply and in_reply in by_mid:
+            parent = by_mid[in_reply]
+            pid = parent.get("id")
+            if pid and pid not in seen_ids:
+                seen_ids.add(pid)
+                members.add(pid)
+                frontier.append(pid)
+        # Kinder: andere mit in_reply_to == cur.message_id
+        cur_mid = cur.get("message_id")
+        if cur_mid:
+            for m in email_msgs:
+                if m.get("in_reply_to") == cur_mid and m.get("id") not in seen_ids:
+                    seen_ids.add(m.get("id"))
+                    members.add(m.get("id"))
+                    frontier.append(m.get("id"))
+
+    # target selbst auf jeden Fall inkludieren
+    members.add(target.get("id"))
+    return [m for m in email_msgs if m.get("id") in members]
+
+
 @app.route("/api/messages/<msg_id>/thread")
 def api_message_thread(msg_id):
     """Thread- bzw. Conversation-Ansicht einer Message.
 
-    - Email: Messages mit gleicher `conversation_id` (Subject-basiert o.ae.)
+    - Email: subject-normalisierte Aggregation + In-Reply-To-Header-Walk
+      (BACKEND_TODO_EMAIL_THREAD_RECONSTRUCTION)
     - Chat (whatsapp/imessage/kchat): Messages mit gleicher `conversation_id`
     Keine DB — wir filtern die aggregierten Messages-Liste.
     """
@@ -15483,11 +15714,16 @@ def api_message_thread(msg_id):
     if not target:
         return jsonify({"ok": False, "error": "not found"}), 404
 
+    is_email = target.get("type") == "email"
     conv_id = target.get("conversation_id") or msg_id
-    thread_msgs = [m for m in messages if (m.get("conversation_id") or m.get("id")) == conv_id]
+
+    if is_email:
+        thread_msgs = _email_thread_members(messages, target)
+    else:
+        thread_msgs = [m for m in messages
+                       if (m.get("conversation_id") or m.get("id")) == conv_id]
     thread_msgs.sort(key=lambda m: m.get("timestamp_epoch", 0))
 
-    is_email = target.get("type") == "email"
     kind = "email_thread" if is_email else "chat_conversation"
 
     # Participants: unique senders
