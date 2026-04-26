@@ -4369,6 +4369,38 @@ except Exception as _e:
     test("API-Gaps grep", False, str(_e))
 
 
+section("Frontend-TODOs CRUD + Reply-Context + Chat-Signature 2026-04-26")
+
+try:
+    with open(os.path.expanduser("~/AssistantDev/src/web_server.py")) as _f:
+        _ws = _f.read()
+
+    # REPLY_SESSION_CONTEXT — Kontext landet in kontext_items
+    test("Reply-Session injectet konversations-kontext in kontext_items",
+         "state.setdefault('kontext_items', []).append" in _ws and
+         "reply_context_" in _ws)
+
+    # CHAT_RESPONSE_MODEL_SIGNATURE
+    test("/chat-Response enthaelt 'provider'-Feld",
+         "'provider': PROVIDER_DISPLAY.get(provider_key" in _ws)
+    test("/chat-Response enthaelt 'model'-Feld",
+         "'model': MODEL_DISPLAY.get(model_id" in _ws)
+
+    # FRONTEND_TODOS_CRUD
+    test("GET /api/frontend-todos registered",
+         "@app.route('/api/frontend-todos', methods=['GET'])" in _ws)
+    test("PATCH /api/frontend-todos/<slug> registered",
+         "@app.route('/api/frontend-todos/<slug>', methods=['PATCH'])" in _ws)
+    test("DELETE /api/frontend-todos/<slug> registered",
+         "@app.route('/api/frontend-todos/<slug>', methods=['DELETE'])" in _ws)
+    test("Slug-Validation gegen Pfad-Traversal",
+         "_TODO_SLUG_RE = re.compile(r'^[A-Z0-9_]+$')" in _ws)
+    test("DELETE soft-renamed nach FIXED_<slug>_<date> bei reason=fixed",
+         'reason == "fixed"' in _ws or "reason == 'fixed'" in _ws)
+except Exception as _e:
+    test("FrontendTodos+ReplyContext grep", False, str(_e))
+
+
 section("WhatsApp Contact Disambiguation 2026-04-25")
 
 try:

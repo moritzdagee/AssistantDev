@@ -8710,6 +8710,129 @@ def api_conversations_messages(conv_id):
     return jsonify({'error': 'conversation not found'}), 404
 
 
+# ── /api/frontend-todos — CRUD fuer BACKEND_TODO_*.md im Frontend-Repo ─────
+# (FRONTEND_TODOS_CRUD)
+_FRONTEND_TODO_DIR = os.path.expanduser('~/AssistantDev/frontend/src/components')
+_TODO_SLUG_RE = re.compile(r'^[A-Z0-9_]+$')
+
+
+def _frontend_todo_path(slug):
+    """Mappt slug -> .md-Pfad. Validiert Slug gegen Pfad-Traversal."""
+    if not _TODO_SLUG_RE.match(slug):
+        return None
+    fname = f'BACKEND_TODO_{slug}.md'
+    full = os.path.join(_FRONTEND_TODO_DIR, fname)
+    # Sicherheit: nur Pfade direkt im Components-Dir akzeptieren
+    if os.path.dirname(os.path.abspath(full)) != os.path.abspath(_FRONTEND_TODO_DIR):
+        return None
+    return full
+
+
+def _parse_frontend_todo(path):
+    """Liest .md-Datei und extrahiert {slug, title, body, date}."""
+    fname = os.path.basename(path)
+    if not fname.startswith('BACKEND_TODO_') or not fname.endswith('.md'):
+        return None
+    slug = fname[len('BACKEND_TODO_'):-len('.md')]
+    try:
+        with open(path, 'r', encoding='utf-8', errors='replace') as f:
+            body = f.read()
+    except OSError:
+        return None
+    title = ''
+    date = ''
+    for line in body.split('\n')[:10]:
+        if not title and line.startswith('# '):
+            title = line[2:].strip()
+        m = re.search(r'\*\*Datum:\*\*\s*(\S+)', line)
+        if m:
+            date = m.group(1)
+    return {
+        'slug': slug,
+        'path': f'src/components/{fname}',
+        'title': title,
+        'body_markdown': body,
+        'date': date,
+        'github_url': f'https://github.com/moritzdagee/assistantdev-frontend-cbbcf761/blob/main/src/components/{fname}',
+    }
+
+
+@app.route('/api/frontend-todos', methods=['GET'])
+def api_frontend_todos_list():
+    if not os.path.isdir(_FRONTEND_TODO_DIR):
+        return jsonify({'items': []})
+    items = []
+    try:
+        for entry in os.scandir(_FRONTEND_TODO_DIR):
+            if not entry.is_file(follow_symlinks=False):
+                continue
+            n = entry.name
+            if not n.startswith('BACKEND_TODO_') or not n.endswith('.md'):
+                continue
+            it = _parse_frontend_todo(entry.path)
+            if it:
+                items.append(it)
+    except OSError as e:
+        return jsonify({'error': str(e)}), 500
+    items.sort(key=lambda x: (x.get('date') or '', x.get('slug')), reverse=True)
+    return jsonify({'items': items})
+
+
+@app.route('/api/frontend-todos/<slug>', methods=['PATCH'])
+def api_frontend_todo_patch(slug):
+    path = _frontend_todo_path(slug)
+    if path is None:
+        return jsonify({'ok': False, 'error': 'invalid slug'}), 400
+    if not os.path.isfile(path):
+        return jsonify({'ok': False, 'error': 'not found'}), 404
+    body = request.get_json(silent=True) or {}
+    new_title = body.get('title')
+    new_body = body.get('body_markdown')
+    if new_body is not None:
+        # Wenn nur title geaendert wird, body unveraendert lassen
+        try:
+            with open(path, 'w', encoding='utf-8') as f:
+                f.write(new_body)
+        except OSError as e:
+            return jsonify({'ok': False, 'error': str(e)}), 500
+    elif new_title is not None:
+        # Title-only: bestehende erste #-Zeile ersetzen
+        try:
+            with open(path, 'r', encoding='utf-8') as f:
+                lines = f.read().split('\n')
+            for i, line in enumerate(lines):
+                if line.startswith('# '):
+                    lines[i] = '# ' + new_title.strip()
+                    break
+            else:
+                lines.insert(0, '# ' + new_title.strip())
+            with open(path, 'w', encoding='utf-8') as f:
+                f.write('\n'.join(lines))
+        except OSError as e:
+            return jsonify({'ok': False, 'error': str(e)}), 500
+    return jsonify({'ok': True, **(_parse_frontend_todo(path) or {})})
+
+
+@app.route('/api/frontend-todos/<slug>', methods=['DELETE'])
+def api_frontend_todo_delete(slug):
+    path = _frontend_todo_path(slug)
+    if path is None:
+        return jsonify({'ok': False, 'error': 'invalid slug'}), 400
+    if not os.path.isfile(path):
+        return jsonify({'ok': False, 'error': 'not found'}), 404
+    reason = (request.args.get('reason') or '').strip().lower()
+    if reason == 'fixed':
+        target = os.path.join(_FRONTEND_TODO_DIR,
+                              f'FIXED_{slug}_{datetime.datetime.now().strftime("%Y-%m-%d")}.md')
+    else:
+        target = path + f'.removed_{int(_msgd_time.time())}'
+    try:
+        os.rename(path, target)
+    except OSError as e:
+        return jsonify({'ok': False, 'error': str(e)}), 500
+    return jsonify({'ok': True, 'moved_to': os.path.basename(target)})
+
+
 @app.route('/api/conversations/<conv_id>', methods=['DELETE'])
 def api_conversation_delete(conv_id):
     """Soft-Delete einer Konversation (CONVERSATION_CLEANUP).
@@ -11741,6 +11864,12 @@ def process_single_message(msg, kontext_override=None, state=None, **kwargs):
             'model_name': model_name,
             'provider_display': PROVIDER_DISPLAY.get(provider_key, provider_key),
             'model_display': MODEL_DISPLAY.get(model_id, model_name),
+            # CHAT_RESPONSE_MODEL_SIGNATURE — Frontend zeigt unter jeder
+            # Antwort an, welcher Provider/Model wirklich genutzt wurde.
+            # Strings matchen 1:1 mit /models-Endpoint (PROVIDER_DISPLAY +
+            # model_name aus models.json).
+            'provider': PROVIDER_DISPLAY.get(provider_key, provider_key),
+            'model': MODEL_DISPLAY.get(model_id, model_name),
             'auto_loaded': auto_loaded_names,
             'auto_search_info': auto_search_info,
             'agent': state['agent'],
@@ -16111,10 +16240,24 @@ def api_agent_sessions(agent):
                 who = m.get("sender_name") or m.get("sender_address") or "?"
                 preview = (m.get("full_content") or m.get("preview") or "")[:500]
                 ctx_lines.append(f"[{m.get('timestamp', '')}] {who}: {preview}")
+            kontext_text = f"Konversations-Kontext ({src_kind}):\n" + "\n".join(ctx_lines)
             initial_messages.append({
                 "role": "system_context",
-                "content": f"Konversations-Kontext ({src_kind}):\n" + "\n".join(ctx_lines),
+                "content": kontext_text,
             })
+            # PERSISTIEREN als kontext_item, damit der LLM beim ersten /chat-
+            # Aufruf den Kontext sieht (BACKEND_TODO_REPLY_SESSION_CONTEXT).
+            # process_single_message liest state['kontext_items'] und baut
+            # daraus den --- KONTEXT --- Block im Prompt.
+            try:
+                state.setdefault('kontext_items', []).append({
+                    'name': f"reply_context_{src_kind}",
+                    'content': kontext_text,
+                })
+                # session_files trackt was bereits injectet wurde
+                state.setdefault('session_files', []).append(f"reply_context_{src_kind}")
+            except Exception as _e:
+                print(f"[REPLY-CONTEXT] state-injection fail: {_e}", flush=True)
 
     if initial_draft:
         initial_messages.append({"role": "assistant_draft", "content": initial_draft})
