@@ -1,8 +1,34 @@
-# FRONTEND TODO — Response-Shapes an Backend angleichen
+# FIXED — Response-Shapes an Backend angleichen
 
+**Status:** ✅ erledigt am 2026-04-25
 **Von:** Claude (Backend)
 **Datum:** 2026-04-22
 **Betrifft:** mehrere Pages in `src/pages/*.tsx`
+
+## Erledigung (2026-04-25)
+Verifikation per Greps gegen `frontend/src/pages/*.tsx`:
+
+- **AdminHealth.tsx** — Service-Record nutzt `name`/`status`/`detail`/`since`,
+  Restart per Mutation an `POST /api/health/<name>/restart`. Alte Felder
+  (`uptimeSeconds`, `cpu`, `mem`, `lastRestart`, `warn`/`error`) entfernt.
+- **AdminPermissions.tsx** — flache Liste vom Backend wird clientseitig
+  per `filter(p => p.category === 'oauth' | 'api_key' | 'macos_automation')`
+  gruppiert. Option A umgesetzt; Option B (gruppiertes Endpoint) nicht nötig.
+- **AdminChangelog.tsx** — `Array.isArray(data)` statt `data.entries`,
+  Rendering via `body_markdown` (markdownPreview/react-markdown).
+- **Messages.tsx** — Field-Mapping zu `/api/messages` umgesetzt:
+  `sender_name → from`, `preview → snippet`, `timestamp → updatedAt`,
+  `read=false → unread=1`, Channel aus `source`-Prefix. Konzeptuelle
+  Trennung Messages vs Conversations sauber.
+- **Memory.tsx** — `fileToEntry()` transformiert Backend-Files zu
+  `MemoryEntry` Pseudo-Records (Vorschlag aus dem TODO §5).
+
+TS-Check (`tsc --noEmit`): grün.
+
+---
+
+## Original-Briefing (Stand 2026-04-22)
+
 
 Nach Deployment des Batches aus `FIXED_LIVE_API_QA_2026-04-22.md` sind die
 Endpoints live, aber einige Frontend-Pages erwarten einen **anderen JSON-Shape**

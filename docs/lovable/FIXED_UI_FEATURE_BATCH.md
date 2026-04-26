@@ -1,7 +1,33 @@
-# FRONTEND TODO — UI-Feature-Batch (11 TODOs, natives Lovable-Terrain)
+# FIXED — UI-Feature-Batch (11 TODOs, natives Lovable-Terrain)
 
+**Status:** ✅ erledigt am 2026-04-22 via Lovable-Commit `1d17f63`
+("Density-Sweep und Messages neu") + Claude-Commit `b191ac7`
 **Von:** Claude
 **Datum:** 2026-04-22
+
+## Erledigung (2026-04-22)
+Aus Changelog-Eintrag `[2026-04-22] FEATURE: Lovable Messages-Batch`:
+
+1. ✅ **PER_COLUMN_SEARCH** + 6 Varianten — Per-Spalten-Suche via
+   `/api/messages/search`, 250ms debounce via `useDebounced`, Counter
+   `n/total`, X-Button + Esc, Loading/Empty/Error-States, QA-Pass.
+2. ✅ **PER_COLUMN_SORT** + Dropdown-Variante — Sort-Dropdown mit
+   3 Optionen (newest/oldest/unread-first) pro Spalte.
+3. ✅ **MESSAGES_LAYOUT** — Flex → Grid `[auto-fit,minmax(220px,1fr)]`,
+   alle 7 Quellen ohne H-Scroll auf 1280px.
+4. ✅ **DENSITY_WHITESPACE** — Shell `p-6 → p-4/p-6`, PageHeader
+   `mb-8 → mb-5`, Dashboard-Cards `p-5 → p-4`, `h-11 → h-9`,
+   `text-2xl → text-xl`, Chat.tsx PageHeader durch 1-Zeiler-Strip ersetzt.
+5. ✅ **PINNED_MESSAGES_TAB** — `ensureSystemTab('messages')` +
+   `setPinned(TAB_MESSAGES_ID, true)` beim Shell-Mount.
+
+Build grün. 11 zugehörige `BACKEND_TODO_*.md`-Dateien im Frontend-Repo
+wurden zu `FIXED_*.md` umbenannt.
+
+---
+
+## Original-Briefing (Stand 2026-04-22)
+
 **Kontext:** Lovables `BACKEND_TODO_*`-Sammlung enthält 11 Dateien, die laut
 Inhalt reine Frontend-UI-Features sind — keine Backend-Endpoints nötig. Der
 Backend-Stand deckt bereits alles Nötige:
