@@ -1781,30 +1781,65 @@ def send_whatsapp_draft(spec, agent_name=None):
         except Exception:
             pass
 
-    # Step 3: Look up in macOS Contacts app via AppleScript
+    # Step 3: Look up in macOS Contacts app via AppleScript.
+    # WICHTIG: Wir holen ALLE Treffer und entscheiden in Python mit Best-Match-
+    # Logik — vorher hat `item 1 of matchedPeople` einfach den ersten
+    # alphabetischen Treffer genommen, was bei "Renata" -> ["Renata Rufino",
+    # "Renata Argolo", ...] die FALSCHE Person erwischt hat.
     if not phone and to_name:
         try:
-            script = f"""
+            # to_name-AppleScript-escape: doppelte Anfuehrungszeichen + backslash
+            esc_name = to_name.replace('\\', '\\\\').replace('"', '\\"')
+            script = f'''
             tell application "Contacts"
-                set matchedPeople to every person whose name contains "{to_name}"
-                if (count of matchedPeople) > 0 then
-                    set thePerson to item 1 of matchedPeople
-                    set thePhones to phones of thePerson
-                    if (count of thePhones) > 0 then
-                        set theNumber to value of item 1 of thePhones
-                        return theNumber
+                set out to ""
+                set matchedPeople to every person whose name contains "{esc_name}"
+                repeat with p in matchedPeople
+                    set nm to name of p
+                    set phs to phones of p
+                    if (count of phs) > 0 then
+                        set num to value of item 1 of phs
+                        set out to out & nm & "\\t" & num & linefeed
                     end if
-                end if
-                return ""
+                end repeat
+                return out
             end tell
-            """
+            '''
             result = subprocess.run(
                 ['osascript', '-e', script],
                 capture_output=True, text=True, timeout=10
             )
-            found_phone = result.stdout.strip()
-            if found_phone and _is_real_phone(found_phone):
-                phone = found_phone
+            # Parse Output (eine Zeile pro Treffer: "Name\tPhone")
+            candidates = []  # (name, phone)
+            for line in (result.stdout or '').splitlines():
+                if '\t' not in line:
+                    continue
+                nm, ph = line.split('\t', 1)
+                nm = nm.strip()
+                ph = ph.strip()
+                if nm and ph and _is_real_phone(ph):
+                    candidates.append((nm, ph))
+            target_lower = to_name.lower()
+            picked = None
+            if candidates:
+                # 1) Exakter Name-Match — bevorzugt mit Phone
+                exact = [c for c in candidates if c[0].lower() == target_lower]
+                if exact:
+                    picked = exact[0]
+                # 2) Genau EIN Treffer ueberhaupt — eindeutig
+                elif len(candidates) == 1:
+                    picked = candidates[0]
+                # 3) Mehrere Treffer + kein Exact-Match -> ambiguous,
+                #    NICHT blind auswaehlen (das war der Renata-Bug).
+                else:
+                    print(
+                        f"[WHATSAPP] Mehrdeutige Contact-Suche fuer {to_name!r}: "
+                        f"{len(candidates)} Treffer ({', '.join(c[0] for c in candidates[:5])}) "
+                        f"-> Clipboard-Fallback statt Falsch-Match",
+                        flush=True,
+                    )
+            if picked:
+                phone = picked[1]
         except Exception:
             pass
 
@@ -11072,6 +11107,14 @@ def process_single_message(msg, kontext_override=None, state=None, **kwargs):
     auto_search_info = kwargs.get('auto_search_info_override', '')
     if auto_loaded_names or auto_search_info:
         pass  # Overrides provided — skip auto-search
+    elif state.get('source_conversation_id'):
+        # Reply-Session — der vollstaendige Konversations-Kontext wurde schon
+        # bei Session-Start ins initial_messages-Array gepackt. auto_search
+        # wuerde hier irrelevante Memory-Files dazuziehen und das LLM
+        # verwirren (Bug 2026-04-25: Renata-Reply zeigte plotzlich PayPal-
+        # Mails als Kontext). Skippen.
+        print(f"[AUTO-SEARCH] Skipped — reply session "
+              f"(source={state.get('source_conversation_id')!r})", flush=True)
     elif auto_search and state.get('speicher'):
         try:
             # Dedup against files already pinned in working memory so we don't
@@ -11508,6 +11551,29 @@ def process_single_message(msg, kontext_override=None, state=None, **kwargs):
                 try:
                     wspec = json.loads(json_str)
                     agent_name = state.get('agent', 'standard')
+                    # Reply-Session: wenn die Session aus einer aktiven WhatsApp-
+                    # Konversation gestartet wurde (source_type=whatsapp), nutze
+                    # den vollstaendigen Kontaktnamen aus der Konversation als
+                    # to_name — uebersteuert die Halluzination des LLMs (z.B.
+                    # "Renata" statt "Renata Argolo"). Phone aus der Konversation
+                    # wird im Lookup priorisiert.
+                    src_type = state.get('source_type')
+                    src_conv = state.get('source_conversation_id', '')
+                    if src_type == 'whatsapp' and src_conv:
+                        # conversation_id-Format = "wa:<contact_name>"
+                        true_contact = src_conv[3:] if src_conv.startswith('wa:') else (
+                            state.get('source_contact_name') or '')
+                        spec_to = (wspec.get('to') or '').strip()
+                        # Override wenn LLM nur Vorname/Teilstring genutzt hat
+                        # ODER wenn gar kein to gesetzt ist
+                        if true_contact and (not spec_to
+                                or spec_to.lower() in true_contact.lower()
+                                or true_contact.lower() in spec_to.lower()):
+                            wspec['to'] = true_contact
+                        # Phone nicht mehr halluziniert akzeptieren — wir machen
+                        # den Lookup mit dem korrekten Vollnamen
+                        if 'phone' in wspec and not _is_real_phone(wspec.get('phone')):
+                            wspec.pop('phone', None)
                     wa_to, wa_phone = send_whatsapp_draft(wspec, agent_name)
                     created_whatsapps.append({'ok': True, 'to': wa_to, 'phone': wa_phone, 'clipboard_fallback': wa_phone is None})
                     marker = f'\n[WhatsApp an {wa_to} vorbereitet — Aktion ausgefuehrt]\n'
@@ -16009,9 +16075,16 @@ def api_agent_sessions(agent):
     src_kind = body.get("source_kind") or "chat_conversation"
     initial_draft = body.get("initial_draft") or ""
 
-    # Neue Session-ID anlegen (zufaellig)
+    # Neue Session-ID anlegen (zufaellig). WICHTIG: Wir legen die Session-State
+    # direkt mit source_*-Feldern an, damit nachfolgende CREATE_WHATSAPP-Actions
+    # wissen, in welcher Konversation sie wirklich sind — sonst waehlt der Agent
+    # nur per LLM-Halluzination einen `to`-Namen, der dann beim Lookup gegen
+    # macOS-Contacts den falschen Treffer liefert.
     import uuid
     session_id = f"sess_{uuid.uuid4().hex[:12]}"
+    state = get_session(session_id)
+    state['agent'] = agent
+    state['speicher'] = get_agent_speicher(agent)
 
     initial_messages = []
     if intent == "reply_to_message" and src_msg_id:
@@ -16023,6 +16096,13 @@ def api_agent_sessions(agent):
             target = None
         if target:
             conv_id = target.get("conversation_id") or src_msg_id
+            # Persist source-info im Session-State — das ist die Quelle der
+            # Wahrheit fuer alle folgenden Reply-Actions in dieser Session.
+            state['source_message_id'] = src_msg_id
+            state['source_conversation_id'] = conv_id
+            state['source_kind'] = src_kind
+            state['source_type'] = target.get('type')  # 'whatsapp' | 'email' | 'imessage' | 'kchat'
+            state['source_contact_name'] = target.get('sender_name') or ''
             thread_msgs = [m for m in messages
                            if (m.get("conversation_id") or m.get("id")) == conv_id]
             thread_msgs.sort(key=lambda m: m.get("timestamp_epoch", 0))

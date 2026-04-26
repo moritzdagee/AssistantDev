@@ -4369,6 +4369,43 @@ except Exception as _e:
     test("API-Gaps grep", False, str(_e))
 
 
+section("WhatsApp Contact Disambiguation 2026-04-25")
+
+try:
+    with open(os.path.expanduser("~/AssistantDev/src/web_server.py")) as _f:
+        _ws = _f.read()
+
+    # Session-State persistiert source_*-Felder
+    test("api_agent_sessions schreibt source_conversation_id in state",
+         "state['source_conversation_id'] = conv_id" in _ws)
+    test("api_agent_sessions schreibt source_type in state",
+         "state['source_type'] = target.get('type')" in _ws)
+    test("api_agent_sessions ruft get_session(session_id) auf",
+         "state = get_session(session_id)" in _ws)
+
+    # CREATE_WHATSAPP nutzt source_conversation_id
+    test("CREATE_WHATSAPP override to-Name aus source_conversation_id",
+         "src_conv = state.get('source_conversation_id'" in _ws and
+         "wspec['to'] = true_contact" in _ws)
+    test("CREATE_WHATSAPP entfernt halluzinierte phone-Werte",
+         "wspec.pop('phone', None)" in _ws)
+
+    # Best-Match Lookup (mehrdeutig -> Clipboard-Fallback)
+    test("AppleScript-Lookup sammelt ALLE Treffer (nicht item 1)",
+         "out & nm & \"\\\\t\" & num & linefeed" in _ws or
+         'out & nm & "\\\\t" & num' in _ws)
+    test("Best-Match: exakter Name bevorzugt",
+         "c[0].lower() == target_lower" in _ws)
+    test("Mehrdeutigkeit -> Clipboard-Fallback statt erste nehmen",
+         "Mehrdeutige Contact-Suche" in _ws)
+
+    # auto_search skip in Reply-Sessions
+    test("auto_search wird in Reply-Session geskippt",
+         "Reply-Session" in _ws or "reply session" in _ws)
+except Exception as _e:
+    test("WhatsApp-Disambiguation grep", False, str(_e))
+
+
 section("WhatsApp + Conversations Cleanup 2026-04-25")
 
 try:
@@ -4382,8 +4419,8 @@ try:
          "Spec.phone" in _ws and "Placeholder" in _ws)
     test("Lookup-Phones gegen _is_real_phone gepruft",
          _ws.count("_is_real_phone(c['phone'])") >= 2)
-    test("found_phone via AppleScript ebenfalls validiert",
-         "_is_real_phone(found_phone)" in _ws)
+    test("AppleScript-Phones werden ueber _is_real_phone gefiltert",
+         "if nm and ph and _is_real_phone(ph):" in _ws)
     test("letzte Verteidigung vor whatsapp:// Aufruf",
          "fails sanity check" in _ws)
 
