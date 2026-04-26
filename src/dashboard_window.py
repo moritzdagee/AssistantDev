@@ -73,11 +73,11 @@ window = webview.create_window(
     text_select=True,
 )
 
-# DevTools im nativen Fenster: per ENV an/aus. Default: AN (debug=True),
-# weil JS-Runtime-Fehler sonst weder von curl noch von den Python-Unit-Tests
-# gefunden werden und zu schwarzen Fenstern fuehren ohne erkennbare Ursache.
-# Rechtsklick im Fenster -> "Element untersuchen" oeffnet den Inspector.
-_DEBUG = os.environ.get("ASSISTANTDEV_WEBVIEW_DEBUG", "1") != "0"
+# DevTools im nativen Fenster: per ENV an/aus. Default: AUS — der User
+# soll eine saubere App ohne automatisch geoeffnete Konsole sehen.
+# Zum Aktivieren: ASSISTANTDEV_WEBVIEW_DEBUG=1 setzen, oder im Fenster
+# Rechtsklick -> "Element untersuchen" (Inspector kommt auch ohne Debug-Mode).
+_DEBUG = os.environ.get("ASSISTANTDEV_WEBVIEW_DEBUG", "0") != "0"
 
 webview.start(
     debug=_DEBUG,
