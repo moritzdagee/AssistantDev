@@ -13,7 +13,7 @@ try:
 except ImportError:
     pass
 
-VALID_PROVIDERS = {'anthropic', 'openai', 'mistral', 'gemini', 'perplexity'}
+VALID_PROVIDERS = {'anthropic', 'openai', 'mistral', 'gemini', 'perplexity', 'deepseek', 'ollama'}
 
 PENDING_MARKER = '[ANTWORT AUSSTEHEND - Server-Neustart hat diese Antwort unterbrochen]'
 RECOVERY_MARKER = '[Antwort verloren - Server wurde neu gestartet]'
@@ -724,6 +724,25 @@ def call_openai(api_key, model_id, system_prompt, messages):
     r = client.chat.completions.create(model=model_id, messages=oai_messages, max_tokens=4096)
     return r.choices[0].message.content
 
+def call_deepseek(api_key, model_id, system_prompt, messages):
+    # V4-Modelle sind Reasoning-Modelle und brauchen viel Platz für intern abgelaufenes Reasoning
+    # bevor sie 'content' liefern. Bei zu kleinem max_tokens kommt content='' zurueck.
+    import openai
+    client = openai.OpenAI(api_key=api_key, base_url="https://api.deepseek.com/v1")
+    ds_messages = [{"role": "system", "content": system_prompt}] + messages
+    r = client.chat.completions.create(model=model_id, messages=ds_messages, max_tokens=8000)
+    return r.choices[0].message.content
+
+def call_ollama(api_key, model_id, system_prompt, messages):
+    import openai
+    client = openai.OpenAI(
+        api_key=api_key or "ollama-local",
+        base_url="http://127.0.0.1:11434/v1",
+    )
+    ollama_messages = [{"role": "system", "content": system_prompt}] + messages
+    r = client.chat.completions.create(model=model_id, messages=ollama_messages, max_tokens=4096)
+    return r.choices[0].message.content
+
 def call_perplexity(api_key, model_id, system_prompt, messages):
     import requests as _pplx_req
     from requests.exceptions import ReadTimeout, ConnectionError as ReqConnectionError
@@ -866,6 +885,8 @@ PROVIDER_DISPLAY = {
     'mistral': 'Mistral',
     'gemini': 'Google',
     'perplexity': 'Perplexity',
+    'deepseek': 'DeepSeek',
+    'ollama': 'Ollama (lokal)',
 }
 
 # Human-readable model names
@@ -895,9 +916,15 @@ MODEL_DISPLAY = {
     'sonar-reasoning': 'Sonar Reasoning',
     'sonar-reasoning-pro': 'Sonar Reasoning Pro',
     'sonar-deep-research': 'Sonar Deep Research',
+    'deepseek-v4-pro': 'DeepSeek V4 Pro',
+    'deepseek-v4-flash': 'DeepSeek V4 Flash',
+    'deepseek-chat': 'DeepSeek Chat (legacy)',
+    'deepseek-reasoner': 'DeepSeek Reasoner (legacy)',
+    'deepseek-r1:8b': 'DeepSeek R1 (lokal, 8B)',
+    'deepseek-r1:14b': 'DeepSeek R1 (lokal, 14B)',
 }
 
-ADAPTERS = {"anthropic": call_anthropic, "openai": call_openai, "perplexity": call_perplexity, "mistral": call_mistral, "gemini": call_gemini}
+ADAPTERS = {"anthropic": call_anthropic, "openai": call_openai, "perplexity": call_perplexity, "mistral": call_mistral, "gemini": call_gemini, "deepseek": call_deepseek, "ollama": call_ollama}
 
 # ─── STATE (see session-based state below) ────────────────────────────────────
 
@@ -2141,6 +2168,25 @@ def call_openai(api_key, model_id, system_prompt, messages):
     r = client.chat.completions.create(model=model_id, messages=oai_messages, max_tokens=4096)
     return r.choices[0].message.content
 
+def call_deepseek(api_key, model_id, system_prompt, messages):
+    # V4-Modelle sind Reasoning-Modelle und brauchen viel Platz für intern abgelaufenes Reasoning
+    # bevor sie 'content' liefern. Bei zu kleinem max_tokens kommt content='' zurueck.
+    import openai
+    client = openai.OpenAI(api_key=api_key, base_url="https://api.deepseek.com/v1")
+    ds_messages = [{"role": "system", "content": system_prompt}] + messages
+    r = client.chat.completions.create(model=model_id, messages=ds_messages, max_tokens=8000)
+    return r.choices[0].message.content
+
+def call_ollama(api_key, model_id, system_prompt, messages):
+    import openai
+    client = openai.OpenAI(
+        api_key=api_key or "ollama-local",
+        base_url="http://127.0.0.1:11434/v1",
+    )
+    ollama_messages = [{"role": "system", "content": system_prompt}] + messages
+    r = client.chat.completions.create(model=model_id, messages=ollama_messages, max_tokens=4096)
+    return r.choices[0].message.content
+
 def call_perplexity(api_key, model_id, system_prompt, messages):
     import requests as _pplx_req
     from requests.exceptions import ReadTimeout, ConnectionError as ReqConnectionError
@@ -2276,7 +2322,7 @@ def call_gemini(api_key, model_id, system_prompt, messages):
     except requests.exceptions.Timeout:
         raise Exception("Gemini API Timeout (120s)")
 
-ADAPTERS = {"anthropic": call_anthropic, "openai": call_openai, "perplexity": call_perplexity, "mistral": call_mistral, "gemini": call_gemini}
+ADAPTERS = {"anthropic": call_anthropic, "openai": call_openai, "perplexity": call_perplexity, "mistral": call_mistral, "gemini": call_gemini, "deepseek": call_deepseek, "ollama": call_ollama}
 
 # ─── IMAGE & VIDEO GENERATION ────────────────────────────────────────────────
 

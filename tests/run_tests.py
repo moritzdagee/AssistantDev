@@ -4369,6 +4369,70 @@ except Exception as _e:
     test("API-Gaps grep", False, str(_e))
 
 
+section("DeepSeek + Ollama Provider 2026-04-25")
+
+try:
+    with open(os.path.expanduser("~/AssistantDev/src/web_server.py")) as _f:
+        _ws = _f.read()
+
+    test("VALID_PROVIDERS enthaelt 'deepseek'",
+         "'deepseek'" in _ws and "VALID_PROVIDERS = {" in _ws)
+    test("VALID_PROVIDERS enthaelt 'ollama'",
+         "'ollama'" in _ws and "VALID_PROVIDERS = {" in _ws)
+
+    test("call_deepseek-Adapter definiert",
+         "def call_deepseek(api_key, model_id, system_prompt, messages):" in _ws)
+    test("call_ollama-Adapter definiert",
+         "def call_ollama(api_key, model_id, system_prompt, messages):" in _ws)
+
+    test("call_deepseek nutzt api.deepseek.com",
+         "https://api.deepseek.com/v1" in _ws)
+    test("call_ollama nutzt 127.0.0.1:11434",
+         "http://127.0.0.1:11434/v1" in _ws)
+
+    test("ADAPTERS dict mappt 'deepseek'",
+         '"deepseek": call_deepseek' in _ws)
+    test("ADAPTERS dict mappt 'ollama'",
+         '"ollama": call_ollama' in _ws)
+
+    test("PROVIDER_DISPLAY hat 'DeepSeek'",
+         "'deepseek': 'DeepSeek'" in _ws)
+    test("PROVIDER_DISPLAY hat 'Ollama (lokal)'",
+         "'ollama': 'Ollama (lokal)'" in _ws)
+
+    test("MODEL_DISPLAY hat deepseek-v4-pro",
+         "'deepseek-v4-pro':" in _ws)
+    test("MODEL_DISPLAY hat deepseek-v4-flash",
+         "'deepseek-v4-flash':" in _ws)
+    test("MODEL_DISPLAY hat deepseek-r1:8b",
+         "'deepseek-r1:8b':" in _ws)
+except Exception as _e:
+    test("DeepSeek+Ollama grep", False, str(_e))
+
+# Optional: models.json hat die neuen Provider (datei liegt im iCloud-Datalake)
+try:
+    _models_path = os.path.expanduser(
+        "~/Library/Mobile Documents/com~apple~CloudDocs/Downloads shared/claude_datalake/config/models.json"
+    )
+    if os.path.exists(_models_path):
+        with open(_models_path) as _f:
+            _models = json.load(_f)
+        _provs = _models.get('providers', {})
+        test("models.json: deepseek-Provider eingetragen", 'deepseek' in _provs)
+        test("models.json: ollama-Provider eingetragen", 'ollama' in _provs)
+        if 'deepseek' in _provs:
+            _ds_models = [m['id'] for m in _provs['deepseek'].get('models', [])]
+            test("models.json: deepseek-v4-flash gelistet", 'deepseek-v4-flash' in _ds_models)
+            test("models.json: deepseek-v4-pro gelistet", 'deepseek-v4-pro' in _ds_models)
+        if 'ollama' in _provs:
+            _ol_models = [m['id'] for m in _provs['ollama'].get('models', [])]
+            test("models.json: deepseek-r1:8b in ollama-Provider", 'deepseek-r1:8b' in _ol_models)
+            test("models.json: ollama base_url localhost",
+                 _provs['ollama'].get('base_url', '').startswith('http://127.0.0.1:11434'))
+except Exception as _e:
+    test("models.json check", False, str(_e))
+
+
 _cleanup_test_artifacts()
 
 # ============================================================
