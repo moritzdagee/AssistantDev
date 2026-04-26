@@ -17335,6 +17335,8 @@ if __name__ == '__main__':
             tick += 1
             time.sleep(300)  # Every 5 minutes
     threading.Thread(target=index_update_loop, daemon=True).start()
-    print('\nAssistant Web Interface laeuft auf http://localhost:8080')
+    # Port via ENV ueberschreibbar — Stable laeuft auf 8090, Beta default 8080.
+    _port = int(os.environ.get('ASSISTANTDEV_PORT', '8080'))
+    print(f'\nAssistant Web Interface laeuft auf http://localhost:{_port}')
     print('Zum Beenden: Control+C\n')
-    app.run(host='127.0.0.1', port=8080, debug=False)
+    app.run(host='127.0.0.1', port=_port, debug=False)

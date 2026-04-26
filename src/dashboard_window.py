@@ -33,7 +33,10 @@ except Exception:
 
 # ── URL bestimmen ────────────────────────────────────────────────────────────
 
-BASE_URL = "http://localhost:8080"
+# Port via ENV ueberschreibbar — Stable laeuft auf 8090, Beta auf 8080.
+# (Konsistent mit src/web_server.py:ASSISTANTDEV_PORT.)
+_PORT = os.environ.get("ASSISTANTDEV_PORT", "8080")
+BASE_URL = f"http://localhost:{_PORT}"
 
 # Default-Route:
 # • Wenn frontend/dist/index.html existiert → /app  (neue React-SPA)
