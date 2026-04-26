@@ -1709,6 +1709,23 @@ end tell'''
         raise Exception(f"AppleScript Fehler: {result.stderr.strip()}")
     return True
 
+def _is_real_phone(phone):
+    """True wenn `phone` plausibel ist (>=8 Ziffern, keine offensichtliche
+    Platzhalter-Sequenz wie +490000000000 oder 0000000000). LLMs
+    halluzinieren gerne Dummy-Nummern, wenn sie keine echte kennen — die
+    sortieren wir hier raus, BEVOR wir WhatsApp damit aufrufen."""
+    if not phone or not str(phone).strip():
+        return False
+    digits = re.sub(r'\D', '', str(phone))
+    if len(digits) < 8:
+        return False
+    # 6+ aufeinanderfolgende Nullen sind ein verlaesslicher Placeholder-Indikator
+    # (echte Mobilnummern haben bestenfalls 2-3 Nullen am Stueck).
+    if re.search(r'0{6,}', digits):
+        return False
+    return True
+
+
 def send_whatsapp_draft(spec, agent_name=None):
     """Opens WhatsApp with a pre-filled message. Looks up phone in contacts.json, then macOS Contacts."""
     import subprocess
@@ -1717,6 +1734,11 @@ def send_whatsapp_draft(spec, agent_name=None):
     to_name = spec.get('to', '')
     message = spec.get('message', '')
     phone = spec.get('phone', '')  # Optional direct phone
+    # LLM-Halluzinations-Schutz: wenn die Nummer offensichtlich Dummy ist
+    # (+490000000000 etc.), verwerfen wir sie und gehen ueber den Lookup.
+    if phone and not _is_real_phone(phone):
+        print(f"[WHATSAPP] Spec.phone {phone!r} ist Placeholder — Lookup-Fallback", flush=True)
+        phone = ''
 
     # Step 1: Look up in agent's contacts.json
     if not phone and to_name and agent_name:
@@ -1730,7 +1752,7 @@ def send_whatsapp_draft(spec, agent_name=None):
                 for c in cdata.get('contacts', []):
                     cname = (c.get('name') or '').lower()
                     if to_lower in cname or cname in to_lower:
-                        if c.get('phone'):
+                        if c.get('phone') and _is_real_phone(c['phone']):
                             phone = c['phone']
                             break
             except Exception:
@@ -1749,7 +1771,7 @@ def send_whatsapp_draft(spec, agent_name=None):
                         for c in cdata.get('contacts', []):
                             cname = (c.get('name') or '').lower()
                             if to_lower in cname or cname in to_lower:
-                                if c.get('phone'):
+                                if c.get('phone') and _is_real_phone(c['phone']):
                                     phone = c['phone']
                                     break
                     except Exception:
@@ -1781,10 +1803,16 @@ def send_whatsapp_draft(spec, agent_name=None):
                 capture_output=True, text=True, timeout=10
             )
             found_phone = result.stdout.strip()
-            if found_phone:
+            if found_phone and _is_real_phone(found_phone):
                 phone = found_phone
         except Exception:
             pass
+
+    # Letzte Verteidigung: falls hier irgendetwas durchgekommen ist, das wie
+    # ein Placeholder aussieht — nicht WhatsApp damit aufrufen.
+    if phone and not _is_real_phone(phone):
+        print(f"[WHATSAPP] resolved phone {phone!r} fails sanity check — clipboard fallback", flush=True)
+        phone = ''
 
     if not phone:
         # Fallback: copy message to clipboard and just open WhatsApp
@@ -8563,14 +8591,17 @@ def api_conversations():
             full = os.path.join(speicher, fn)
             try:
                 stat = os.stat(full)
+                # Volles File lesen — ohne ist message_count nur die ersten 2KB
+                # gross, was bei Sessions mit langen Antworten falsch ist
+                # (CONVERSATION_CLEANUP).
                 with open(full, encoding='utf-8', errors='replace') as fh:
-                    head = fh.read(2000)
+                    full_text = fh.read()
             except OSError:
                 continue
             # Title: erste Zeile des Files, oder erste User-Message, oder Filename-Date
             title = ''
             first_user = ''
-            for line in head.split('\n'):
+            for line in full_text.split('\n'):
                 if not title and line.strip() and not line.startswith('['):
                     title = line.strip()[:120]
                 if line.startswith('Du: ') and not first_user:
@@ -8581,10 +8612,13 @@ def api_conversations():
                 # Ableitung aus Filename "konversation_2026-04-22_18-30-12_<agent>"
                 parts = fn.replace('.txt', '').split('_')
                 title = f'{parts[1]} {parts[2].replace("-", ":")}' if len(parts) >= 3 else fn
-            # Approx message count: zaehle "Du: " + "Assistant: " ohne ganzes Parsen
-            msg_count = head.count('Du: ') + head.count('Assistant: ')
+            # Accurate counts ueber das volle File (CONVERSATION_CLEANUP).
+            user_count = full_text.count('Du: ')
+            assistant_count = full_text.count('Assistant: ')
+            msg_count = user_count + assistant_count
             mtime_iso = datetime.datetime.fromtimestamp(stat.st_mtime).isoformat()
-            preview = (first_user or head.replace('\n', ' ').strip())[:160]
+            ctime_iso = datetime.datetime.fromtimestamp(stat.st_ctime).isoformat()
+            preview = (first_user or full_text[:1000].replace('\n', ' ').strip())[:160]
             result.append({
                 'id': fn.replace('.txt', ''),
                 'agent': name,
@@ -8593,7 +8627,9 @@ def api_conversations():
                 'updated_at': mtime_iso,
                 'updatedAt': mtime_iso,
                 'last_message_at': mtime_iso,
+                'created_at': ctime_iso,  # NEU (CONVERSATION_CLEANUP)
                 'message_count': msg_count,
+                'user_message_count': user_count,  # NEU (CONVERSATION_CLEANUP)
                 # Legacy-Felder
                 'file': fn,
                 'modified': mtime_iso,
@@ -8637,6 +8673,43 @@ def api_conversations_messages(conv_id):
         ]
         return jsonify({'id': conv_id, 'agent': name, 'messages': messages})
     return jsonify({'error': 'conversation not found'}), 404
+
+
+@app.route('/api/conversations/<conv_id>', methods=['DELETE'])
+def api_conversation_delete(conv_id):
+    """Soft-Delete einer Konversation (CONVERSATION_CLEANUP).
+
+    Benennt das File um in `<file>.deleted_<unix_ts>` — niemals echtes
+    Loeschen (CLAUDE.md-Konvention). Listing filtert .deleted_* aus.
+    Body optional: {agent: 'privat'} — wenn gesetzt, wird nur dort gesucht.
+    """
+    fn = conv_id + '.txt'
+    body = request.get_json(silent=True) or {}
+    agent_hint = (body.get('agent') or '').strip()
+    agent_names = [agent_hint] if agent_hint else [
+        f.replace('.txt', '') for f in os.listdir(AGENTS_DIR)
+        if f.endswith('.txt') and '.backup_' not in f and '.deleted_' not in f
+    ]
+    for name in agent_names:
+        speicher = get_agent_speicher(name)
+        if not speicher:
+            continue
+        full = os.path.join(speicher, fn)
+        if not os.path.isfile(full):
+            continue
+        ts = int(_msgd_time.time())
+        target = full + f".deleted_{ts}"
+        try:
+            os.rename(full, target)
+        except OSError as e:
+            return jsonify({'ok': False, 'error': str(e)}), 500
+        return jsonify({
+            'ok': True,
+            'id': conv_id,
+            'agent': name,
+            'archived_path': os.path.basename(target),
+        })
+    return jsonify({'ok': False, 'error': 'conversation not found'}), 404
 
 
 # ═════════════════════════════════════════════════════════════════════════
@@ -14420,8 +14493,7 @@ def _msg_parse_whatsapp_messages(fpath, fname, source_key, agent_name,
             rest = line[line.index("]")+1:].strip()
         except Exception:
             continue
-        if rest.startswith("Ich:"):
-            continue  # eigene ausgehende Messages skippen
+        is_own = rest.startswith("Ich:")
         # Timestamp parsen
         try:
             dt = datetime.datetime.strptime(ts_str, "%Y-%m-%d %H:%M")
@@ -14439,10 +14511,18 @@ def _msg_parse_whatsapp_messages(fpath, fname, source_key, agent_name,
             sender, text = rest, ""
         # Hash-Sender-Flag (fuer spaetere UI-Entscheidung)
         sender_is_hash = bool(_is_hash_sender.match(rest))
-        display_sender = contact or sender
+        # display_sender bei Hash-Senders auf Kontakt-Name fallback,
+        # sodass die Nachricht im Listing nicht mit "CN+ptc8GIA..."-Prefix
+        # erscheint (CHAT_THREAD_OWN_MESSAGES Bonus-Punkt).
+        if is_own:
+            display_sender = "Ich"
+        elif sender_is_hash:
+            display_sender = contact or "WhatsApp"
+        else:
+            display_sender = contact or sender
         preview = text[:150] + ("..." if len(text) > 150 else "")
         # Eindeutige ID: File-hash + timestamp + laufender Zeilen-Index
-        seed = f"{fpath}|{dt.isoformat()}|{text[:80]}"
+        seed = f"{fpath}|{dt.isoformat()}|{text[:80]}|{'sent' if is_own else 'recv'}"
         mid = _hl.sha1(seed.encode('utf-8', errors='replace')).hexdigest()[:16]
         messages.append({
             "id": mid,
@@ -14456,7 +14536,7 @@ def _msg_parse_whatsapp_messages(fpath, fname, source_key, agent_name,
             "full_content": "",  # Wird erst bei Detail-Request geladen
             "timestamp": dt.isoformat(),
             "timestamp_epoch": dt.timestamp(),
-            "read": False,
+            "read": True if is_own else False,  # eigene als gelesen
             "has_attachments": any(tag in text for tag in ("[Bild]", "[Video]", "[Sprachnachricht]", "[Dokument]")),
             "attachments": [],
             "raw_file_path": fpath,
@@ -14466,6 +14546,7 @@ def _msg_parse_whatsapp_messages(fpath, fname, source_key, agent_name,
             "is_archived": is_archived,
             "conversation_id": f"wa:{contact or fname}",
             "sender_is_hash": sender_is_hash,
+            "is_own": is_own,  # CHAT_THREAD_OWN_MESSAGES: explizites Flag
         })
 
     # Juengste zuerst + limit
@@ -15158,8 +15239,10 @@ def _msg_is_sent_by_user(m):
     weitere Infos. Rueckgabe False = "behandle als received" (sicherer Default).
     """
     # Source-Feld kennzeichnet typischerweise den Inbox-Typ, nicht die Richtung
-    # Wenn 'from_me' oder 'is_sent' im Message-Dict enthalten ist, nutzen wir das
-    if m.get('from_me') or m.get('is_sent') or m.get('direction') == 'sent':
+    # Wenn 'from_me'/'is_sent'/'is_own' im Message-Dict enthalten ist, nutzen wir das.
+    # WhatsApp-Parser setzt is_own=True fuer "Ich:"-Zeilen (CHAT_THREAD_OWN_MESSAGES).
+    if (m.get('from_me') or m.get('is_sent')
+            or m.get('is_own') or m.get('direction') == 'sent'):
         return True
     # email_*-Sources haben sender=nicht-User, also received
     return False
@@ -15234,8 +15317,13 @@ def api_messages():
     # ── direction-Filter ─────────────────────────────────────────────────
     direction = (request.args.get("direction") or "").lower()
     if not direction:
-        # Default: received fuer email, all sonst
-        if source_filter and source_filter.startswith("email"):
+        # Default: received fuer email + chat (whatsapp/imessage/kchat) — Inbox
+        # zeigt eingehende Nachrichten, eigene gibt's nur explizit via direction=sent
+        # oder im Thread-Endpoint. Fuer 'all'-Inbox direction=all setzen.
+        if source_filter and (
+            source_filter.startswith("email") or
+            source_filter in ("whatsapp", "imessage", "kchat")
+        ):
             direction = "received"
         else:
             direction = "all"

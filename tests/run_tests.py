@@ -4369,6 +4369,51 @@ except Exception as _e:
     test("API-Gaps grep", False, str(_e))
 
 
+section("WhatsApp + Conversations Cleanup 2026-04-25")
+
+try:
+    with open(os.path.expanduser("~/AssistantDev/src/web_server.py")) as _f:
+        _ws = _f.read()
+
+    # PLACEHOLDER_NUMBER
+    test("_is_real_phone-Helper definiert",
+         "def _is_real_phone(phone):" in _ws)
+    test("send_whatsapp_draft validiert spec.phone",
+         "Spec.phone" in _ws and "Placeholder" in _ws)
+    test("Lookup-Phones gegen _is_real_phone gepruft",
+         _ws.count("_is_real_phone(c['phone'])") >= 2)
+    test("found_phone via AppleScript ebenfalls validiert",
+         "_is_real_phone(found_phone)" in _ws)
+    test("letzte Verteidigung vor whatsapp:// Aufruf",
+         "fails sanity check" in _ws)
+
+    # CHAT_THREAD_OWN_MESSAGES
+    test("WhatsApp-Parser skippt 'Ich:' nicht mehr",
+         "is_own = rest.startswith(\"Ich:\")" in _ws)
+    test("Hash-Sender wird nicht als sender_name geleakt",
+         "display_sender = contact or \"WhatsApp\"" in _ws)
+    test("WhatsApp-Message hat is_own-Flag",
+         "\"is_own\": is_own" in _ws)
+    test("_msg_is_sent_by_user respektiert is_own",
+         "m.get('is_own')" in _ws)
+    test("Default-direction fuer chat-Sources auf 'received'",
+         "(\"whatsapp\", \"imessage\", \"kchat\")" in _ws)
+
+    # CONVERSATION_CLEANUP
+    test("/api/conversations liest volles File",
+         "full_text = fh.read()" in _ws and "CONVERSATION_CLEANUP" in _ws)
+    test("user_message_count im Listing",
+         "'user_message_count': user_count" in _ws)
+    test("created_at im Listing",
+         "'created_at': ctime_iso" in _ws)
+    test("DELETE /api/conversations/<id> registered",
+         "@app.route('/api/conversations/<conv_id>', methods=['DELETE'])" in _ws)
+    test("Soft-Delete via .deleted_<ts>",
+         '".deleted_{ts}"' in _ws or 'f".deleted_{ts}"' in _ws)
+except Exception as _e:
+    test("WhatsApp+Conv-Cleanup grep", False, str(_e))
+
+
 section("DeepSeek + Ollama Provider 2026-04-25")
 
 try:
