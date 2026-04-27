@@ -50,6 +50,31 @@ except Exception as _ule:
     print(f"[usage_logger] Import fehlgeschlagen: {_ule}", flush=True)
     _usage_logger = None
 
+# Skill-Database + Benchmark-Fetcher (Feature 4 — Roadmap April 2026)
+# Beim Server-Start: Bootstrap der DB aus models.json (idempotent).
+# Wochen-Scheduler im Hintergrund.
+try:
+    import skill_database as _skill_db
+    try:
+        _skill_db.bootstrap_from_models()
+        print("[skill_database] Bootstrap OK", flush=True)
+    except Exception as _sde:
+        print(f"[skill_database] Bootstrap fehlgeschlagen: {_sde}", flush=True)
+except Exception as _sde:
+    print(f"[skill_database] Import fehlgeschlagen: {_sde}", flush=True)
+    _skill_db = None
+
+try:
+    import benchmark_fetcher as _bench
+    try:
+        _bench.start_scheduler()
+        print("[benchmark_fetcher] Scheduler gestartet", flush=True)
+    except Exception as _bfe:
+        print(f"[benchmark_fetcher] Scheduler-Start fehlgeschlagen: {_bfe}", flush=True)
+except Exception as _bfe:
+    print(f"[benchmark_fetcher] Import fehlgeschlagen: {_bfe}", flush=True)
+    _bench = None
+
 
 def _log_chat_turn(*, msg, result, duration, session_id, agent_override=None,
                    sub_agent=None):
@@ -12938,6 +12963,89 @@ def subagent_confirm():
         return jsonify({'error': str(e)})
 
 
+@app.route('/api/skills/database', methods=['GET'])
+def api_skills_database():
+    """Liefert die komplette Skill-Datenbank (Feature 4, Roadmap 2026-04)."""
+    if _skill_db is None:
+        return jsonify({'available': False, 'error': 'skill_database nicht geladen'})
+    try:
+        db = _skill_db.load()
+        return jsonify({
+            'available': True,
+            'last_updated': db.get('last_updated'),
+            'update_source': db.get('update_source'),
+            'skill_definitions': db.get('skill_definitions', {}),
+            'models': db.get('models', {}),
+            'count': len(db.get('models', {})),
+        })
+    except Exception as e:
+        return jsonify({'available': False, 'error': str(e)})
+
+
+@app.route('/api/skills/best', methods=['GET'])
+def api_skills_best():
+    """Top-N Modelle fuer einen Skill. Query: task=<skill> (default 'reasoning'),
+    n=<int> (default 3, max 10), include_unavailable=1 optional."""
+    if _skill_db is None:
+        return jsonify({'available': False, 'error': 'skill_database nicht geladen',
+                       'task': None, 'results': []})
+    task = (request.args.get('task') or 'reasoning').strip()
+    try:
+        n = int(request.args.get('n', 3))
+    except Exception:
+        n = 3
+    n = max(1, min(n, 10))
+    only_available = request.args.get('include_unavailable') not in ('1', 'true', 'yes')
+    try:
+        results = _skill_db.get_best(task, n=n, only_available=only_available)
+        return jsonify({
+            'available': True, 'task': task, 'n': n,
+            'only_available': only_available, 'results': results,
+            'valid_tasks': _skill_db.SKILLS,
+        })
+    except Exception as e:
+        return jsonify({'available': False, 'error': str(e),
+                       'task': task, 'results': []})
+
+
+@app.route('/api/skills/model', methods=['GET'])
+def api_skills_model():
+    """Liefert alle Skills eines Modells. Query: id=<provider>/<model_id>."""
+    if _skill_db is None:
+        return jsonify({'available': False, 'error': 'skill_database nicht geladen'})
+    ref = (request.args.get('id') or '').strip()
+    if not ref or '/' not in ref:
+        return jsonify({'available': True, 'error': "id fehlt oder ungueltig (Format: provider/model_id)",
+                       'model': None}), 400
+    try:
+        m = _skill_db.get_model(ref)
+        if m is None:
+            return jsonify({'available': True, 'error': f'Modell nicht gefunden: {ref}',
+                           'model': None}), 404
+        return jsonify({'available': True, 'model_ref': ref, 'model': m})
+    except Exception as e:
+        return jsonify({'available': False, 'error': str(e)})
+
+
+@app.route('/api/skills/refresh', methods=['POST'])
+def api_skills_refresh():
+    """Manueller Trigger fuer den Benchmark-Fetcher. Optional Body {force:true}
+    laesst den Slot-Check (Mo>=06:00) ueberspringen."""
+    if _bench is None:
+        return jsonify({'ok': False, 'error': 'benchmark_fetcher nicht geladen'})
+    force = False
+    try:
+        body = request.get_json(silent=True) or {}
+        force = bool(body.get('force', True))  # Default true bei manuellem Aufruf
+    except Exception:
+        force = True
+    try:
+        summary = _bench.run_once(force=force)
+        return jsonify(summary)
+    except Exception as e:
+        return jsonify({'ok': False, 'error': str(e)})
+
+
 @app.route('/api/usage/summary', methods=['GET'])
 def api_usage_summary():
     """Aggregat-Statistik fuer den Usage Logger (Feature 3, Roadmap 2026-04).
@@ -15070,17 +15178,35 @@ _MSG_JUNK_SENDER_PATTERNS = (
     'newsletter', 'news@', 'notifications@', 'notify@', 'notification@',
     'marketing', 'campaign', 'promotions', 'promo@', 'offers',
     'mailings', 'broadcast', 'hello@mail', 'team@mail', 'info@mail',
-    '@email.', '@mail.', '@mailer.', '@newsletter.',
+    'contato@mkt', 'contato@email', 'contact@mkt',
+    # Marketing-Sub-Domains die unsere echten Newsletter konsequent verwenden
+    # (Sample 2026-04-27: 800+ Mails aus dem Privat-/Signicat-Posteingang).
+    '@email.', '@mail.', '@mailer.', '@newsletter.', '@news.', '@nl.',
+    '@mkt.', '@em.', '@e.', '@info.', '@updates.', '@update.', '@offers.',
+    '@cs.', '@ses', '@em-marketing.', '@email-marketing.',
+    '@marketing.', '@hello.', '@announcements.', '@announce.',
+    '@bounces.', '@bounce.', 'bounces+', 'reply+',
 )
 _MSG_JUNK_SUBJECT_KEYWORDS = (
     'unsubscribe', 'abmelden', 'newsletter', 'weekly digest', 'daily digest',
     'webinar', 'your weekly', 'your daily', 'black friday', 'cyber monday',
     'exclusive offer', 'limited time', '% off', 'save now', 'sale ends',
     'verification code', 'one-time code', 'otp', 'confirm your email',
+    'tipp der woche', 'tipp des tages',
+    # Internationale Newsletter-Trigger
+    'desabonner', 'desinscribir', 'cancelar inscricao', 'rimuovere',
 )
 _MSG_JUNK_BODY_SIGNALS = (
     'click here to unsubscribe', 'to unsubscribe', 'abmelden', 'update your preferences',
     'view in browser', 'in deinem browser anzeigen', 'view email in browser',
+    # Multi-Lingual View-in-Browser Signals — wichtig fuer .com.br /
+    # .de / .es / .fr Newsletter (im Bestand Sample heute mehrere
+    # portugiesische "Ver no navegador" gefunden, die sonst durchrutschen).
+    'ver no navegador', 'ver en el navegador', 'voir dans le navigateur',
+    'visualizza nel browser', 'in browser anzeigen',
+    # Footer-Pflichthinweise (DSGVO/EU)
+    'manage your preferences', 'preferenze di posta', 'preferences de communication',
+    'unsubscribe here', 'opt out',
 )
 
 
@@ -15437,6 +15563,19 @@ def _msg_whatsapp_archived_names() -> set:
         return set()
 
 
+_MSG_JUNK_SENDER_REGEX = re.compile(
+    # Marketing-Subdomain-Praefixe (em, em1, em2, mkt, news, news1, ses, ses2,
+    # nl, em-marketing, etc.) — wichtig fur ESPs wie Sendgrid, Mailgun, AWS SES,
+    # Cloudflare Email Routing, die Newsletter ueber numerierte Subdomains
+    # raushauen (em@em1.cloudflare.com, news@news0.shopify.com, etc.).
+    r"@(em|news|nl|mkt|mail|mailer|ses|info|updates|update|offers|cs|"
+    r"marketing|hello|announcements|announce|bounces|bounce|hr-mail|"
+    r"em-marketing|email-marketing|notification|notifications|notify)"
+    r"[0-9]*\.",
+    re.IGNORECASE,
+)
+
+
 def _msg_is_junk(sender_email: str, subject: str, body_preview: str) -> bool:
     """Einfache Punkt-Heuristik: ab Score >= 2 -> junk."""
     score = 0
@@ -15447,6 +15586,9 @@ def _msg_is_junk(sender_email: str, subject: str, body_preview: str) -> bool:
         if p in se:
             score += 2
             break
+    # Regex-Fallback fuer numerierte Marketing-Subdomains (em1., news2., ses3.)
+    if score < 2 and _MSG_JUNK_SENDER_REGEX.search(se):
+        score += 2
     for p in _MSG_JUNK_SUBJECT_KEYWORDS:
         if p in su:
             score += 1

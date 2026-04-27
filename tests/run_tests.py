@@ -5150,6 +5150,72 @@ except Exception as _e:
     test("Email-Detail live", False, str(_e))
 
 
+section("Junk-Filter Erweiterung (Marketing-Subdomains) 2026-04-27")
+
+try:
+    with open(os.path.expanduser("~/AssistantDev/src/web_server.py")) as _f:
+        _ws = _f.read()
+
+    test("_MSG_JUNK_SENDER_REGEX definiert (numerierte Marketing-Subdomains)",
+         "_MSG_JUNK_SENDER_REGEX = re.compile(" in _ws)
+    test("Regex deckt em/em1/em2 etc. ab",
+         "(em|news|nl|mkt|" in _ws and "[0-9]*\\." in _ws)
+    test("Junk-Patterns enthalten @mkt.",
+         "'@mkt.'" in _ws)
+    test("Junk-Patterns enthalten Multi-Lingual View-in-Browser",
+         "'ver no navegador'" in _ws and "'ver en el navegador'" in _ws)
+    test("Junk-Patterns enthalten 'tipp der woche'",
+         "'tipp der woche'" in _ws)
+    # Regex wird in _msg_is_junk benutzt
+    test("_msg_is_junk nutzt _MSG_JUNK_SENDER_REGEX als Fallback",
+         "_MSG_JUNK_SENDER_REGEX.search(se)" in _ws)
+
+    # Direct unit test (ohne flask)
+    import re as _re
+    pat = _re.compile(
+        r"@(em|news|nl|mkt|mail|mailer|ses|info|updates|update|offers|cs|"
+        r"marketing|hello|announcements|announce|bounces|bounce|hr-mail|"
+        r"em-marketing|email-marketing|notification|notifications|notify)"
+        r"[0-9]*\.",
+        _re.IGNORECASE,
+    )
+    test("Regex matcht em@em1.cloudflare.com",
+         bool(pat.search("em@em1.cloudflare.com")))
+    test("Regex matcht service@ses2.unternehmenswelt.de",
+         bool(pat.search("service@ses2.unternehmenswelt.de")))
+    test("Regex matcht contato@mkt.osklen.com",
+         bool(pat.search("contato@mkt.osklen.com")))
+    test("Regex matcht NICHT echte Domains (foo@signicat.com)",
+         not pat.search("foo@signicat.com"))
+    test("Regex matcht NICHT echte Domains (a@trustedcarrier.net)",
+         not pat.search("a@trustedcarrier.net"))
+except Exception as _e:
+    test("Junk-Pattern grep", False, str(_e))
+
+# Live: Junk-Treffer-Quote
+try:
+    r = requests.get(
+        "http://localhost:8080/api/messages?limit=5000&junk=show", timeout=180
+    )
+    msgs = r.json().get("messages", []) if r.status_code == 200 else []
+    emails = [m for m in msgs if (m.get("source") or "").startswith("email_")]
+    junk = [m for m in emails if m.get("is_junk")]
+    test("Live: Mind. 1 Mail als is_junk=True markiert (sonst Filter kaputt)",
+         len(junk) > 0)
+    # Konkret: em1.cloudflare-Domain muss gematched werden falls vorhanden
+    em1_mails = [
+        m for m in emails
+        if "em1.cloudflare" in (m.get("sender_address") or "")
+    ]
+    if em1_mails:
+        test("Live: em1.cloudflare-Mails als junk markiert",
+             all(m.get("is_junk") for m in em1_mails))
+except requests.exceptions.RequestException as _e:
+    test("Junk live", False, f"server not reachable: {_e}")
+except Exception as _e:
+    test("Junk live", False, str(_e))
+
+
 section("CREATE_FILE Truncation-Detection + Provider-aware max_tokens (2026-04-27)")
 
 try:
@@ -5607,6 +5673,291 @@ except requests.exceptions.RequestException as _e:
     test("usage_logger live /chat increment", False, f"server not reachable: {_e}")
 except Exception as _e:
     test("usage_logger live /chat increment", False, str(_e))
+
+
+section("Skill-Database + Benchmark-Fetcher 2026-04-27 (Feature 4 — Roadmap April 2026)")
+
+# Modul-Dateien vorhanden + importierbar
+try:
+    _sd_path = os.path.expanduser("~/AssistantDev/src/skill_database.py")
+    _bf_path = os.path.expanduser("~/AssistantDev/src/benchmark_fetcher.py")
+    test("src/skill_database.py existiert", os.path.exists(_sd_path))
+    test("src/benchmark_fetcher.py existiert", os.path.exists(_bf_path))
+
+    sys.path.insert(0, os.path.expanduser("~/AssistantDev/src"))
+    import skill_database as _sd
+    import benchmark_fetcher as _bf
+    test("skill_database importierbar", True)
+    test("benchmark_fetcher importierbar", True)
+
+    # Public API vorhanden
+    for _fn in ("load", "save", "bootstrap_from_models", "get_best", "get_model",
+                "apply_updates", "classify_tier", "set_available"):
+        test(f"skill_database.{_fn} vorhanden", callable(getattr(_sd, _fn, None)))
+    for _fn in ("run_once", "should_run_now", "start_scheduler",
+                "fetch_from_artificialanalysis", "register_source"):
+        test(f"benchmark_fetcher.{_fn} vorhanden", callable(getattr(_bf, _fn, None)))
+
+    test("skill_database.SKILLS enthaelt mind. 10 Skills",
+         isinstance(_sd.SKILLS, list) and len(_sd.SKILLS) >= 10)
+    for _sk in ("research_long", "writing", "coding", "reasoning",
+                "image_generation", "video_generation", "speed", "cost_efficiency"):
+        test(f"SKILLS enthaelt '{_sk}'", _sk in _sd.SKILLS)
+    test("SKILL_DEFINITIONS hat Eintrag fuer jeden Skill",
+         isinstance(_sd.SKILL_DEFINITIONS, dict)
+         and all(s in _sd.SKILL_DEFINITIONS for s in _sd.SKILLS))
+except Exception as _e:
+    test("skill_database/benchmark_fetcher sanity", False, str(_e))
+
+
+# Tier-Klassifikation: bekannte Modelle landen im richtigen Bucket
+try:
+    _cases = [
+        ("anthropic", "claude-opus-4-7", "flagship_reasoning"),
+        ("anthropic", "claude-sonnet-4-6", "flagship"),
+        ("anthropic", "claude-haiku-4-5-20251001", "small_fast"),
+        ("openai", "gpt-5.5-pro", "flagship_reasoning"),
+        ("openai", "o3-pro", "flagship_reasoning"),
+        ("openai", "gpt-5.4-mini", "small_fast"),
+        ("openai", "gpt-5.3-codex", "code_specialist"),
+        ("gemini", "gemini-3.1-pro-preview", "flagship_reasoning"),
+        ("gemini", "gemini-2.5-flash", "small_fast"),
+        ("mistral", "codestral-latest", "code_specialist"),
+        ("mistral", "magistral-medium-latest", "flagship_reasoning"),
+        ("perplexity", "sonar-deep-research", "research_specialist"),
+        ("ollama", "qwen3:14b", "local"),
+    ]
+    for _prov, _mid, _expected in _cases:
+        _got = _sd.classify_tier(_prov, _mid, "")
+        test(f"tier({_prov}/{_mid}) == {_expected}", _got == _expected,
+             f"got={_got}")
+except Exception as _e:
+    test("tier classification", False, str(_e))
+
+
+# Bootstrap: alle Modelle aus models.json landen in der DB
+try:
+    _db = _sd.bootstrap_from_models()
+    test("bootstrap liefert dict", isinstance(_db, dict))
+    test("DB hat 'models'-key", "models" in _db)
+    _models = _db.get("models", {})
+    test(f"DB enthaelt mind. 30 Modelle (got {len(_models)})", len(_models) >= 30)
+    for _ref in ("anthropic/claude-opus-4-7",
+                 "openai/gpt-5.5-pro",
+                 "gemini/gemini-3.1-pro-preview",
+                 "perplexity/sonar-deep-research",
+                 "mistral/codestral-latest"):
+        test(f"DB enthaelt '{_ref}'", _ref in _models)
+
+    _has_image = any("imagen" in r.lower() or "gpt-image" in r.lower() for r in _models)
+    test("DB enthaelt Image-Generator (imagen oder gpt-image)", _has_image)
+    _has_video = any("veo" in r.lower() for r in _models)
+    test("DB enthaelt Video-Generator (Veo)", _has_video)
+
+    _opus = _models.get("anthropic/claude-opus-4-7", {})
+    _opus_skills = _opus.get("skills", {})
+    for _sk in ("research_long", "writing", "coding", "reasoning",
+                "image_generation", "video_generation"):
+        test(f"opus-4-7 skills enthaelt '{_sk}'", _sk in _opus_skills)
+    test("opus-4-7 image_generation == 0 (Chat-only)",
+         _opus_skills.get("image_generation") == 0)
+    test("opus-4-7 video_generation == 0",
+         _opus_skills.get("video_generation") == 0)
+    test("opus-4-7 reasoning >= 4", _opus_skills.get("reasoning", 0) >= 4)
+
+    _veo_ref = next((r for r in _models if "veo" in r.lower()), None)
+    if _veo_ref:
+        test(f"{_veo_ref}: video_generation == 5",
+             _models[_veo_ref]["skills"]["video_generation"] == 5)
+        test(f"{_veo_ref}: coding == 0 (kein Chat-Modell)",
+             _models[_veo_ref]["skills"]["coding"] == 0)
+except Exception as _e:
+    test("bootstrap pipeline", False, str(_e))
+
+
+# get_best: liefert sortierte Top-N
+try:
+    _best_code = _sd.get_best("coding", n=3)
+    test("get_best('coding', 3) ist Liste", isinstance(_best_code, list))
+    test("get_best('coding', 3) liefert genau 3", len(_best_code) == 3)
+    test("get_best 'coding' Top-Eintrag hat rating == 5",
+         _best_code and _best_code[0].get("rating") == 5)
+    test("get_best 'coding' Top-Eintrag hat 'rationale'-Feld",
+         _best_code and "rationale" in _best_code[0])
+
+    _best_video = _sd.get_best("video_generation", n=5)
+    test("get_best('video_generation') liefert mind. 1 Eintrag (Veo)",
+         len(_best_video) >= 1)
+    if _best_video:
+        test("video-Top hat rating 5", _best_video[0].get("rating") == 5)
+
+    _best_image = _sd.get_best("image_generation", n=5)
+    test("get_best('image_generation') liefert mind. 1 Eintrag",
+         len(_best_image) >= 1)
+
+    test("get_best('quatsch_skill') liefert []",
+         _sd.get_best("quatsch_skill", n=3) == [])
+except Exception as _e:
+    test("get_best query", False, str(_e))
+
+
+# apply_updates: aendert Rating, persistiert, schreibt JSONL-Diff
+try:
+    _ref = "anthropic/claude-haiku-4-5-20251001"
+    _before = _sd.get_model(_ref)
+    _orig_coding = _before["skills"]["coding"]
+    _new_val = 1 if _orig_coding != 1 else 2
+
+    _changes = _sd.apply_updates([
+        {"model_ref": _ref, "skill": "coding", "rating": _new_val,
+         "source": "test_artifact"}
+    ], source="test_artifact")
+    test("apply_updates liefert Liste", isinstance(_changes, list))
+    test("apply_updates registriert Change", len(_changes) == 1)
+    if _changes:
+        test("Change-Eintrag hat old/new/source",
+             all(k in _changes[0] for k in ("old", "new", "source", "skill", "model_ref")))
+        test(f"Change new == {_new_val}", _changes[0]["new"] == _new_val)
+        test(f"Change old == {_orig_coding}", _changes[0]["old"] == _orig_coding)
+
+    _no_changes = _sd.apply_updates([
+        {"model_ref": _ref, "skill": "coding", "rating": _new_val,
+         "source": "test_artifact"}
+    ])
+    test("apply_updates idempotent (gleicher Wert -> 0 Aenderungen)",
+         len(_no_changes) == 0)
+
+    _sd.apply_updates([
+        {"model_ref": _ref, "skill": "coding", "rating": _orig_coding,
+         "source": "test_rollback"}
+    ])
+    _after = _sd.get_model(_ref)
+    test("Rollback erfolgreich", _after["skills"]["coding"] == _orig_coding)
+
+    _bad = _sd.apply_updates([
+        {"model_ref": _ref, "skill": "coding", "rating": 99},
+        {"model_ref": _ref, "skill": "unknown_skill", "rating": 4},
+        {"model_ref": "fake/model", "skill": "coding", "rating": 4},
+    ])
+    test("apply_updates verwirft ungueltige Eingaben", len(_bad) == 0)
+except Exception as _e:
+    test("apply_updates pipeline", False, str(_e))
+
+
+# benchmark_fetcher: run_once force=True liefert sauberes Summary
+try:
+    test("should_run_now ist callable",
+         callable(getattr(_bf, "should_run_now", None)))
+
+    _summary = _bf.run_once(force=True)
+    test("run_once force=True liefert dict",
+         isinstance(_summary, dict))
+    test("Summary hat 'sources'-Feld",
+         isinstance(_summary.get("sources"), list))
+    test("Summary hat 'started_at'-Feld", "started_at" in _summary)
+    test("Summary hat 'finished_at' oder 'skipped'",
+         "finished_at" in _summary or _summary.get("skipped"))
+    test("benchmark_fetcher_state.json existiert nach Lauf",
+         os.path.exists(_bf.state_path()))
+except Exception as _e:
+    test("benchmark_fetcher run_once", False, str(_e))
+
+
+# Live-Endpoints
+try:
+    r = requests.get("http://localhost:8080/api/skills/database", timeout=10)
+    test("/api/skills/database 200", r.status_code == 200)
+    if r.status_code == 200:
+        _data = r.json()
+        test("/api/skills/database liefert dict", isinstance(_data, dict))
+        test("/api/skills/database has 'models'", "models" in _data)
+        test("/api/skills/database has 'skill_definitions'",
+             "skill_definitions" in _data)
+        test("/api/skills/database 'count' >= 30",
+             (_data.get("count") or 0) >= 30)
+except requests.exceptions.RequestException as _e:
+    test("/api/skills/database live", False, f"server not reachable: {_e}")
+except Exception as _e:
+    test("/api/skills/database live", False, str(_e))
+
+try:
+    r = requests.get("http://localhost:8080/api/skills/best?task=coding&n=3", timeout=10)
+    test("/api/skills/best 200", r.status_code == 200)
+    if r.status_code == 200:
+        _data = r.json()
+        test("/api/skills/best liefert dict", isinstance(_data, dict))
+        test("/api/skills/best 'task' == 'coding'", _data.get("task") == "coding")
+        test("/api/skills/best 'results' ist Liste",
+             isinstance(_data.get("results"), list))
+        test("/api/skills/best results-len == 3",
+             len(_data.get("results") or []) == 3)
+        if _data.get("results"):
+            _top = _data["results"][0]
+            test("/api/skills/best Top-Eintrag hat 'rating'", "rating" in _top)
+            test("/api/skills/best Top-Eintrag hat 'rationale'", "rationale" in _top)
+            test("/api/skills/best Top-Eintrag hat 'model_ref'", "model_ref" in _top)
+except Exception as _e:
+    test("/api/skills/best live", False, str(_e))
+
+try:
+    r = requests.get(
+        "http://localhost:8080/api/skills/model?id=anthropic/claude-opus-4-7",
+        timeout=10,
+    )
+    test("/api/skills/model 200", r.status_code == 200)
+    if r.status_code == 200:
+        _data = r.json()
+        test("/api/skills/model 'model' nicht None",
+             _data.get("model") is not None)
+        if _data.get("model"):
+            test("/api/skills/model liefert 'skills'-dict",
+                 isinstance(_data["model"].get("skills"), dict))
+            test("/api/skills/model liefert 'tier'",
+                 "tier" in _data["model"])
+
+    r2 = requests.get("http://localhost:8080/api/skills/model?id=fake/missing",
+                      timeout=10)
+    test("/api/skills/model missing -> 404",
+         r2.status_code == 404)
+
+    r3 = requests.get("http://localhost:8080/api/skills/model?id=invalid",
+                      timeout=10)
+    test("/api/skills/model invalid format -> 400",
+         r3.status_code == 400)
+except Exception as _e:
+    test("/api/skills/model live", False, str(_e))
+
+try:
+    r = requests.post("http://localhost:8080/api/skills/refresh",
+                      json={"force": True}, timeout=30)
+    test("/api/skills/refresh 200", r.status_code == 200)
+    if r.status_code == 200:
+        _data = r.json()
+        test("/api/skills/refresh liefert dict", isinstance(_data, dict))
+        test("/api/skills/refresh hat 'sources'- oder 'error'-Feld",
+             "sources" in _data or "error" in _data)
+except Exception as _e:
+    test("/api/skills/refresh live", False, str(_e))
+
+
+# Wiring im web_server.py grep'en
+try:
+    with open(os.path.expanduser("~/AssistantDev/src/web_server.py")) as _f:
+        _ws_src = _f.read()
+    test("web_server importiert skill_database",
+         "import skill_database" in _ws_src)
+    test("web_server importiert benchmark_fetcher",
+         "import benchmark_fetcher" in _ws_src)
+    test("web_server ruft bootstrap_from_models() beim Start",
+         "_skill_db.bootstrap_from_models()" in _ws_src)
+    test("web_server startet benchmark-scheduler",
+         "_bench.start_scheduler()" in _ws_src)
+    for _route in ("'/api/skills/database'", "'/api/skills/best'",
+                   "'/api/skills/model'", "'/api/skills/refresh'"):
+        test(f"Route {_route} registriert",
+             f"@app.route({_route}" in _ws_src)
+except Exception as _e:
+    test("web_server skill-wiring", False, str(_e))
 
 
 _cleanup_test_artifacts()
