@@ -2933,10 +2933,10 @@ section("Email-Anhang-Auto-Load + Dashboard-Button 2026-04-20")
 test("Dashboard: Email-Parser kennt 'anhaenge' Header-Key",
      'fields.get("anhaenge"' in _ws_src)
 test("Dashboard: attachments-Liste wird aus Header befuellt",
-     "attachments_list = []" in _ws_src
-     and '"attachments": attachments_list' in _ws_src)
-test("Dashboard: has_attachments nutzt attachments_list-Laenge",
-     "len(attachments_list) > 0" in _ws_src)
+     "attachments_filenames = []" in _ws_src
+     and '"attachment_filenames": attachments_filenames' in _ws_src)
+test("Dashboard: has_attachments nutzt attachments_struct-Laenge",
+     "len(attachments_struct) > 0" in _ws_src)
 
 # Backend: email_content_route gibt attachment_paths mit
 test("email_content_route: parst 'anhaenge' Header",
@@ -4703,6 +4703,73 @@ try:
             test("models.json: deepseek-r1:14b in ollama-Provider", 'deepseek-r1:14b' in _ol_ids)
 except Exception as _e:
     test("Model-Catalog models.json check", False, str(_e))
+
+
+section("Email body_html + Attachments-Pipeline 2026-04-27")
+
+try:
+    with open(os.path.expanduser("~/AssistantDev/src/web_server.py")) as _f:
+        _ws = _f.read()
+    with open(os.path.expanduser("~/AssistantDev/src/email_watcher.py")) as _f:
+        _ew = _f.read()
+
+    # Watcher: HTML-Companion + EML-Source-Header
+    test("email_watcher extrahiert HTML separat (3-tuple return)",
+         "return '\\n'.join(body_parts), html_body, attachments" in _ew)
+    test("email_watcher schreibt .html-Companion neben .txt",
+         "html_path = primary_path[:-4] + \".html\"" in _ew)
+    test("email_watcher schreibt EML-Source-Header in .txt",
+         'eml_src_line = f"EML-Source: {eml_name}\\n"' in _ew)
+
+    # _MSG_EMAIL_FIELD_RE kennt EML-Source + Anhaenge-Aliase
+    test("FIELD_RE kennt EML-Source",
+         "EML-Source" in _ws.split("_MSG_EMAIL_FIELD_RE")[1].split(")")[0])
+    test("FIELD_RE kennt Anhaenge|Anhänge|Attachments",
+         "Anhaenge|Anhänge|Attachments" in _ws)
+
+    # MIME-Lookup-Helper
+    test("_mime_from_filename-Helper definiert",
+         "def _mime_from_filename(name: str) -> str:" in _ws)
+    test("MIME-Map kennt PDF + DOCX + PNG",
+         "'.pdf': 'application/pdf'" in _ws and
+         "'.docx': 'application/vnd" in _ws and
+         "'.png': 'image/png'" in _ws)
+
+    # Strukturierte attachments[] mit id/mime/size/url
+    test("Email-Normalizer baut attachments_struct mit id/mime/size/url",
+         "attachments_struct.append({" in _ws and
+         '"url": f"/api/messages/{msg_id}/attachments/{att_id}"' in _ws)
+    test("Backwards-Compat: attachment_filenames bleibt verfuegbar",
+         '"attachment_filenames": attachments_filenames' in _ws)
+    test("Email-Normalizer liest body_html aus .html-Companion",
+         'html_companion = fpath[:-4] + ".html"' in _ws and
+         "body_html = fh_html.read().decode" in _ws)
+    test("Email-Normalizer Fallback: HTML aus .eml im processed-Ordner",
+         "_EMAIL_PROCESSED_EML_DIR" in _ws and
+         "eml_msg = _email_mod.message_from_bytes" in _ws)
+
+    # Detail-Endpoint reparst mit only_header=False
+    test("/api/messages/<id> reparst Email mit only_header=False",
+         "_msg_normalize_email_content(" in _ws and
+         "only_header=False" in _ws)
+    test("Detail-Response hat body_text + body_html",
+         '"body_text": body_clean' in _ws and
+         '"body_html": body_html' in _ws)
+
+    # Download-Endpoint
+    test("/api/messages/<id>/attachments/<att_id> Route registered",
+         "@app.route(\"/api/messages/<msg_id>/attachments/<att_id>\")" in _ws)
+    test("Download-Endpoint nutzt send_from_directory mit as_attachment",
+         "send_from_directory(" in _ws and "as_attachment=True" in _ws)
+    test("Download-Endpoint hat Pfad-Traversal-Schutz",
+         "real_path = os.path.realpath(att_path)" in _ws and
+         "path traversal blocked" in _ws)
+
+    # Backfill-Skript existiert
+    test("Backfill-Skript scripts/backfill_email_html.py existiert",
+         os.path.isfile(os.path.expanduser("~/AssistantDev/scripts/backfill_email_html.py")))
+except Exception as _e:
+    test("Email body_html + Attachments grep", False, str(_e))
 
 
 section("Message-Dashboard Cleanup 2026-04-27 (kChat raus, Sonstige-Label, Phantom-Fix, Junk-Toggle)")

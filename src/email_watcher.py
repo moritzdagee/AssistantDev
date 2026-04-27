@@ -270,7 +270,16 @@ def extract_file_content(raw, filename):
 # ── Body + Attachments extrahieren ───────────────────────────────────────────
 
 def extract_body_and_attachments(msg):
+    """Extrahiert Body (Plaintext + HTML separat) und Anhaenge.
+
+    Returns: (plaintext_body, html_body_or_None, attachments_list)
+
+    HTML wird ZUSAETZLICH zum Plaintext-Body zurueckgegeben (statt zu
+    text-strippen) — Frontend kann damit die Mail formatiert rendern,
+    Plaintext bleibt fuer Volltext-Suche/Agent-Kontext sauber.
+    """
     body_parts = []
+    html_body = None
     attachments = []
     for part in msg.walk():
         ct = part.get_content_type()
@@ -284,17 +293,22 @@ def extract_body_and_attachments(msg):
             payload = part.get_payload(decode=True)
             if payload:
                 body_parts.append(payload.decode('utf-8', errors='ignore'))
-        elif ct == 'text/html' and not body_parts and 'attachment' not in disp:
+        elif ct == 'text/html' and 'attachment' not in disp:
             payload = part.get_payload(decode=True)
             if payload:
-                try:
-                    from bs4 import BeautifulSoup
-                    body_parts.append(BeautifulSoup(
-                        payload.decode('utf-8', errors='ignore'), 'html.parser'
-                    ).get_text(separator='\n', strip=True))
-                except Exception:
-                    body_parts.append(payload.decode('utf-8', errors='ignore'))
-    return '\n'.join(body_parts), attachments
+                raw_html = payload.decode('utf-8', errors='ignore')
+                # HTML separat speichern fuer Frontend-Rendering
+                if html_body is None:
+                    html_body = raw_html
+                # Plaintext-Body nur fallback bauen, wenn keine text/plain-Part
+                # da war — sonst landet HTML-stripped Text doppelt im Body.
+                if not body_parts:
+                    try:
+                        from bs4 import BeautifulSoup
+                        body_parts.append(BeautifulSoup(raw_html, 'html.parser').get_text(separator='\n', strip=True))
+                    except Exception:
+                        body_parts.append(raw_html)
+    return '\n'.join(body_parts), html_body, attachments
 
 # ── Kontakt-Tracking ────────────────────────────────────────────────────────
 
@@ -498,7 +512,7 @@ def process_eml(eml_path, processed):
             contact = sender_addr
 
         timestamp = datetime.datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
-        body, attachments = extract_body_and_attachments(msg)
+        body, html_body, attachments = extract_body_and_attachments(msg)
         agent = route_agent(direction, sender, to)
 
         memory_dir = os.path.join(BASE, agent, "memory")
@@ -531,6 +545,10 @@ def process_eml(eml_path, processed):
             anh_line = f"Anhaenge: {len(saved_attachments)} ({', '.join(saved_attachments)})\n"
         else:
             anh_line = "Anhaenge: 0\n"
+        # EML-Source-Header: pointer auf die Original-.eml in
+        # email_inbox/processed/. Backend kann das fuer HTML-Rendering und
+        # MIME-Reparse heranziehen, falls die HTML-Companion-Datei fehlt.
+        eml_src_line = f"EML-Source: {eml_name}\n"
         content = (f"Von: {sender}\n"
                    f"An: {to}\n"
                    f"Betreff: {subject}\n"
@@ -540,11 +558,23 @@ def process_eml(eml_path, processed):
                    f"Agent: {agent}\n"
                    f"Importiert: {timestamp}\n"
                    f"{anh_line}"
+                   f"{eml_src_line}"
                    f"{separator}\n\n{body}")
 
         primary_path = os.path.join(memory_dir, email_filename)
         with open(primary_path, 'w') as f:
             f.write(content)
+
+        # 2b) HTML-Companion-File schreiben, wenn die Mail einen text/html-
+        # Part hatte. Frontend rendert das via /api/messages/<id> body_html.
+        # Filename: gleicher Stamm wie die .txt, nur Endung .html.
+        if html_body:
+            html_path = primary_path[:-4] + ".html"
+            try:
+                with open(html_path, 'w') as f:
+                    f.write(html_body)
+            except Exception as e:
+                print(f"  Warning: html-companion write failed for {email_filename}: {e}")
 
         # 3) Globale Kopie nach email_inbox/all_emails/ — identischer Text,
         #    damit andere Agenten bei Bedarf Zugriff bekommen koennen.

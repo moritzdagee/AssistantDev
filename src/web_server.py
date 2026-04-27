@@ -14505,9 +14505,40 @@ _MSG_SOURCE_TO_AGENT = {
 }
 
 _MSG_EMAIL_FIELD_RE = _msgd_re.compile(
-    r'^(Von|An|From|To|Betreff|Subject|Datum|Date|Kontakt|Richtung|Agent|Importiert|Quelle|Kanal|Cc|Kopie|Message-ID|Reply-To):\s*(.*)$',
+    r'^(Von|An|From|To|Betreff|Subject|Datum|Date|Kontakt|Richtung|Agent|Importiert|Anhaenge|Anhänge|Attachments|Quelle|Kanal|Cc|Kopie|Message-ID|Reply-To|EML-Source):\s*(.*)$',
     _msgd_re.IGNORECASE,
 )
+
+
+# Wo der Email-Watcher Original-.eml-Files ablegt — Backend nutzt das fuer
+# HTML-Reparse + Anhang-Lookup, falls die HTML-Companion-Datei fehlt.
+_EMAIL_PROCESSED_EML_DIR = os.path.expanduser(
+    "~/Library/Mobile Documents/com~apple~CloudDocs/Downloads shared/claude_datalake/email_inbox/processed"
+)
+
+
+_MIME_BY_EXT = {
+    '.pdf': 'application/pdf',
+    '.docx': 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+    '.doc': 'application/msword',
+    '.xlsx': 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+    '.xls': 'application/vnd.ms-excel',
+    '.pptx': 'application/vnd.openxmlformats-officedocument.presentationml.presentation',
+    '.ppt': 'application/vnd.ms-powerpoint',
+    '.png': 'image/png', '.jpg': 'image/jpeg', '.jpeg': 'image/jpeg',
+    '.gif': 'image/gif', '.webp': 'image/webp', '.svg': 'image/svg+xml',
+    '.mp4': 'video/mp4', '.mov': 'video/quicktime',
+    '.mp3': 'audio/mpeg', '.wav': 'audio/wav',
+    '.zip': 'application/zip', '.csv': 'text/csv', '.txt': 'text/plain',
+    '.html': 'text/html', '.json': 'application/json', '.xml': 'application/xml',
+    '.eml': 'message/rfc822', '.ics': 'text/calendar',
+    '.p7s': 'application/pkcs7-signature',
+}
+
+
+def _mime_from_filename(name: str) -> str:
+    ext = os.path.splitext(name)[1].lower()
+    return _MIME_BY_EXT.get(ext, 'application/octet-stream')
 
 # ─── Junk-Heuristik fuer Message Dashboard ─────────────────────────────────
 # Klassifiziert typische Newsletter/Bounce/Automatisiert-Mails als "junk".
@@ -15066,26 +15097,81 @@ def _msg_normalize_email_content(fpath, fname, source_key, agent_name, only_head
     # anderen Header. Wir extrahieren die Filenames, damit Dashboard und
     # Chat-UI die Anhaenge zusammen mit der Mail in den Session-Kontext
     # laden koennen. Leerer String wenn der Watcher keine Anhaenge fand.
-    attachments_list = []
+    attachments_filenames = []
     anh_raw = fields.get("anhaenge", fields.get("anhänge", fields.get("attachments", "")))
     if anh_raw:
         m_anh = _msgd_re.match(r"\s*\d+\s*\((.+)\)\s*$", anh_raw)
         if m_anh:
             inner = m_anh.group(1).strip()
-            attachments_list = [x.strip() for x in inner.split(",") if x.strip()]
+            attachments_filenames = [x.strip() for x in inner.split(",") if x.strip()]
         elif "," in anh_raw or "." in anh_raw:
             # Fallback: nur Komma-Liste ohne "N (...)"-Wrapper
-            attachments_list = [x.strip() for x in anh_raw.split(",") if x.strip()]
+            attachments_filenames = [x.strip() for x in anh_raw.split(",") if x.strip()]
+
+    # Voll-Strukturierte Attachment-Objekte mit id/mime/size/url —
+    # BACKEND_TODO_EMAIL_ATTACHMENTS-Format. Frontend rendert daraus die
+    # Download-Chips und kann die Files via url herunterladen.
+    msg_id = _msg_hash_path(fpath)
+    memdir = os.path.dirname(fpath)
+    attachments_struct = []
+    for att_filename in attachments_filenames:
+        att_path = os.path.join(memdir, att_filename)
+        try:
+            att_size = os.path.getsize(att_path) if os.path.exists(att_path) else None
+        except Exception:
+            att_size = None
+        # Stable, URL-safe ID — gleicher hash wie msg_id, aber per-file.
+        att_id = _msg_hash_path(att_path) if os.path.exists(att_path) else _msg_hash_path(att_filename)
+        attachments_struct.append({
+            "id": att_id,
+            "name": att_filename,
+            "mime": _mime_from_filename(att_filename),
+            "size": att_size,
+            "url": f"/api/messages/{msg_id}/attachments/{att_id}",
+            "inline": False,
+        })
 
     has_attachments = (
-        len(attachments_list) > 0
+        len(attachments_struct) > 0
         or bool(_msgd_re.search(
             r"(anhang|attachment|\[cid:|\[Bild\]|\.pdf|\.docx|\.xlsx|\.png|\.jpg)",
             body_clean[:2000], _msgd_re.IGNORECASE))
     )
 
+    # body_html aus HTML-Companion-Datei (vom Email-Watcher seit 2026-04-27
+    # geschrieben). Filename = gleicher Stamm wie .txt, aber mit .html.
+    # Nur wenn only_header=False -> heavy I/O nicht im Listing.
+    body_html = None
+    if not only_header:
+        html_companion = fpath[:-4] + ".html" if fpath.endswith(".txt") else None
+        if html_companion and os.path.isfile(html_companion):
+            try:
+                with open(html_companion, "rb") as fh_html:
+                    body_html = fh_html.read().decode("utf-8", errors="replace")
+            except Exception:
+                body_html = None
+        # Fallback: aus dem Original-.eml im processed-Ordner reparsen
+        if body_html is None:
+            eml_src = fields.get("eml-source", "").strip()
+            if eml_src:
+                eml_path = os.path.join(_EMAIL_PROCESSED_EML_DIR, eml_src)
+                if os.path.isfile(eml_path):
+                    try:
+                        import email as _email_mod
+                        with open(eml_path, "rb") as fh_eml:
+                            eml_msg = _email_mod.message_from_bytes(fh_eml.read())
+                        for part in eml_msg.walk():
+                            if (part.get_content_type() == "text/html"
+                                    and "attachment" not in str(part.get("Content-Disposition", ""))):
+                                payload = part.get_payload(decode=True)
+                                if payload:
+                                    body_html = payload.decode("utf-8", errors="replace")
+                                    break
+                    except Exception:
+                        body_html = None
+
     return {
-        "id": _msg_hash_path(fpath),
+        "id": msg_id,
         "source": source_key,
         "source_agent": agent_name,
         "sender_name": sender_name[:150],
@@ -15094,12 +15180,19 @@ def _msg_normalize_email_content(fpath, fname, source_key, agent_name, only_head
         "subject": subject[:200],
         "preview": preview,
         "full_content": body_clean if not only_header else "",
+        "body_text": body_clean if not only_header else "",
+        "body_html": body_html,
         "timestamp": dt.isoformat(),
         "timestamp_epoch": dt.timestamp(),
         "read": False,
         "has_attachments": has_attachments,
-        "attachments": attachments_list,
+        # Strukturierte Attachments + Backwards-Compat-String-Liste.
+        # Frontend kann auf attachments[].url klicken; alte Konsumenten
+        # finden weiter ein String-Array unter attachment_filenames.
+        "attachments": attachments_struct,
+        "attachment_filenames": attachments_filenames,
         "raw_file_path": fpath,
+        "eml_source": fields.get("eml-source", ""),
         "message_id": fields.get("message-id", ""),
         "type": "email",
         "is_junk": _msg_is_junk(sender_email, subject, preview),
@@ -16167,10 +16260,82 @@ def messages_view(msg_id):
 
 @app.route("/api/messages/<msg_id>")
 def api_messages_detail(msg_id):
+    """Detail einer Nachricht inkl. body_text, body_html (wenn vorhanden),
+    und voll-strukturierten attachments[] mit url/mime/size.
+
+    Im Gegensatz zum Listing wird hier mit only_header=False neu geparst,
+    damit body_text + body_html mitkommen — das Listing optimiert auf
+    Speed und liefert fuer email-Sources nur die Header-Info.
+    """
     msg = _msg_find_by_id(msg_id)
     if not msg:
         return jsonify({"ok": False, "error": "not found"}), 404
+    # Email-Detail: full reparse mit body_html + voll-strukturierten Attachments.
+    if msg.get("type") == "email" and msg.get("raw_file_path"):
+        try:
+            full = _msg_normalize_email_content(
+                msg["raw_file_path"],
+                os.path.basename(msg["raw_file_path"]),
+                msg["source"],
+                msg.get("source_agent") or "",
+                only_header=False,
+            )
+            if full:
+                # Read-State + dynamische Felder vom Listing uebernehmen
+                full["read"] = msg.get("read", False)
+                full["sync_direction"] = msg.get("sync_direction")
+                msg = full
+        except Exception as _e:
+            print(f"[MSG-DETAIL] reparse-Fehler: {_e}", flush=True)
     return jsonify({"ok": True, "message": msg})
+
+
+@app.route("/api/messages/<msg_id>/attachments/<att_id>")
+def api_messages_attachment_download(msg_id, att_id):
+    """Streamt einen E-Mail-Anhang als binaere Response.
+
+    Auth: identisch zu den anderen /api/messages-Endpoints (Bearer / JWT
+    via Globaler Middleware). Setzt Content-Type aus File-Extension und
+    Content-Disposition: attachment; filename="..." damit Browser direkt
+    den Save-Dialog zeigen.
+    """
+    msg = _msg_find_by_id(msg_id)
+    if not msg:
+        return jsonify({"ok": False, "error": "message not found"}), 404
+    if msg.get("type") != "email":
+        return jsonify({"ok": False, "error": "no attachments on non-email"}), 400
+    # Wir reparsen die Mail um die volle attachments-Liste mit ID-Match zu bekommen.
+    try:
+        full = _msg_normalize_email_content(
+            msg["raw_file_path"],
+            os.path.basename(msg["raw_file_path"]),
+            msg["source"],
+            msg.get("source_agent") or "",
+            only_header=False,
+        )
+    except Exception:
+        full = None
+    if not full:
+        return jsonify({"ok": False, "error": "could not load message"}), 500
+    target = next((a for a in full.get("attachments", []) if a.get("id") == att_id), None)
+    if not target:
+        return jsonify({"ok": False, "error": "attachment not found"}), 404
+    memdir = os.path.dirname(msg["raw_file_path"])
+    att_path = os.path.join(memdir, target["name"])
+    if not os.path.isfile(att_path):
+        return jsonify({"ok": False, "error": "file missing on disk"}), 404
+    # Pfad-Traversal-Schutz: target['name'] muss nach Normalisierung im memdir bleiben
+    real_dir = os.path.realpath(memdir)
+    real_path = os.path.realpath(att_path)
+    if not real_path.startswith(real_dir + os.sep):
+        return jsonify({"ok": False, "error": "path traversal blocked"}), 400
+    return send_from_directory(
+        memdir,
+        target["name"],
+        as_attachment=True,
+        download_name=target["name"],
+        mimetype=target.get("mime") or _mime_from_filename(target["name"]),
+    )
 
 
 @app.route("/api/messages/mark-read", methods=["POST"])
