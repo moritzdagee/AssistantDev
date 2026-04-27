@@ -4369,6 +4369,50 @@ except Exception as _e:
     test("API-Gaps grep", False, str(_e))
 
 
+section("WhatsApp Empty-Name Match Bug 2026-04-26")
+
+try:
+    with open(os.path.expanduser("~/AssistantDev/src/web_server.py")) as _f:
+        _ws = _f.read()
+    test("Step1 contacts.json: cname Truthy-Check (kein '' in to_lower)",
+         "if cname and (to_lower in cname or cname in to_lower):" in _ws)
+    # Strip vorhanden gegen whitespace-only Namen
+    test("cname.strip() um Whitespace-Names auszuschliessen",
+         "(c.get('name') or '').lower().strip()" in _ws)
+except Exception as _e:
+    test("WhatsApp empty-name grep", False, str(_e))
+
+
+section("WhatsApp Ambiguity Detection 2026-04-26")
+
+try:
+    with open(os.path.expanduser("~/AssistantDev/src/web_server.py")) as _f:
+        _ws = _f.read()
+
+    # Mehrdeutigkeits-Erkennung
+    test("AppleScript holt Eintraege auch ohne Phone (fuer Ambiguity-Detection)",
+         "set out to out & nm & \"\\\\t\" & linefeed" in _ws)
+    test("Zwei Eintraege mit identischem Namen -> ambiguous",
+         "len(same_name) > 1" in _ws)
+    test("Single-Match ohne Phone -> ambiguous (nicht silently ignorieren)",
+         "len(same_name) == 1 and not same_name[0][1]" in _ws)
+    test("Substring-Match nur wenn EINDEUTIG (sonst ambiguous)",
+         "len(with_phone) == 1" in _ws and "len(with_phone) > 1" in _ws)
+
+    # Hint-Propagation
+    test("send_whatsapp_draft returnt 3-tuple (to, phone, hint)",
+         "return to_name, phone, None" in _ws and
+         "return to_name, None, _ambiguity_hint" in _ws)
+    test("Caller in process_single_message unpackt 3-tuple",
+         "wa_to, wa_phone, wa_hint = send_whatsapp_draft" in _ws)
+    test("Action-Marker zeigt Hint statt 'vorbereitet' bei Mehrdeutigkeit",
+         "KEIN AUTO-VERSAND" in _ws and "manuell" in _ws)
+    test("/send_whatsapp_draft-Route gibt ambiguity_hint zurueck",
+         "'ambiguity_hint': hint" in _ws)
+except Exception as _e:
+    test("WhatsApp-Ambiguity grep", False, str(_e))
+
+
 section("Frontend-TODOs CRUD + Reply-Context + Chat-Signature 2026-04-26")
 
 try:
@@ -4426,10 +4470,10 @@ try:
     test("AppleScript-Lookup sammelt ALLE Treffer (nicht item 1)",
          "out & nm & \"\\\\t\" & num & linefeed" in _ws or
          'out & nm & "\\\\t" & num' in _ws)
-    test("Best-Match: exakter Name bevorzugt",
-         "c[0].lower() == target_lower" in _ws)
+    test("Best-Match: exakter Name bevorzugt (per same_name)",
+         "e[0].lower() == target_lower" in _ws)
     test("Mehrdeutigkeit -> Clipboard-Fallback statt erste nehmen",
-         "Mehrdeutige Contact-Suche" in _ws)
+         "ambiguity_reason" in _ws and "-> Clipboard-Fallback" in _ws)
 
     # auto_search skip in Reply-Sessions
     test("auto_search wird in Reply-Session geskippt",
@@ -4452,7 +4496,7 @@ try:
     test("Lookup-Phones gegen _is_real_phone gepruft",
          _ws.count("_is_real_phone(c['phone'])") >= 2)
     test("AppleScript-Phones werden ueber _is_real_phone gefiltert",
-         "if nm and ph and _is_real_phone(ph):" in _ws)
+         "_is_real_phone(ph)" in _ws and "all_entries.append" in _ws)
     test("letzte Verteidigung vor whatsapp:// Aufruf",
          "fails sanity check" in _ws)
 

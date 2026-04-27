@@ -1727,13 +1727,19 @@ def _is_real_phone(phone):
 
 
 def send_whatsapp_draft(spec, agent_name=None):
-    """Opens WhatsApp with a pre-filled message. Looks up phone in contacts.json, then macOS Contacts."""
+    """Opens WhatsApp with a pre-filled message. Looks up phone in contacts.json, then macOS Contacts.
+
+    Returns: (to_name, phone_or_None, hint_or_None). hint ist gesetzt wenn der
+    Lookup mehrdeutig oder leer war — der Agent kann das dem User zeigen, statt
+    eine zufaellige Nummer zu nutzen.
+    """
     import subprocess
     import urllib.parse
 
     to_name = spec.get('to', '')
     message = spec.get('message', '')
     phone = spec.get('phone', '')  # Optional direct phone
+    _ambiguity_hint = None
     # LLM-Halluzinations-Schutz: wenn die Nummer offensichtlich Dummy ist
     # (+490000000000 etc.), verwerfen wir sie und gehen ueber den Lookup.
     if phone and not _is_real_phone(phone):
@@ -1741,6 +1747,10 @@ def send_whatsapp_draft(spec, agent_name=None):
         phone = ''
 
     # Step 1: Look up in agent's contacts.json
+    # WICHTIG (Bug 2026-04-26): cname MUSS truthy sein. Sonst matcht
+    # `'' in to_lower` immer True und Eintraege mit name=null bekommen
+    # ihre Phone an JEDES to_name verteilt. (Renata Argolo bekam so
+    # eine zufaellige +47-Nummer aus signicat-contacts.json.)
     if not phone and to_name and agent_name:
         parent = agent_name.split('_')[0] if '_' in agent_name else agent_name
         contacts_path = os.path.join(BASE, parent, "memory", "contacts.json")
@@ -1750,8 +1760,8 @@ def send_whatsapp_draft(spec, agent_name=None):
                     cdata = json.load(f)
                 to_lower = to_name.lower()
                 for c in cdata.get('contacts', []):
-                    cname = (c.get('name') or '').lower()
-                    if to_lower in cname or cname in to_lower:
+                    cname = (c.get('name') or '').lower().strip()
+                    if cname and (to_lower in cname or cname in to_lower):
                         if c.get('phone') and _is_real_phone(c['phone']):
                             phone = c['phone']
                             break
@@ -1769,8 +1779,8 @@ def send_whatsapp_draft(spec, agent_name=None):
                         with open(cpath) as f:
                             cdata = json.load(f)
                         for c in cdata.get('contacts', []):
-                            cname = (c.get('name') or '').lower()
-                            if to_lower in cname or cname in to_lower:
+                            cname = (c.get('name') or '').lower().strip()
+                            if cname and (to_lower in cname or cname in to_lower):
                                 if c.get('phone') and _is_real_phone(c['phone']):
                                     phone = c['phone']
                                     break
@@ -1782,13 +1792,15 @@ def send_whatsapp_draft(spec, agent_name=None):
             pass
 
     # Step 3: Look up in macOS Contacts app via AppleScript.
-    # WICHTIG: Wir holen ALLE Treffer und entscheiden in Python mit Best-Match-
-    # Logik — vorher hat `item 1 of matchedPeople` einfach den ersten
-    # alphabetischen Treffer genommen, was bei "Renata" -> ["Renata Rufino",
-    # "Renata Argolo", ...] die FALSCHE Person erwischt hat.
+    # WICHTIG: Wir holen ALLE Treffer (auch ohne Phone!) und entscheiden in
+    # Python. Der Renata-Bug 2026-04-26: macOS Contacts hatte ZWEI Eintraege
+    # "Renata Argolo" — einer mit (falscher) Nummer, einer ohne. Mein
+    # vorheriges Filtern auf "phones > 0" hat den No-Phone-Eintrag versteckt
+    # und damit die Mehrdeutigkeit. Dieser Code holt jetzt ALLE und prueft
+    # explizit ob mehrere Eintraege mit IDENTISCHEM Namen existieren — wenn
+    # ja, kann keine Nummer eindeutig zugeordnet werden -> Clipboard-Fallback.
     if not phone and to_name:
         try:
-            # to_name-AppleScript-escape: doppelte Anfuehrungszeichen + backslash
             esc_name = to_name.replace('\\', '\\\\').replace('"', '\\"')
             script = f'''
             tell application "Contacts"
@@ -1800,6 +1812,8 @@ def send_whatsapp_draft(spec, agent_name=None):
                     if (count of phs) > 0 then
                         set num to value of item 1 of phs
                         set out to out & nm & "\\t" & num & linefeed
+                    else
+                        set out to out & nm & "\\t" & linefeed
                     end if
                 end repeat
                 return out
@@ -1809,39 +1823,70 @@ def send_whatsapp_draft(spec, agent_name=None):
                 ['osascript', '-e', script],
                 capture_output=True, text=True, timeout=10
             )
-            # Parse Output (eine Zeile pro Treffer: "Name\tPhone")
-            candidates = []  # (name, phone)
+            all_entries = []  # (name, phone-or-empty)
             for line in (result.stdout or '').splitlines():
                 if '\t' not in line:
                     continue
                 nm, ph = line.split('\t', 1)
                 nm = nm.strip()
                 ph = ph.strip()
-                if nm and ph and _is_real_phone(ph):
-                    candidates.append((nm, ph))
+                if nm:
+                    all_entries.append((nm, ph if _is_real_phone(ph) else ''))
+
             target_lower = to_name.lower()
+            # Eintraege mit EXAKT diesem Namen (case-insensitive)
+            same_name = [e for e in all_entries if e[0].lower() == target_lower]
             picked = None
-            if candidates:
-                # 1) Exakter Name-Match — bevorzugt mit Phone
-                exact = [c for c in candidates if c[0].lower() == target_lower]
-                if exact:
-                    picked = exact[0]
-                # 2) Genau EIN Treffer ueberhaupt — eindeutig
-                elif len(candidates) == 1:
-                    picked = candidates[0]
-                # 3) Mehrere Treffer + kein Exact-Match -> ambiguous,
-                #    NICHT blind auswaehlen (das war der Renata-Bug).
-                else:
-                    print(
-                        f"[WHATSAPP] Mehrdeutige Contact-Suche fuer {to_name!r}: "
-                        f"{len(candidates)} Treffer ({', '.join(c[0] for c in candidates[:5])}) "
-                        f"-> Clipboard-Fallback statt Falsch-Match",
-                        flush=True,
+            ambiguity_reason = None
+
+            if len(same_name) > 1:
+                # Mehrere Kontakte mit identischem Namen — wir koennen NICHT
+                # automatisch auswaehlen, auch nicht wenn nur einer eine
+                # Phone hat. Im Adressbuch sind beide gleichberechtigt.
+                ambiguity_reason = (
+                    f"{len(same_name)} Kontakte mit dem Namen {to_name!r} "
+                    f"im macOS-Adressbuch — bitte Adressbuch bereinigen "
+                    f"oder phone explizit angeben"
+                )
+            elif len(same_name) == 1 and same_name[0][1]:
+                # Genau ein exakter Name-Match mit Phone
+                picked = same_name[0]
+            elif len(same_name) == 1 and not same_name[0][1]:
+                # Genau ein exakter Match aber OHNE Phone
+                ambiguity_reason = (
+                    f"Kontakt {to_name!r} im macOS-Adressbuch hat keine "
+                    f"Telefonnummer hinterlegt"
+                )
+            else:
+                # Kein Exakt-Match — pruefe Single-Substring-Match
+                with_phone = [e for e in all_entries if e[1]]
+                if len(with_phone) == 1:
+                    picked = with_phone[0]
+                elif len(with_phone) > 1:
+                    ambiguity_reason = (
+                        f"{len(with_phone)} mehrdeutige Kontakte fuer "
+                        f"{to_name!r} ({', '.join(e[0] for e in with_phone[:5])})"
                     )
+                else:
+                    ambiguity_reason = f"Kein Kontakt {to_name!r} mit Phone gefunden"
+
+            if ambiguity_reason:
+                print(f"[WHATSAPP] {ambiguity_reason} -> Clipboard-Fallback",
+                      flush=True)
+                # Clipboard-Path triggern via leeres phone
+                phone = ''
+                # Reason fuer den Caller verfuegbar machen (per global on instance)
+                # — wird in created_whatsapps-Marker eingebaut
+                _ambiguity_hint = ambiguity_reason
+            else:
+                _ambiguity_hint = None
             if picked:
                 phone = picked[1]
+                _ambiguity_hint = None
         except Exception:
-            pass
+            _ambiguity_hint = None
+    else:
+        _ambiguity_hint = None
 
     # Letzte Verteidigung: falls hier irgendetwas durchgekommen ist, das wie
     # ein Placeholder aussieht — nicht WhatsApp damit aufrufen.
@@ -1854,7 +1899,7 @@ def send_whatsapp_draft(spec, agent_name=None):
         if message:
             subprocess.run(['pbcopy'], input=message.encode('utf-8'), timeout=5)
         subprocess.run(['open', '-a', 'WhatsApp'], capture_output=True, text=True, timeout=10)
-        return to_name, None  # None signals clipboard fallback
+        return to_name, None, _ambiguity_hint
 
     # Normalize phone: remove spaces, dashes, dots, leading +
     phone_clean = re.sub(r'[\s./-]', '', phone).lstrip('+')
@@ -1865,7 +1910,7 @@ def send_whatsapp_draft(spec, agent_name=None):
     result = subprocess.run(['open', whatsapp_url], capture_output=True, text=True, timeout=10)
     if result.returncode != 0:
         raise Exception(f"WhatsApp konnte nicht geoeffnet werden: {result.stderr.strip()}")
-    return to_name, phone
+    return to_name, phone, None
 
 
 def send_slack_draft(spec):
@@ -10976,8 +11021,12 @@ def send_whatsapp_draft_route():
     try:
         spec = request.json
         agent_name = state.get('agent', 'standard')
-        to_name, phone = send_whatsapp_draft(spec, agent_name)
-        return jsonify({'ok': True, 'to': to_name, 'phone': phone, 'clipboard_fallback': phone is None})
+        to_name, phone, hint = send_whatsapp_draft(spec, agent_name)
+        return jsonify({
+            'ok': True, 'to': to_name, 'phone': phone,
+            'clipboard_fallback': phone is None,
+            'ambiguity_hint': hint,
+        })
     except Exception as e:
         return jsonify({'ok': False, 'error': str(e)})
 
@@ -11697,9 +11746,22 @@ def process_single_message(msg, kontext_override=None, state=None, **kwargs):
                         # den Lookup mit dem korrekten Vollnamen
                         if 'phone' in wspec and not _is_real_phone(wspec.get('phone')):
                             wspec.pop('phone', None)
-                    wa_to, wa_phone = send_whatsapp_draft(wspec, agent_name)
-                    created_whatsapps.append({'ok': True, 'to': wa_to, 'phone': wa_phone, 'clipboard_fallback': wa_phone is None})
-                    marker = f'\n[WhatsApp an {wa_to} vorbereitet — Aktion ausgefuehrt]\n'
+                    wa_to, wa_phone, wa_hint = send_whatsapp_draft(wspec, agent_name)
+                    created_whatsapps.append({
+                        'ok': True, 'to': wa_to, 'phone': wa_phone,
+                        'clipboard_fallback': wa_phone is None,
+                        'ambiguity_hint': wa_hint,
+                    })
+                    if wa_hint:
+                        # Mehrdeutiger oder unauflösbarer Lookup — der User soll
+                        # das sehen, statt dass die App still eine falsche
+                        # Nummer benutzt. Marker explizit ausweisen.
+                        marker = (f'\n[WhatsApp an {wa_to}: KEIN AUTO-VERSAND — '
+                                  f'{wa_hint}. Nachricht wurde in die Zwischenablage '
+                                  f'kopiert; bitte den richtigen Chat in WhatsApp manuell '
+                                  f'oeffnen und einfuegen.]\n')
+                    else:
+                        marker = f'\n[WhatsApp an {wa_to} vorbereitet — Aktion ausgefuehrt]\n'
                     text = text[:widx] + marker + text[wjend+1:]
                     wi = widx + len(marker)
                 except Exception as we:
