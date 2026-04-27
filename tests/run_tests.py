@@ -5372,6 +5372,193 @@ except Exception as _e:
     test("ChatResponseSignature live", False, str(_e))
 
 
+section("Usage Logger 2026-04-27 (Feature 3 — Roadmap April 2026)")
+
+# Modul-Datei vorhanden + sauber importierbar
+try:
+    _ul_path = os.path.expanduser("~/AssistantDev/src/usage_logger.py")
+    test("src/usage_logger.py existiert", os.path.exists(_ul_path))
+
+    sys.path.insert(0, os.path.expanduser("~/AssistantDev/src"))
+    import usage_logger as _ul
+    test("usage_logger Modul importierbar", True)
+
+    # Public API vorhanden
+    test("usage_logger.log_turn vorhanden", callable(getattr(_ul, "log_turn", None)))
+    test("usage_logger.classify_task vorhanden", callable(getattr(_ul, "classify_task", None)))
+    test("usage_logger.estimate_tokens vorhanden", callable(getattr(_ul, "estimate_tokens", None)))
+    test("usage_logger.get_summary vorhanden", callable(getattr(_ul, "get_summary", None)))
+    test("usage_logger.CATEGORIES enthaelt 'other'",
+         isinstance(getattr(_ul, "CATEGORIES", None), list)
+         and "other" in _ul.CATEGORIES)
+
+    # Klassifikator: harte Keyword-Treffer
+    test("classify('Schreib mir eine Python-Funktion') == 'coding'",
+         _ul.classify_task("Schreib mir eine Python-Funktion") == "coding")
+    test("classify('Schreib eine E-Mail an Sven') == 'email'",
+         _ul.classify_task("Schreib eine E-Mail an Sven") == "email")
+    test("classify('Mach mir bitte eine Recherche zu X') == 'research'",
+         _ul.classify_task("Mach mir bitte eine Recherche zu X") == "research")
+    test("classify('Bild generier fuer LinkedIn') == 'image'",
+         _ul.classify_task("Bild generier fuer LinkedIn") == "image")
+    test("classify('Generier ein Video fuer Reels') == 'video'",
+         _ul.classify_task("Generier ein Video fuer Reels") == "video")
+    test("classify('Uebersetz das ins Englische') == 'translation'",
+         _ul.classify_task("Uebersetz das ins Englische") == "translation")
+    test("classify('Hi') == 'other'", _ul.classify_task("Hi") == "other")
+    test("classify('') == 'other'", _ul.classify_task("") == "other")
+    test("classify(None) == 'other'", _ul.classify_task(None) == "other")
+
+    # Token-Schaetzung sinnvoll
+    test("estimate_tokens('') == 0", _ul.estimate_tokens("") == 0)
+    test("estimate_tokens('1234') >= 1", _ul.estimate_tokens("1234") >= 1)
+    test("estimate_tokens(40 chars) ~ 10", 5 <= _ul.estimate_tokens("a" * 40) <= 15)
+except Exception as _e:
+    test("usage_logger sanity", False, str(_e))
+
+
+# Schreib-Pipeline live: log_turn -> JSONL-Eintrag (Sentinel-Marker)
+try:
+    import json as _ul_json
+    _sentinel = "USAGE_LOGGER_TEST_" + str(int(time.time()))
+    _ul.log_turn(
+        agent="test_agent",
+        provider="TestProvider",
+        model="TestModel",
+        user_message=_sentinel + " Schreib mir Code",
+        assistant_response="ok",
+        duration_seconds=0.42,
+        sub_agent=None,
+        session_id="test_session",
+    )
+    # Writer ist async — kurz warten, max 3 Sekunden
+    import time as _ul_time
+    _logfile = _ul._current_logfile()
+    _found_entry = None
+    for _ in range(30):
+        _ul_time.sleep(0.1)
+        if not os.path.exists(_logfile):
+            continue
+        with open(_logfile, "r", encoding="utf-8") as _f:
+            for _line in _f:
+                _line = _line.strip()
+                if not _line:
+                    continue
+                try:
+                    _e = _ul_json.loads(_line)
+                except Exception:
+                    continue
+                if isinstance(_e.get("user_message"), str) and _sentinel in _e["user_message"]:
+                    _found_entry = _e
+                    break
+        if _found_entry:
+            break
+
+    test("log_turn schreibt JSONL-Eintrag", _found_entry is not None)
+    if _found_entry:
+        test("Eintrag enthaelt timestamp", bool(_found_entry.get("timestamp")))
+        test("Eintrag enthaelt agent='test_agent'", _found_entry.get("agent") == "test_agent")
+        test("Eintrag enthaelt provider='TestProvider'",
+             _found_entry.get("provider") == "TestProvider")
+        test("Eintrag enthaelt model='TestModel'",
+             _found_entry.get("model") == "TestModel")
+        test("Eintrag enthaelt category='coding' (Keyword 'Code')",
+             _found_entry.get("category") == "coding")
+        test("Eintrag enthaelt duration_seconds (Float)",
+             isinstance(_found_entry.get("duration_seconds"), (int, float)))
+        test("Eintrag enthaelt tokens_estimated.input + .output",
+             isinstance(_found_entry.get("tokens_estimated"), dict)
+             and "input" in _found_entry["tokens_estimated"]
+             and "output" in _found_entry["tokens_estimated"])
+except Exception as _e:
+    test("usage_logger write pipeline", False, str(_e))
+
+
+# get_summary() liefert sinnvolles Aggregat
+try:
+    _summary = _ul.get_summary()
+    test("get_summary ist dict", isinstance(_summary, dict))
+    for _key in ("turns_today", "turns_this_week", "turns_this_month",
+                 "top_categories", "top_model_per_agent",
+                 "avg_turn_duration_seconds"):
+        test(f"summary enthaelt '{_key}'", _key in _summary)
+    test("turns_today >= 1 (gerade gerade einer geschrieben)",
+         _summary.get("turns_today", 0) >= 1)
+    test("top_categories ist Liste", isinstance(_summary.get("top_categories"), list))
+    test("top_model_per_agent ist dict",
+         isinstance(_summary.get("top_model_per_agent"), dict))
+except Exception as _e:
+    test("usage_logger summary", False, str(_e))
+
+
+# Live-Endpoint /api/usage/summary
+try:
+    r = requests.get("http://localhost:8080/api/usage/summary", timeout=10)
+    test("/api/usage/summary 200", r.status_code == 200)
+    if r.status_code == 200:
+        _data = r.json()
+        test("/api/usage/summary liefert JSON-Dict", isinstance(_data, dict))
+        test("/api/usage/summary hat 'available'", "available" in _data)
+        for _key in ("turns_today", "turns_this_week", "turns_this_month",
+                     "top_categories", "top_model_per_agent",
+                     "avg_turn_duration_seconds"):
+            test(f"/api/usage/summary hat '{_key}'", _key in _data)
+except requests.exceptions.RequestException as _e:
+    test("/api/usage/summary live", False, f"server not reachable: {_e}")
+except Exception as _e:
+    test("/api/usage/summary live", False, str(_e))
+
+
+# Wiring: web_server.py ruft den Logger auch wirklich auf
+try:
+    with open(os.path.expanduser("~/AssistantDev/src/web_server.py")) as _f:
+        _ws_src = _f.read()
+    test("web_server importiert usage_logger",
+         "import usage_logger" in _ws_src)
+    test("web_server hat _log_chat_turn-Wrapper",
+         "def _log_chat_turn(" in _ws_src)
+    # An mindestens einer Stelle muss er aufgerufen werden — heisst: chat-Path
+    test("_log_chat_turn wird in chat()-Handler genutzt",
+         _ws_src.count("_log_chat_turn(") >= 3)
+    test("/api/usage/summary Route in web_server registriert",
+         "@app.route('/api/usage/summary'" in _ws_src)
+except Exception as _e:
+    test("web_server usage_logger wiring", False, str(_e))
+
+
+# Live: nach echtem /chat-Turn MUSS turns_today gestiegen sein
+try:
+    _before = requests.get("http://localhost:8080/api/usage/summary", timeout=10).json()
+    _t0 = _before.get("turns_today", 0) if isinstance(_before, dict) else 0
+
+    import uuid as _uul
+    _SID = "ulogger_" + str(_uul.uuid4())
+    requests.post("http://localhost:8080/select_agent",
+                  json={"agent": "privat", "session_id": _SID}, timeout=5)
+    requests.post("http://localhost:8080/select_model",
+                  json={"provider": "anthropic",
+                        "model_id": "claude-haiku-4-5-20251001",
+                        "session_id": _SID}, timeout=5)
+    requests.post("http://localhost:8080/chat",
+                  json={"message": "sag nur ok", "session_id": _SID},
+                  timeout=60)
+
+    # Logger ist async — kurz warten
+    _t1 = _t0
+    for _ in range(30):
+        time.sleep(0.1)
+        _after = requests.get("http://localhost:8080/api/usage/summary", timeout=10).json()
+        _t1 = _after.get("turns_today", 0) if isinstance(_after, dict) else 0
+        if _t1 > _t0:
+            break
+    test("turns_today nach echtem /chat-Turn gestiegen", _t1 > _t0,
+         f"vorher={_t0} nachher={_t1}")
+except requests.exceptions.RequestException as _e:
+    test("usage_logger live /chat increment", False, f"server not reachable: {_e}")
+except Exception as _e:
+    test("usage_logger live /chat increment", False, str(_e))
+
+
 _cleanup_test_artifacts()
 
 # ============================================================

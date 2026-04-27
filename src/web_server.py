@@ -42,6 +42,48 @@ try:
 except ImportError:
     inject_capabilities_on_startup = None
 
+# Usage Logger (Feature 3 — Roadmap April 2026): passives Turn-Logging
+# Fire-and-forget, blockiert /chat nie. Bei Import-Fehler -> No-Op-Stub.
+try:
+    import usage_logger as _usage_logger
+except Exception as _ule:
+    print(f"[usage_logger] Import fehlgeschlagen: {_ule}", flush=True)
+    _usage_logger = None
+
+
+def _log_chat_turn(*, msg, result, duration, session_id, agent_override=None,
+                   sub_agent=None):
+    """Wrapper um usage_logger.log_turn — niemals exception-propagating.
+
+    Wird nach jedem erfolgreichen process_single_message-Aufruf gerufen.
+    'result' ist das Dict aus process_single_message (oder execute_delegation).
+    """
+    if _usage_logger is None:
+        return
+    try:
+        if not isinstance(result, dict):
+            return
+        # Sub-agent-Confirmation oder Fehler nicht mitloggen
+        if result.get('type') == 'subagent_confirmation_required':
+            return
+        if 'error' in result and 'response' not in result:
+            return
+        _usage_logger.log_turn(
+            agent=agent_override or result.get('agent') or '',
+            provider=result.get('provider') or result.get('provider_display') or '',
+            model=result.get('model') or result.get('model_display') or result.get('model_name') or '',
+            user_message=msg,
+            assistant_response=result.get('response') or '',
+            duration_seconds=duration,
+            sub_agent=sub_agent or result.get('delegated_to'),
+            session_id=session_id,
+        )
+    except Exception as e:
+        try:
+            print(f"[usage_logger] _log_chat_turn failed: {e}", flush=True)
+        except Exception:
+            pass
+
 # ─── IMAGE HELPERS ───────────────────────────────────────────────────────────
 # Anthropic API limitiert Bild-Dimensionen auf max. 8000 px pro Seite.
 # Groessere Bilder muessen vor dem Senden herunterskaliert werden.
@@ -12793,16 +12835,24 @@ def process_queue_worker(state):
             state['current_prompt'] = item['message'][:50]
 
         try:
+            _q_started = _time.time()
             result = process_single_message(item['message'], kontext_override=item.get('kontext_snapshot'), state=state)
             result['queue_id'] = item['id']
             result['original_message'] = item['message'][:50]
             with queue_lock:
                 state['completed_responses'].append(result)
             # Auto-save after queue item processed
+            _matched_sid = None
             for _sid, _st in sessions.items():
                 if _st is state:
                     auto_save_session(_sid)
+                    _matched_sid = _sid
                     break
+            _log_chat_turn(
+                msg=item['message'], result=result,
+                duration=_time.time() - _q_started,
+                session_id=_matched_sid,
+            )
         except Exception as e:
             with queue_lock:
                 state['completed_responses'].append({
@@ -12829,6 +12879,7 @@ def subagent_confirm():
     if not confirmed:
         # User declined — process with current agent (no delegation)
         try:
+            _sc_started = _time.time()
             # Re-process the original message without delegation
             result = process_single_message(
                 pending['msg'], state=state, skip_delegation=True,
@@ -12836,12 +12887,18 @@ def subagent_confirm():
                 auto_loaded_override=pending.get('auto_loaded', []),
                 auto_search_info_override=pending.get('auto_search_info', ''),
             )
+            _log_chat_turn(
+                msg=pending['msg'], result=result,
+                duration=_time.time() - _sc_started,
+                session_id=session_id,
+            )
             return jsonify(result)
         except Exception as e:
             return jsonify({'error': str(e)})
 
     # User confirmed — execute delegation
     try:
+        _dl_started = _time.time()
         deleg_result = execute_delegation(
             pending['sub_agent'], pending['msg'],
             pending.get('kontext', []), state=state
@@ -12855,7 +12912,7 @@ def subagent_confirm():
                 auto_save_session(_sid)
                 break
         model_name = deleg_result.get('model_name', '')
-        return jsonify({
+        response_payload = {
             'response': deleg_result['response'],
             'model_name': model_name,
             'provider_display': deleg_result.get('provider_display', ''),
@@ -12869,9 +12926,46 @@ def subagent_confirm():
             'created_images': [], 'created_videos': [], 'created_slacks': [],
             'delegated_to': deleg_result.get('delegated_to', ''),
             'delegated_display': deleg_result.get('delegated_display', ''),
-        })
+        }
+        _log_chat_turn(
+            msg=pending['msg'], result=response_payload,
+            duration=_time.time() - _dl_started,
+            session_id=session_id,
+            sub_agent=pending.get('sub_agent'),
+        )
+        return jsonify(response_payload)
     except Exception as e:
         return jsonify({'error': str(e)})
+
+
+@app.route('/api/usage/summary', methods=['GET'])
+def api_usage_summary():
+    """Aggregat-Statistik fuer den Usage Logger (Feature 3, Roadmap 2026-04).
+    Liefert Turn-Counts (heute/Woche/Monat), Top-Kategorien, Top-Modell pro
+    Agent und Durchschnitts-Turn-Dauer. Niemals Fehler werfen — wenn der
+    Logger nicht verfuegbar ist, wird ein leerer Stub geliefert.
+    """
+    if _usage_logger is None:
+        return jsonify({
+            'available': False,
+            'error': 'usage_logger nicht geladen',
+            'turns_today': 0, 'turns_this_week': 0, 'turns_this_month': 0,
+            'turns_total_scanned': 0,
+            'top_categories': [], 'top_model_per_agent': {},
+            'avg_turn_duration_seconds': 0.0,
+        })
+    try:
+        summary = _usage_logger.get_summary()
+        summary['available'] = True
+        return jsonify(summary)
+    except Exception as e:
+        return jsonify({
+            'available': False, 'error': str(e),
+            'turns_today': 0, 'turns_this_week': 0, 'turns_this_month': 0,
+            'turns_total_scanned': 0,
+            'top_categories': [], 'top_model_per_agent': {},
+            'avg_turn_duration_seconds': 0.0,
+        })
 
 
 @app.route('/chat', methods=['POST'])
@@ -12905,6 +12999,7 @@ def chat():
     with _active_requests_lock:
         global _active_requests
         _active_requests += 1
+    _turn_started = _time.time()
     try:
         result = process_single_message(msg, state=state, _session_id=session_id)
     except Exception as e:
@@ -12926,6 +13021,11 @@ def chat():
             state['current_prompt'] = ''
 
     result['queue_active'] = has_queue
+    _log_chat_turn(
+        msg=msg, result=result,
+        duration=_time.time() - _turn_started,
+        session_id=session_id,
+    )
     return jsonify(result)
 
 
@@ -15044,7 +15144,9 @@ def _imsg_probe_access() -> dict:
 # max. alle 90s neu aufgebaut — SQLite-Query ist schnell (~100ms), aber
 # 115k+ Messages durchzugehen kostet doch was.
 _APPLE_MAIL_READ_CACHE = {"keys": set(), "ts": 0.0, "error": None}
-_APPLE_MAIL_READ_TTL = 90
+_APPLE_MAIL_READ_TTL = 20  # gesenkt von 90s — User-perception von "nicht oft genug syncen"
+                            # bei Read/Unread. Envelope-Index-Lesen ist billig (~ms),
+                            # aggressiveres Refresh kostet kaum was.
 
 
 def _normalize_subject(subject: str) -> str:
@@ -17237,9 +17339,15 @@ def api_message_thread(msg_id):
     })
 
 
-@app.route("/api/messages/conversation/<conv_id>")
+@app.route("/api/messages/conversation/<path:conv_id>")
 def api_conversation_detail(conv_id):
-    """Alias fuer /api/messages/<id>/thread mit conversation_id als Key."""
+    """Alias fuer /api/messages/<id>/thread mit conversation_id als Key.
+
+    `<path:conv_id>` (statt `<conv_id>`) erlaubt Slashes im Wert — sonst
+    schlagen Mails mit "/" im Subject (z.B. "Fall Winter 26/27") fehl
+    (HTTP 404), weil die conversation_id-Konstruktion das Subject als
+    Key nutzt und das Slash beim Routing verschluckt wird.
+    """
     try:
         messages = _msg_get_all()
     except Exception as e:
