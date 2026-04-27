@@ -8124,7 +8124,7 @@ def _move_agent_storage(old_slug: str, new_slug: str):
     return True
 
 
-def _archive_agent(slug: str, reason: str = 'user_delete') -> dict:
+def _archive_agent(slug: str, reason=None) -> dict:
     """Archiviert einen Agent nach <base>/.deleted_agents/<slug>_<ts>/.
 
     Verschiebt:
@@ -9648,8 +9648,25 @@ def api_agent_delete(name):
     """
     if not _agent_exists(name):
         return jsonify({'error': f'agent "{name}" not found'}), 404
+    # Reason kann ueber drei Kanaele kommen (Frontend-DELETE-Wrapper schickt
+    # bei manchen Proxies keinen JSON-Body — Header/Query als Fallback):
+    # JSON-Body > X-Archive-Reason Header > ?reason= Query.
+    # Header wird URL-decoded (HTTP-Header-Konvention fuer Non-ASCII chars).
+    # Body kommt pre-decoded aus JSON; Query wird von Flask schon decoded.
+    import urllib.parse as _urlparse
     body = request.get_json(silent=True) or {}
-    reason = (body.get('reason') or 'user_delete').strip()[:100]
+    reason = body.get('reason')
+    if not reason:
+        hdr = request.headers.get('X-Archive-Reason')
+        if hdr:
+            reason = _urlparse.unquote(hdr)
+    if not reason:
+        reason = request.args.get('reason')
+    if reason:
+        # Trim + Hardcap. None bleibt None (Akzeptanzkriterium 3).
+        reason = reason.strip()[:200] or None
+    else:
+        reason = None
     try:
         meta = _archive_agent(name, reason=reason)
     except OSError as e:

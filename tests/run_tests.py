@@ -4705,6 +4705,66 @@ except Exception as _e:
     test("Model-Catalog models.json check", False, str(_e))
 
 
+section("DELETE /agents reason via Body/Header/Query 2026-04-27")
+
+try:
+    with open(os.path.expanduser("~/AssistantDev/src/web_server.py")) as _f:
+        _ws = _f.read()
+    test("DELETE /agents liest reason aus Body/Header/Query",
+         "X-Archive-Reason" in _ws and
+         "request.args.get('reason')" in _ws)
+    test("X-Archive-Reason wird URL-decoded",
+         "_urlparse.unquote(hdr)" in _ws)
+    test("_archive_agent default reason=None statt 'user_delete'",
+         "def _archive_agent(slug: str, reason=None)" in _ws)
+    test("Reihenfolge dokumentiert: Body > Header > Query",
+         "JSON-Body > X-Archive-Reason Header > ?reason= Query" in _ws)
+except Exception as _e:
+    test("DELETE-reason grep", False, str(_e))
+
+# Live: 4 Akzeptanzkriterien
+try:
+    # Slot 1: kein reason -> null
+    requests.post(BASE_URL + "/agents", json={"label": "reason_live_1"}, timeout=10)
+    _r = requests.delete(BASE_URL + "/agents/reason_live_1", timeout=10)
+    aid = _r.json().get("archive_id")
+    arch_list = requests.get(BASE_URL + "/agents/archive", timeout=10).json().get("archives", [])
+    rec = next((a for a in arch_list if a.get("archive_id") == aid), None)
+    test("Live: kein reason gesetzt -> null in _meta", rec and rec.get("reason") is None)
+
+    # Slot 2: Header URL-encoded
+    requests.post(BASE_URL + "/agents", json={"label": "reason_live_2"}, timeout=10)
+    _r = requests.delete(BASE_URL + "/agents/reason_live_2",
+                         headers={"X-Archive-Reason": "weil%20es%20muss"}, timeout=10)
+    aid = _r.json().get("archive_id")
+    arch_list = requests.get(BASE_URL + "/agents/archive", timeout=10).json().get("archives", [])
+    rec = next((a for a in arch_list if a.get("archive_id") == aid), None)
+    test("Live: Header X-Archive-Reason URL-decoded",
+         rec and rec.get("reason") == "weil es muss")
+
+    # Slot 3: Query-Param
+    requests.post(BASE_URL + "/agents", json={"label": "reason_live_3"}, timeout=10)
+    _r = requests.delete(BASE_URL + "/agents/reason_live_3?reason=via-query", timeout=10)
+    aid = _r.json().get("archive_id")
+    arch_list = requests.get(BASE_URL + "/agents/archive", timeout=10).json().get("archives", [])
+    rec = next((a for a in arch_list if a.get("archive_id") == aid), None)
+    test("Live: Query ?reason wird gelesen", rec and rec.get("reason") == "via-query")
+
+    # Slot 4: Priority Body > Header > Query
+    requests.post(BASE_URL + "/agents", json={"label": "reason_live_4"}, timeout=10)
+    _r = requests.delete(BASE_URL + "/agents/reason_live_4?reason=q",
+                         json={"reason": "from-body"},
+                         headers={"X-Archive-Reason": "from-header",
+                                  "Content-Type": "application/json"},
+                         timeout=10)
+    aid = _r.json().get("archive_id")
+    arch_list = requests.get(BASE_URL + "/agents/archive", timeout=10).json().get("archives", [])
+    rec = next((a for a in arch_list if a.get("archive_id") == aid), None)
+    test("Live: Body > Header > Query Priority", rec and rec.get("reason") == "from-body")
+except Exception as _e:
+    test("DELETE-reason live", False, str(_e))
+
+
 section("Agent-Lifecycle robust 2026-04-27 (Create+Rename+Delete+Restore mit Storage)")
 
 try:
@@ -4726,7 +4786,7 @@ try:
     test("_move_agent_storage-Helper definiert",
          "def _move_agent_storage(old_slug: str, new_slug: str):" in _ws)
     test("_archive_agent-Helper definiert",
-         "def _archive_agent(slug: str, reason: str = 'user_delete')" in _ws)
+         "def _archive_agent(slug: str, reason=None)" in _ws)
     test("_restore_agent-Helper definiert",
          "def _restore_agent(archive_id: str)" in _ws)
     test("_deleted_agents_dir-Helper definiert",
