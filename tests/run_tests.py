@@ -4705,6 +4705,84 @@ except Exception as _e:
     test("Model-Catalog models.json check", False, str(_e))
 
 
+section("3 Backend-TODOs 2026-04-27 (Agent-Persist + Cleanup-Global + iMessage-FDA)")
+
+try:
+    with open(os.path.expanduser("~/AssistantDev/src/web_server.py")) as _f:
+        _ws = _f.read()
+
+    # TODO 1: POST /agents fsync + Log + Orphan-Promote
+    test("POST /agents ruft os.fsync() auf",
+         "os.fsync(fh.fileno())" in _ws and
+         "[AGENT-CREATE] agent_created name=" in _ws)
+    test("get_agents() promotet Orphan-Children zu Top-Level",
+         "Orphan-Children werden direkt als Top-Level-Agenten" in _ws)
+    test("Orphan-Promotion: kein synthetic-parent mehr",
+         "for c in sorted(children[op]):" in _ws and
+         "'has_subagents': False,\n                'subagents': []," in _ws)
+
+    # TODO 2: Cleanup-Response mit Per-Agent-Breakdown
+    test("Cleanup-Response hat agents-breakdown",
+         "'agents': agents_breakdown" in _ws)
+    test("Cleanup-Response hat total-Alias",
+         "'total': len(junk_entries),  # alias fuer Frontend-Konsumenten" in _ws)
+    test("Per-Agent breakdown sortiert + ids[]",
+         "agents_breakdown = sorted([" in _ws and
+         "'would_delete': len(ids)" in _ws)
+
+    # TODO 3: iMessage probe-fix Hint
+    test("_imsg_probe_access liefert fix-Hint bei authorization denied",
+         '"authorization denied" in err.lower()' in _ws and
+         "Full-Disk-Access fuer den Server-Prozess fehlt" in _ws)
+    test("/api/messages/sources expose access_fix + access_binary",
+         'entry["access_fix"] = probe.get("fix")' in _ws and
+         'entry["access_binary"] = probe.get("binary")' in _ws)
+except Exception as _e:
+    test("3 BACKEND_TODOs grep", False, str(_e))
+
+
+# Live: 3 fixes
+try:
+    # TODO 1 live: agent mit '_' im slug erscheint top-level
+    _r = requests.post(BASE_URL + "/agents",
+                       json={"label": "test_topleveltodo_2026"},
+                       timeout=10)
+    if _r.ok:
+        _r2 = requests.get(BASE_URL + "/agents", timeout=10)
+        names = [a.get("name") for a in (_r2.json() or [])]
+        test("Live: Agent mit '_' im slug erscheint als Top-Level",
+             "test_topleveltodo_2026" in names)
+        # Aufraeumen
+        requests.delete(BASE_URL + "/agents/test_topleveltodo_2026", timeout=10)
+    else:
+        test("Live: Agent-create top-level test", False, f"create failed: {_r.status_code}")
+
+    # TODO 2 live: cleanup response shape
+    _r = requests.post(BASE_URL + "/api/conversations/cleanup",
+                       json={"dry_run": True}, timeout=30)
+    _data = _r.json() if _r.ok else {}
+    test("Live: cleanup-Response hat 'agents'-Liste",
+         isinstance(_data.get("agents"), list))
+    test("Live: cleanup-Response hat 'total'-Feld",
+         isinstance(_data.get("total"), int))
+    if _data.get("agents"):
+        first = _data["agents"][0]
+        test("Live: per-agent-Breakdown hat agent + would_delete + ids",
+             "agent" in first and "would_delete" in first and "ids" in first)
+
+    # TODO 3 live: iMessage diagnostic enriched
+    _r = requests.get(BASE_URL + "/api/messages/sources", timeout=10)
+    _imsg = next((s for s in (_r.json() or {}).get("sources", []) if s["key"] == "imessage"), None)
+    if _imsg and not _imsg.get("access_ok"):
+        # Wenn FDA fehlt, sollte access_fix gesetzt sein
+        test("Live: iMessage access_fix bei FDA-Fehler verfuegbar",
+             bool(_imsg.get("access_fix")))
+        test("Live: iMessage access_binary verfuegbar fuer User-Hint",
+             bool(_imsg.get("access_binary")))
+except Exception as _e:
+    test("3-TODOs Live", False, str(_e))
+
+
 section("Email body_html + Attachments-Pipeline 2026-04-27")
 
 try:

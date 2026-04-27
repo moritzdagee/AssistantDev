@@ -9068,13 +9068,30 @@ def api_conversations_cleanup():
                 # Single-File-Fehler nicht den ganzen Lauf abbrechen lassen.
                 print(f'[CONV-CLEANUP] Konnte {full_path} nicht verschieben: {e}')
 
+    # Per-Agent-Breakdown (BACKEND_TODO_CONVERSATION_CLEANUP_GLOBAL_2026-04-27).
+    # Frontend baut daraus den Confirm-Dialog "X Junk in Y, Z Junk in W".
+    from collections import defaultdict as _dd_cleanup
+    by_agent = _dd_cleanup(list)
+    for entry, _reason, _fp, _sp in junk_entries:
+        by_agent[entry['agent']].append(entry['id'])
+    agents_breakdown = sorted([
+        {
+            'agent': agent,
+            'would_delete': len(ids),
+            'ids': sorted(ids),
+        }
+        for agent, ids in by_agent.items()
+    ], key=lambda x: x['agent'])
+
     return jsonify({
         'scanned': scanned,
         'junk': len(junk_entries),
+        'total': len(junk_entries),  # alias fuer Frontend-Konsumenten
         'moved': moved,
         'destination': deleted_subdir + '/',
         'dry_run': dry_run,
         'examples': examples,
+        'agents': agents_breakdown,
     })
 
 
@@ -9294,12 +9311,20 @@ def api_agent_create():
     path = os.path.join(AGENTS_DIR, slug + '.txt')
     prompt = description or f'Du bist {label}, ein hilfreicher Assistent.'
     try:
+        # Synchroner Disk-Write: fh.flush() + os.fsync() bevor wir 201 melden,
+        # damit das Frontend bei HTTP-200 garantiert weiss, dass der Agent
+        # ueber Server-Restart hinweg persistiert ist (BACKEND_TODO 2026-04-27,
+        # Symptom "Nayara verschwand").
         with open(path, 'w', encoding='utf-8') as fh:
             fh.write(prompt)
+            fh.flush()
+            os.fsync(fh.fileno())
         speicher = get_agent_speicher(slug)
         os.makedirs(speicher, exist_ok=True)
     except OSError as e:
+        print(f"[AGENT-CREATE] FEHLER fuer slug={slug!r}: {e}", flush=True)
         return jsonify({'error': str(e)}), 500
+    print(f"[AGENT-CREATE] agent_created name={slug} label={label!r} path={path}", flush=True)
     return jsonify({
         'name': slug, 'label': label, 'description': description,
         'has_subagents': False, 'subagents': []
@@ -9550,24 +9575,23 @@ def get_agents():
             'has_subagents': len(subs) > 0,
             'subagents': subs,
         })
+    # Orphan-Children: ein Agent-File hat einen "_"-Prefix (z.B. "nayara_pro"),
+    # aber das vermutete Parent-File ("nayara.txt") existiert NICHT. Frueher
+    # haben wir hier einen synthetischen Parent erzeugt — was den User-erstellten
+    # Top-Level-Agent versteckte ("Nayara verschwand"-Bug, BACKEND_TODO
+    # 2026-04-27). Jetzt: Orphan-Children werden direkt als Top-Level-Agenten
+    # in die Liste gehoben, weil der User sie explizit so angelegt hat.
     orphan_parents = set(children.keys()) - set(parents)
     for op in sorted(orphan_parents):
-        subs = []
-        for c in children[op]:
-            sub_label = c.split('_', 1)[1] if '_' in c else c
-            subs.append({
-                'name': c, 'label': sub_label,
+        for c in sorted(children[op]):
+            result.append({
+                'name': c,
+                'label': c,
                 'description': _agent_description_full(c),
                 'description_preview': _agent_description_preview(c),
+                'has_subagents': False,
+                'subagents': [],
             })
-        result.append({
-            'name': op,
-            'label': op,
-            'description': '',
-            'description_preview': '',
-            'has_subagents': True,
-            'subagents': subs,
-        })
     return jsonify(result)
 
 
@@ -14575,7 +14599,13 @@ _IMSG_APPLE_EPOCH = 978307200
 def _imsg_probe_access() -> dict:
     """Testet ob chat.db lesbar ist. Liefert erweiterte Diagnose inkl.
     Server-Binary-Pfad, damit der Nutzer genau weiss welchen Eintrag er
-    in Systemeinstellungen -> FDA setzen muss."""
+    in Systemeinstellungen -> FDA setzen muss.
+
+    Bei "authorization denied" geben wir eine actionable Hint-Nachricht
+    zurueck (BACKEND_TODO_IMESSAGE_INBOX_EMPTY_2026-04-27): das Frontend
+    kann den Nutzer direkt zur Permission-Konfig leiten statt nur "leer"
+    zu zeigen.
+    """
     import sys as _sys
     info = {
         "binary": _sys.executable,
@@ -14583,7 +14613,8 @@ def _imsg_probe_access() -> dict:
         "ppid": os.getppid(),
     }
     if not os.path.isfile(_IMSG_DB_PATH):
-        return dict(info, ok=False, reason="chat.db existiert nicht")
+        return dict(info, ok=False, reason="chat.db existiert nicht",
+                    fix="iMessage ist auf diesem Mac nicht eingerichtet — Nachrichten-App oeffnen + Apple-ID einloggen.")
     try:
         import sqlite3 as _sq
         conn = _sq.connect(f"file:{_IMSG_DB_PATH}?mode=ro&immutable=1", uri=True, timeout=2)
@@ -14597,7 +14628,20 @@ def _imsg_probe_access() -> dict:
         conn.close()
         return dict(info, ok=True, messages=msg_cnt, chats=chat_cnt, archived=arch_cnt)
     except Exception as e:
-        return dict(info, ok=False, reason=str(e))
+        err = str(e)
+        # Actionable Fix fuer den haeufigsten Fall: FDA-Permission fehlt
+        # fuer den Server-Prozess. Da der Server via /usr/bin/python3 laeuft,
+        # muss DAS in System-Settings als Full-Disk-Access getoggelt sein.
+        if "authorization denied" in err.lower() or "operation not permitted" in err.lower():
+            fix = (
+                "Full-Disk-Access fuer den Server-Prozess fehlt. "
+                f"Oeffne System-Einstellungen -> Datenschutz & Sicherheit -> "
+                f"Festplattenvollzugriff und fuege '{info['binary']}' hinzu (Plus-Knopf, "
+                f"Cmd+Shift+G, Pfad eingeben). Danach Server neu starten "
+                f"(`bash scripts/deploy.sh`)."
+            )
+            return dict(info, ok=False, reason=err, fix=fix)
+        return dict(info, ok=False, reason=err)
 
 
 # Apple Mail Envelope-Index: Cache des "read"-Sets. Wird pro Request
@@ -16016,11 +16060,15 @@ def api_messages_sources():
             "supports_read": src["type"] in _MSG_BIDIRECTIONAL_SYNC_TYPES,
         }
         # iMessage: FDA-Status mitgeben, damit das Frontend eine klare
-        # Fehlermeldung zeigen kann, wenn die Permission fehlt.
+        # Fehlermeldung zeigen kann, wenn die Permission fehlt. Plus
+        # `access_fix`-Hint mit konkreten User-Action-Steps (BACKEND_TODO
+        # 2026-04-27).
         if src["type"] == "imessage":
             probe = _imsg_probe_access()
             entry["access_ok"] = probe.get("ok", False)
             entry["access_error"] = probe.get("reason") if not probe.get("ok") else None
+            entry["access_fix"] = probe.get("fix") if not probe.get("ok") else None
+            entry["access_binary"] = probe.get("binary") if not probe.get("ok") else None
         # kChat: Token-Status aus Watcher-Log
         elif src["type"] == "kchat":
             probe = _kchat_probe_status()
