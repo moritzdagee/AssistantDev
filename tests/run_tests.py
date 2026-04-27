@@ -5216,6 +5216,82 @@ except Exception as _e:
     test("Junk live", False, str(_e))
 
 
+section("Permissions Detection + Matrix 2026-04-27")
+
+try:
+    with open(os.path.expanduser("~/AssistantDev/src/web_server.py")) as _f:
+        _ws = _f.read()
+
+    # /api/permissions: Slack raus, Detection per echter Probe
+    test("Slack-Eintrag aus /api/permissions OAuth-Block entfernt",
+         "('slack', 'Slack', 'https://api.slack.com/apps')" not in _ws)
+    test("_canva_connected prueft access_token in models.json",
+         "def _canva_connected():" in _ws and "models_cfg.get('canva') or {}" in _ws)
+    test("_google_calendar_connected mit mehreren Token-Pfaden",
+         "def _google_calendar_connected():" in _ws and
+         "google_calendar_oauth.json" in _ws)
+    test("_macos_mail_connected nutzt _apple_mail_envelope_probe()",
+         "def _macos_mail_connected():" in _ws and
+         "_apple_mail_envelope_probe()" in _ws)
+    test("_macos_contacts_connected prueft AddressBook-Verzeichnis",
+         "def _macos_contacts_connected():" in _ws and "AddressBook" in _ws)
+    test("_macos_calendar_connected prueft ~/Library/Calendars",
+         "def _macos_calendar_connected():" in _ws and "Library/Calendars" in _ws)
+    # Slack auch aus /api/oauth-status raus
+    test("/api/oauth-status: Slack-Eintrag entfernt",
+         "'service': 'slack'" not in _ws)
+
+    # /api/permissions_matrix: resources-Field, Default-Resources, Union mit Disk-Agents
+    test("permissions_matrix liefert resources-Field (kanonisch)",
+         "'resources': resources" in _ws)
+    test("permissions_matrix behaelt scopes-Alias (Backwards-Compat)",
+         "'scopes': resources" in _ws)
+    test("Default-Resources enthalten mail/whatsapp/imessage/calendar/contacts",
+         "_PERMISSIONS_MATRIX_DEFAULT_RESOURCES = [" in _ws and
+         "'mail'" in _ws and "'whatsapp'" in _ws and "'imessage'" in _ws)
+    test("Cells haben crossRead-Feld",
+         "'crossRead'" in _ws)
+    test("Agents Union mit Disk (auch ohne ACL-Eintrag in Matrix)",
+         "set(list(agents_map.keys()) + list(disk_agents))" in _ws)
+except Exception as _e:
+    test("Permissions grep", False, str(_e))
+
+# Live-Verifikation
+try:
+    r = requests.get("http://localhost:8080/api/permissions", timeout=10)
+    items = r.json() if r.status_code == 200 else []
+    test("/api/permissions: kein Slack-Eintrag",
+         not any('slack' in (i.get('id') or '') for i in items))
+    test("/api/permissions: macos_mail-Detection liefert ok|missing (kein 'unknown')",
+         any(i.get('id') == 'macos_mail' and i.get('status') in ('ok', 'missing') for i in items))
+    test("/api/permissions: canva_oauth-Detection liefert ok|missing (kein 'unknown')",
+         any(i.get('id') == 'canva_oauth' and i.get('status') in ('ok', 'missing') for i in items))
+
+    r2 = requests.get("http://localhost:8080/api/permissions_matrix", timeout=10)
+    d = r2.json() if r2.status_code == 200 else {}
+    a = d.get('agents', [])
+    res = d.get('resources', [])
+    cells = d.get('cells', [])
+    test("/api/permissions_matrix: agents nicht leer", len(a) > 0)
+    test("/api/permissions_matrix: resources nicht leer", len(res) > 0)
+    test("/api/permissions_matrix: cells = agents x resources (rechteckig)",
+         len(cells) == len(a) * len(res))
+    test("/api/permissions_matrix: resources enthaelt mail",
+         'mail' in res)
+    test("/api/permissions_matrix: resources enthaelt whatsapp",
+         'whatsapp' in res)
+
+    r3 = requests.get("http://localhost:8080/api/oauth-status", timeout=10)
+    od = r3.json() if r3.status_code == 200 else {}
+    services = [s.get('service') for s in od.get('oauth', [])]
+    test("/api/oauth-status: Slack nicht in oauth-Liste",
+         'slack' not in services)
+except requests.exceptions.RequestException as _e:
+    test("Permissions live", False, f"server not reachable: {_e}")
+except Exception as _e:
+    test("Permissions live", False, str(_e))
+
+
 section("CREATE_FILE Truncation-Detection + Provider-aware max_tokens (2026-04-27)")
 
 try:

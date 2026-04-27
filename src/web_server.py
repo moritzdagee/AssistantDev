@@ -8005,25 +8005,30 @@ def api_oauth_status():
         key = prov.get('api_key') if isinstance(prov, dict) else None
         return bool(key and str(key).strip() and not str(key).startswith('YOUR_'))
 
+    # Slack entfernt per BACKEND_TODO_PERMISSIONS_DETECTION_2026-04-27
+    # (User-Entscheidung: Slack-OAuth wird nicht weiter gebaut).
+    canva_connected = _file_exists('canva_oauth.json') or bool(
+        (_models_cfg.get('canva') or {}).get('access_token')
+    )
+    gcal_connected = (
+        _file_exists('google_calendar_token.json')
+        or _file_exists('google_calendar_oauth.json')
+        or bool((_models_cfg.get('google_calendar') or {}).get('access_token'))
+    )
     return jsonify({
         'oauth': [
             {
-                'service': 'slack',
-                'label': 'Slack',
-                'connected': _file_exists('slack_oauth.json'),
-                'note': 'Token-Refresh-Status in Konfiguration',
-            },
-            {
                 'service': 'canva',
                 'label': 'Canva',
-                'connected': _file_exists('canva_oauth.json'),
-                'note': 'OAuth-Flow via scripts/canva_oauth_setup.py',
+                'connected': canva_connected,
+                'note': 'OAuth-Flow via scripts/canva_oauth_setup.py oder direkter '
+                        'access_token in models.json -> canva',
             },
             {
                 'service': 'google_calendar',
                 'label': 'Google Calendar',
-                'connected': _file_exists('google_calendar_token.json'),
-                'note': 'Token im config/-Ordner erwartet',
+                'connected': gcal_connected,
+                'note': 'Token-File in config/ ODER models.json -> google_calendar',
             },
         ],
         'api_keys': [
@@ -8628,6 +8633,62 @@ def api_permissions():
     def _cfg_exists(rel):
         return os.path.isfile(os.path.join(config_dir, rel))
 
+    # Funktional-orientierte Detection (BACKEND_TODO_PERMISSIONS_DETECTION_2026-04-27):
+    # Status "ok" nur wenn die Verbindung wirklich nutzbar ist — Token vorhanden,
+    # nicht abgelaufen, MCP-Server-Datei oder Probe erfolgreich.
+    def _provider_field(prov, field):
+        cfg = _providers.get(prov, {}) if isinstance(_providers.get(prov), dict) else {}
+        v = cfg.get(field)
+        return v if (v and str(v).strip() and not str(v).startswith('YOUR_')) else None
+
+    def _canva_connected():
+        # Nicht nur OAuth-File — auch direkter Token in models.json -> canva.access_token
+        # (seit der Connect-Integration mit Auto-Refresh).
+        if _cfg_exists('canva_oauth.json') or _cfg_exists('canva_token.json'):
+            return True
+        try:
+            mcfg = (_models_cfg.get('canva') or {}) if isinstance(_models_cfg, dict) else {}
+            return bool(mcfg.get('access_token') and mcfg.get('refresh_token'))
+        except Exception:
+            return False
+
+    def _google_calendar_connected():
+        # Token-Files unter mehreren bekannten Pfaden zulassen.
+        for rel in ('google_calendar_oauth.json', 'google_calendar_token.json',
+                    'gcal_oauth.json', 'gcal_token.json'):
+            if _cfg_exists(rel):
+                return True
+        try:
+            gcfg = (_models_cfg.get('google_calendar') or {}) if isinstance(_models_cfg, dict) else {}
+            return bool(gcfg.get('access_token') or gcfg.get('refresh_token'))
+        except Exception:
+            return False
+
+    def _macos_mail_connected():
+        # Echte Probe ueber den Apple-Mail-Envelope-Index — wenn lesbar
+        # ist die Permission tatsaechlich gegeben.
+        try:
+            probe = _apple_mail_envelope_probe()
+            return bool(probe.get('ok'))
+        except Exception:
+            return False
+
+    def _macos_contacts_connected():
+        # AddressBook-Sources vorhanden + lesbar?
+        try:
+            ab_root = os.path.expanduser('~/Library/Application Support/AddressBook')
+            return os.path.isdir(ab_root) and bool(os.listdir(ab_root))
+        except Exception:
+            return False
+
+    def _macos_calendar_connected():
+        # Calendar.app speichert unter ~/Library/Calendars
+        try:
+            cal_root = os.path.expanduser('~/Library/Calendars')
+            return os.path.isdir(cal_root) and bool(os.listdir(cal_root))
+        except Exception:
+            return False
+
     items = []
     # API-Keys
     for prov in ('anthropic', 'openai', 'gemini', 'mistral', 'perplexity'):
@@ -8645,46 +8706,96 @@ def api_permissions():
                 f'3. Backend neu starten: `bash ~/AssistantDev/scripts/deploy.sh`'
             ),
         })
-    # OAuth
-    for svc, label, fixurl in [
-        ('slack', 'Slack', 'https://api.slack.com/apps'),
-        ('canva', 'Canva', 'https://www.canva.com/developers/apps'),
-        ('google_calendar', 'Google Calendar', 'https://console.cloud.google.com/'),
-    ]:
-        items.append({
-            'id': f'{svc}_oauth',
-            'label': f'{label} OAuth',
-            'status': 'ok' if _cfg_exists(f'{svc}_oauth.json') or _cfg_exists(f'{svc}_token.json') else 'missing',
-            'category': 'oauth',
-            'fix_kind': 'open_url',
-            'fix_target': fixurl,
-            'instructions_markdown': (
-                f'## {label} verbinden\n\n'
-                f'OAuth-Setup via `scripts/{svc}_oauth_setup.py` ausfuehren.'
-            ),
-        })
-    # macOS Automation
-    for tgt, label in [('mail', 'Mail'), ('contacts', 'Contacts'), ('calendar', 'Calendar')]:
+    # OAuth (Slack entfernt per BACKEND_TODO_PERMISSIONS_DETECTION_2026-04-27)
+    items.append({
+        'id': 'canva_oauth',
+        'label': 'Canva OAuth',
+        'status': 'ok' if _canva_connected() else 'missing',
+        'category': 'oauth',
+        'fix_kind': 'open_url',
+        'fix_target': 'https://www.canva.com/developers/integrations',
+        'instructions_markdown': (
+            '## Canva verbinden\n\n'
+            '1. Im [Canva Developer Portal](https://www.canva.com/developers/integrations) '
+            'eine Connect-API-Integration anlegen, Client ID + Secret kopieren.\n'
+            '2. `python3 scripts/canva_oauth_setup.py` ausfuehren — schreibt '
+            '`access_token` + `refresh_token` nach `models.json -> canva`.\n'
+            '3. Detection prueft: `models.json -> canva.access_token` + `refresh_token` '
+            'vorhanden. Auto-Refresh laeuft im Backend.'
+        ),
+    })
+    items.append({
+        'id': 'google_calendar_oauth',
+        'label': 'Google Calendar OAuth',
+        'status': 'ok' if _google_calendar_connected() else 'missing',
+        'category': 'oauth',
+        'fix_kind': 'open_url',
+        'fix_target': 'https://console.cloud.google.com/',
+        'instructions_markdown': (
+            '## Google Calendar verbinden\n\n'
+            'OAuth-Setup via `scripts/google_calendar_oauth_setup.py` ausfuehren. '
+            'Detection prueft Token-Datei in `config/` ODER `models.json -> '
+            'google_calendar.access_token/refresh_token`.'
+        ),
+    })
+    # macOS Automation — echte Detection statt 'unknown'
+    macos_specs = [
+        ('mail', 'Mail', _macos_mail_connected,
+            '## Mail-Zugriff freigeben\n\n'
+            'Detection: liest Apple-Mail Envelope-Index (`~/Library/Mail/V*/MailData/Envelope Index`). '
+            'Bei `missing` braucht der Server-Process **Full Disk Access**: Systemeinstellungen → '
+            'Datenschutz & Sicherheit → Festplattenvollzugriff → `+` → '
+            '`/Applications/Xcode.app/Contents/Developer/usr/bin/python3` hinzufuegen, '
+            'danach `bash scripts/deploy.sh`. Probe: `GET /api/probe-fda`.'),
+        ('contacts', 'Contacts', _macos_contacts_connected,
+            '## Contacts-Zugriff freigeben\n\n'
+            'Detection: prueft `~/Library/Application Support/AddressBook` lesbar. '
+            'Bei `missing` siehe Mail-Anleitung (Full Disk Access fuer Server-Process).'),
+        ('calendar', 'Calendar', _macos_calendar_connected,
+            '## Calendar-Zugriff freigeben\n\n'
+            'Detection: prueft `~/Library/Calendars` lesbar. '
+            'Bei `missing` siehe Mail-Anleitung (Full Disk Access fuer Server-Process).'),
+    ]
+    for tgt, label, detector, md in macos_specs:
         items.append({
             'id': f'macos_{tgt}',
             'label': f'macOS {label} Access',
-            'status': 'unknown',
+            'status': 'ok' if detector() else 'missing',
             'category': 'macos_automation',
             'fix_kind': 'open_settings',
-            'fix_target': 'x-apple.systempreferences:com.apple.preference.security?Privacy_Automation',
-            'instructions_markdown': (
-                f'## {label}-Zugriff freigeben\n\n'
-                f'Systemeinstellungen → Datenschutz & Sicherheit → Automation → '
-                f'Terminal/Python3 → {label} aktivieren.'
-            ),
+            'fix_target': 'x-apple.systempreferences:com.apple.preference.security?Privacy_AllFiles',
+            'instructions_markdown': md,
         })
     return jsonify(items)
 
 
 # ── /api/permissions_matrix (Agent × Source) ───────────────────────────────
+# Default-Resources fuer die Matrix — auch wenn access_control.json keine
+# explicit shared_memory listet, werden alle bekannten Memory-/Source-Bereiche
+# als Spalten angezeigt (BACKEND_TODO_PERMISSIONS_MATRIX_EMPTY_2026-04-27).
+_PERMISSIONS_MATRIX_DEFAULT_RESOURCES = [
+    'mail', 'whatsapp', 'imessage', 'kchat',
+    'calendar', 'contacts', 'webclips',
+    'memory', 'memory_shared',
+]
+
+
 @app.route('/api/permissions_matrix')
 def api_permissions_matrix():
-    """Alias zu /api/access-control mit UI-freundlicher Shape."""
+    """Agent x Resource Permission-Matrix.
+
+    Response (BACKEND_TODO_PERMISSIONS_MATRIX_EMPTY_2026-04-27 §1-3):
+      {
+        agents: [str, ...],          // alle aktiven Agents (auch ohne ACL-Eintrag)
+        resources: [str, ...],       // alle bekannten Resource-Bereiche
+        scopes: [str, ...],          // Alias zu resources (Backwards-Compat)
+        cells: [{agent, resource, scope, read, write, crossRead}],
+      }
+
+    Fehlende Cells in access_control.json werden als Default `none`
+    (read=false, write=false, crossRead=false) materialisiert — Frontend
+    bekommt damit eine vollstaendige rechteckige Matrix, kein Empty-State.
+    """
     try:
         agents_cfg_path = os.path.join(_REPO_ROOT_FOR_FRONTEND_APIS, 'config', 'access_control.json')
         if os.path.isfile(agents_cfg_path):
@@ -8696,32 +8807,45 @@ def api_permissions_matrix():
         data = {'agents': {}}
 
     agents_map = data.get('agents', {}) if isinstance(data, dict) else {}
-    agent_names = list(agents_map.keys()) or [
+    # Active agents: Union aus access_control.json + Disk (AGENTS_DIR), damit
+    # neu angelegte Agents auch ohne ACL-Eintrag sofort in der Matrix stehen.
+    disk_agents = sorted(
         f.replace('.txt', '') for f in os.listdir(AGENTS_DIR)
-        if f.endswith('.txt') and '.backup_' not in f
-    ]
-    all_scopes = set()
+        if f.endswith('.txt') and '.backup_' not in f and '.deleted_' not in f
+    )
+    agent_names = sorted(set(list(agents_map.keys()) + list(disk_agents)))
+
+    # Resources: Union aus konfigurierten shared_memory-Werten + Default-Set.
+    configured = set()
     for cfg in agents_map.values():
         if isinstance(cfg, dict):
             for s in (cfg.get('shared_memory') or []):
-                all_scopes.add(s)
-    scopes = sorted(all_scopes) or ['email_inbox', 'calendar', 'contacts', 'webclips']
+                configured.add(s)
+    resources = sorted(set(_PERMISSIONS_MATRIX_DEFAULT_RESOURCES) | configured)
 
     cells = []
     for agent in agent_names:
         cfg = agents_map.get(agent, {}) if isinstance(agents_map.get(agent), dict) else {}
         shared = set(cfg.get('shared_memory') or [])
-        own = cfg.get('own_memory', True)
-        for scope in scopes:
+        own = bool(cfg.get('own_memory', True))
+        cross_read_global = bool(cfg.get('cross_read', False))
+        for resource in resources:
+            # own_memory deckt nur den eigenen Memory-Bereich ('memory').
+            # Andere Ressourcen sind nur lesbar wenn explizit in shared_memory.
+            is_own_memory = resource == 'memory'
+            read = (resource in shared) or (is_own_memory and own)
             cells.append({
                 'agent': agent,
-                'scope': scope,
-                'read': scope in shared or own,
+                'resource': resource,   # neuer kanonischer Name
+                'scope': resource,      # Backwards-Compat fuer alte Frontends
+                'read': read,
                 'write': False,
+                'crossRead': cross_read_global and not is_own_memory,
             })
     return jsonify({
         'agents': agent_names,
-        'scopes': scopes,
+        'resources': resources,         # neuer Name
+        'scopes': resources,            # Alias (Backwards-Compat)
         'cells': cells,
     })
 
