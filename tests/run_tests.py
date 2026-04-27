@@ -4696,8 +4696,35 @@ try:
             _gem_ids = [m['id'] for m in _provs['gemini'].get('models', [])]
             test("models.json: gemini-3.1-flash-lite-preview gelistet",
                  'gemini-3.1-flash-lite-preview' in _gem_ids)
+
+        if 'ollama' in _provs:
+            _ol_ids = [m['id'] for m in _provs['ollama'].get('models', [])]
+            test("models.json: qwen3:14b in ollama-Provider", 'qwen3:14b' in _ol_ids)
+            test("models.json: deepseek-r1:14b in ollama-Provider", 'deepseek-r1:14b' in _ol_ids)
 except Exception as _e:
     test("Model-Catalog models.json check", False, str(_e))
+
+
+section("Ollama lokale 14B-Modelle 2026-04-26")
+
+try:
+    with open(os.path.expanduser("~/AssistantDev/src/web_server.py")) as _f:
+        _ws = _f.read()
+    test("MODEL_DISPLAY hat qwen3:14b",
+         "'qwen3:14b': 'Qwen 3 (lokal, 14B)'" in _ws)
+    test("MODEL_DISPLAY hat deepseek-r1:14b",
+         "'deepseek-r1:14b': 'DeepSeek R1 (lokal, 14B)'" in _ws)
+except Exception as _e:
+    test("Ollama-14B grep", False, str(_e))
+
+# Live: ollama Daemon hat die neuen Modelle gepullt
+try:
+    _r = requests.get("http://127.0.0.1:11434/api/tags", timeout=5)
+    _names = {m.get('name','') for m in (_r.json() or {}).get('models', [])}
+    test("Ollama Daemon hat qwen3:14b lokal gepullt", 'qwen3:14b' in _names)
+    test("Ollama Daemon hat deepseek-r1:14b lokal gepullt", 'deepseek-r1:14b' in _names)
+except Exception as _e:
+    test("Ollama tags check", False, str(_e))
 
 
 section("Conversation Cleanup Purge 2026-04-26")

@@ -941,6 +941,7 @@ MODEL_DISPLAY = {
     'deepseek-reasoner': 'DeepSeek Reasoner (legacy)',
     'deepseek-r1:8b': 'DeepSeek R1 (lokal, 8B)',
     'deepseek-r1:14b': 'DeepSeek R1 (lokal, 14B)',
+    'qwen3:14b': 'Qwen 3 (lokal, 14B)',
 }
 
 ADAPTERS = {"anthropic": call_anthropic, "openai": call_openai, "perplexity": call_perplexity, "mistral": call_mistral, "gemini": call_gemini, "deepseek": call_deepseek, "ollama": call_ollama}
