@@ -4392,10 +4392,12 @@ try:
     # Mehrdeutigkeits-Erkennung
     test("AppleScript holt Eintraege auch ohne Phone (fuer Ambiguity-Detection)",
          "set out to out & nm & \"\\\\t\" & linefeed" in _ws)
-    test("Zwei Eintraege mit identischem Namen -> ambiguous",
-         "len(same_name) > 1" in _ws)
-    test("Single-Match ohne Phone -> ambiguous (nicht silently ignorieren)",
-         "len(same_name) == 1 and not same_name[0][1]" in _ws)
+    test("Phantom-Duplicates ohne Phone blockieren eindeutigen Match nicht",
+         "same_name_with_phone = [e for e in same_name if e[1]]" in _ws)
+    test("Mehrere same_name MIT phone -> echte Mehrdeutigkeit",
+         "len(same_name_with_phone) > 1" in _ws)
+    test("Same_name ohne irgendeine Phone -> 'keine Telefonnummer hinterlegt'",
+         "same_name and not same_name_with_phone" in _ws)
     test("Substring-Match nur wenn EINDEUTIG (sonst ambiguous)",
          "len(with_phone) == 1" in _ws and "len(with_phone) > 1" in _ws)
 
@@ -4407,6 +4409,8 @@ try:
          "wa_to, wa_phone, wa_hint = send_whatsapp_draft" in _ws)
     test("Action-Marker zeigt Hint statt 'vorbereitet' bei Mehrdeutigkeit",
          "KEIN AUTO-VERSAND" in _ws and "manuell" in _ws)
+    test("Clipboard-Fallback oeffnet WhatsApp NICHT mehr automatisch",
+         "KEIN automatisches Oeffnen von WhatsApp" in _ws)
     test("/send_whatsapp_draft-Route gibt ambiguity_hint zurueck",
          "'ambiguity_hint': hint" in _ws)
 except Exception as _e:

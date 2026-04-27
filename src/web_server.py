@@ -1836,23 +1836,32 @@ def send_whatsapp_draft(spec, agent_name=None):
             target_lower = to_name.lower()
             # Eintraege mit EXAKT diesem Namen (case-insensitive)
             same_name = [e for e in all_entries if e[0].lower() == target_lower]
+            # Davon NUR die mit echter Phone — ohne-Phone-Duplikate (Phantom-
+            # Eintraege aus iCloud-Sync etc.) blockieren sonst den eindeutigen
+            # Match (Renata-Bug 2026-04-26: zwei "Renata Argolo" in Contacts,
+            # eine mit Phone, eine ohne -> wurde fälschlich als ambiguous
+            # behandelt).
+            same_name_with_phone = [e for e in same_name if e[1]]
             picked = None
             ambiguity_reason = None
 
-            if len(same_name) > 1:
-                # Mehrere Kontakte mit identischem Namen — wir koennen NICHT
-                # automatisch auswaehlen, auch nicht wenn nur einer eine
-                # Phone hat. Im Adressbuch sind beide gleichberechtigt.
+            if len(same_name_with_phone) == 1:
+                # Eindeutiger Phone-Eintrag fuer diesen Namen — nimm ihn.
+                # Egal ob es Duplikate ohne Phone gibt (die sind Phantom).
+                picked = same_name_with_phone[0]
+            elif len(same_name_with_phone) > 1:
+                # ECHTE Mehrdeutigkeit: mehrere Eintraege mit identischem
+                # Namen UND jeweils Phone — wir koennen nicht automatisch
+                # auswaehlen.
+                phones = ', '.join(e[1] for e in same_name_with_phone[:3])
                 ambiguity_reason = (
-                    f"{len(same_name)} Kontakte mit dem Namen {to_name!r} "
-                    f"im macOS-Adressbuch — bitte Adressbuch bereinigen "
+                    f"{len(same_name_with_phone)} Kontakte mit dem Namen "
+                    f"{to_name!r} und unterschiedlichen Phones im macOS-"
+                    f"Adressbuch ({phones}) — bitte Adressbuch bereinigen "
                     f"oder phone explizit angeben"
                 )
-            elif len(same_name) == 1 and same_name[0][1]:
-                # Genau ein exakter Name-Match mit Phone
-                picked = same_name[0]
-            elif len(same_name) == 1 and not same_name[0][1]:
-                # Genau ein exakter Match aber OHNE Phone
+            elif same_name and not same_name_with_phone:
+                # Exakter Name-Match existiert, aber KEIN Eintrag hat eine Phone
                 ambiguity_reason = (
                     f"Kontakt {to_name!r} im macOS-Adressbuch hat keine "
                     f"Telefonnummer hinterlegt"
@@ -1895,10 +1904,14 @@ def send_whatsapp_draft(spec, agent_name=None):
         phone = ''
 
     if not phone:
-        # Fallback: copy message to clipboard and just open WhatsApp
+        # Fallback: NUR Clipboard, KEIN automatisches Oeffnen von WhatsApp.
+        # Vorher haben wir 'open -a WhatsApp' aufgerufen — das aktiviert die
+        # App mit dem zuletzt-aktiven Chat, der zufaellig der falsche sein
+        # kann (z.B. +47 Bank Norwegian aus einem alten falschen Auto-Send).
+        # Saubereres UX: User sieht im Chat-UI die klare Meldung, kopiert die
+        # Nachricht selbst aus dem Clipboard und oeffnet WhatsApp manuell.
         if message:
             subprocess.run(['pbcopy'], input=message.encode('utf-8'), timeout=5)
-        subprocess.run(['open', '-a', 'WhatsApp'], capture_output=True, text=True, timeout=10)
         return to_name, None, _ambiguity_hint
 
     # Normalize phone: remove spaces, dashes, dots, leading +
