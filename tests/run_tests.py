@@ -5100,6 +5100,56 @@ except Exception as _e:
     test("Live sources check", False, str(_e))
 
 
+section("Email-Detail Slash-in-Subject + Read-Status TTL 2026-04-27")
+
+try:
+    with open(os.path.expanduser("~/AssistantDev/src/web_server.py")) as _f:
+        _ws = _f.read()
+
+    test("/api/messages/conversation nutzt path-Konverter (Slashes erlaubt)",
+         '@app.route("/api/messages/conversation/<path:conv_id>")' in _ws)
+    test("_APPLE_MAIL_READ_TTL gesenkt auf <= 30s",
+         "_APPLE_MAIL_READ_TTL = 20" in _ws or "_APPLE_MAIL_READ_TTL = 30" in _ws)
+except Exception as _e:
+    test("Email-Detail+TTL grep", False, str(_e))
+
+try:
+    import urllib.parse as _up
+    r = requests.get("http://localhost:8080/api/messages?limit=200", timeout=120)
+    msgs = r.json().get("messages", []) if r.status_code == 200 else []
+    emails = [m for m in msgs if (m.get("source") or "").startswith("email_")]
+    slashy = next((m for m in emails if "/" in (m.get("conversation_id") or "")), None)
+    if slashy:
+        cid = slashy["conversation_id"]
+        enc = _up.quote(cid, safe="")
+        r2 = requests.get(
+            f"http://localhost:8080/api/messages/conversation/{enc}", timeout=60
+        )
+        test("Live: Conversation-Endpoint mit Slash-cid -> HTTP 200",
+             r2.status_code == 200)
+        if r2.status_code == 200:
+            ms = r2.json().get("messages", [])
+            test("Live: Slash-Conv liefert mind. 1 Message",
+                 isinstance(ms, list) and len(ms) >= 1)
+    else:
+        warn("Keine Mail mit Slash im Subject im Sample — Live-Slash-Test geskippt")
+    if emails:
+        r3 = requests.get(
+            f"http://localhost:8080/api/messages/{emails[0]['id']}", timeout=60
+        )
+        test("Live: /api/messages/<id> -> 200", r3.status_code == 200)
+        if r3.status_code == 200:
+            m = r3.json().get("message", {})
+            bt = m.get("body_text") or ""
+            pv = m.get("preview") or ""
+            test("Live: Detail liefert body_text mind. so lang wie preview",
+                 len(bt) >= len(pv.rstrip(".")))
+except requests.exceptions.RequestException as _e:
+    test("Email-Detail live", False, f"server not reachable: {_e}")
+except Exception as _e:
+    test("Email-Detail live", False, str(_e))
+
+
 section("CREATE_FILE Truncation-Detection + Provider-aware max_tokens (2026-04-27)")
 
 try:
