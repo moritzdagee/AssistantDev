@@ -677,6 +677,46 @@ _recover_pending_markers()
 
 # ─── PROVIDER ADAPTERS ────────────────────────────────────────────────────────
 
+def _provider_max_tokens(provider, model_id):
+    """Pro Provider/Modell der maximale Output-Token-Wert.
+
+    Wichtig fuer User-Use-Case "20-seitige Dokumente exportieren": ein
+    20-Seiter generiert ~10k Tokens an JSON-Spec (Inhalt + Overhead).
+    Default-Werte verschiedener SDKs (4096-8192) reichen dafuer NICHT.
+    Wir gehen pro Provider an die offiziellen Output-Limits — der
+    User zahlt eh nur fuer das, was wirklich emittiert wird.
+
+    Limits (Stand 2026-04, aus den jeweiligen API-Docs):
+    - Anthropic Claude 4 Opus/Sonnet: 32000 Output-Tokens
+    - Anthropic Claude Haiku 4.5: 8192 (Fallback fuer kleinere Models)
+    - OpenAI GPT-5.x: 16384 Output-Tokens
+    - DeepSeek V4: 16000 (Reasoning + Content brauchen Platz)
+    - Mistral Large/Medium/Small: 16384
+    - Perplexity Sonar: 8000 (Search-anchored, kurze Antworten)
+    - Ollama lokal: 16384 (haengt vom Modell-Context ab; 14B mit 32k-Context
+      koennen 16k Output liefern)
+
+    Bei Fehler "max_tokens too high" faellt call_anthropic auf 8192 zurueck.
+    """
+    p = (provider or '').lower()
+    m = (model_id or '').lower()
+    if p == 'anthropic':
+        if 'haiku' in m:
+            return 8192
+        return 32000
+    if p == 'openai':
+        return 16384
+    if p == 'deepseek':
+        return 16000
+    if p == 'mistral':
+        return 16384
+    if p == 'perplexity':
+        return 8000
+    if p == 'ollama':
+        return 16384
+    return 8192
+
+
 def _sanitize_anthropic_images(messages):
     """Walk message list und downscale alle base64-Bilder, die die
     Anthropic-Dimensions-Grenze (8000 px) ueberschreiten. Mutiert die
@@ -714,14 +754,34 @@ def call_anthropic(api_key, model_id, system_prompt, messages):
     from anthropic import Anthropic
     _sanitize_anthropic_images(messages)
     client = Anthropic(api_key=api_key)
-    r = client.messages.create(model=model_id, max_tokens=8192, system=system_prompt, messages=messages)
+    _max = _provider_max_tokens('anthropic', model_id)
+    # Per-Request-Timeout hochsetzen: das SDK erzwingt sonst Streaming bei
+    # max_tokens > ~20k (heuristisch: 10min-Limit / Tokens-pro-Sekunde).
+    # 30min = 1800s deckt 32k Output mit Sicherheitspuffer ab.
+    _timeout = 1800.0 if _max > 16000 else 600.0
+    try:
+        r = client.messages.create(
+            model=model_id, max_tokens=_max, system=system_prompt,
+            messages=messages, timeout=_timeout,
+        )
+    except Exception as e:
+        # Falls die API max_tokens als zu hoch ablehnt (z.B. neue Modell-Variante
+        # mit Limit < 32k), automatisch auf 8192 fallen.
+        if 'max_tokens' in str(e).lower() and _max > 8192:
+            print(f"[ANTHROPIC] max_tokens={_max} abgelehnt fuer {model_id}, retry mit 8192", flush=True)
+            r = client.messages.create(
+                model=model_id, max_tokens=8192, system=system_prompt,
+                messages=messages, timeout=600.0,
+            )
+        else:
+            raise
     return r.content[0].text
 
 def call_openai(api_key, model_id, system_prompt, messages):
     import openai
     client = openai.OpenAI(api_key=api_key)
     oai_messages = [{"role": "system", "content": system_prompt}] + messages
-    r = client.chat.completions.create(model=model_id, messages=oai_messages, max_tokens=8192)
+    r = client.chat.completions.create(model=model_id, messages=oai_messages, max_tokens=_provider_max_tokens('openai', model_id))
     return r.choices[0].message.content
 
 def call_deepseek(api_key, model_id, system_prompt, messages):
@@ -730,7 +790,7 @@ def call_deepseek(api_key, model_id, system_prompt, messages):
     import openai
     client = openai.OpenAI(api_key=api_key, base_url="https://api.deepseek.com/v1")
     ds_messages = [{"role": "system", "content": system_prompt}] + messages
-    r = client.chat.completions.create(model=model_id, messages=ds_messages, max_tokens=8000)
+    r = client.chat.completions.create(model=model_id, messages=ds_messages, max_tokens=_provider_max_tokens('deepseek', model_id))
     return r.choices[0].message.content
 
 def call_ollama(api_key, model_id, system_prompt, messages):
@@ -740,7 +800,7 @@ def call_ollama(api_key, model_id, system_prompt, messages):
         base_url="http://127.0.0.1:11434/v1",
     )
     ollama_messages = [{"role": "system", "content": system_prompt}] + messages
-    r = client.chat.completions.create(model=model_id, messages=ollama_messages, max_tokens=8192)
+    r = client.chat.completions.create(model=model_id, messages=ollama_messages, max_tokens=_provider_max_tokens('ollama', model_id))
     return r.choices[0].message.content
 
 def call_perplexity(api_key, model_id, system_prompt, messages):
@@ -783,7 +843,7 @@ def call_perplexity(api_key, model_id, system_prompt, messages):
         merged.append({'role': 'user', 'content': '.'})
     pplx_messages = [{"role": "system", "content": system_prompt}] + merged
     headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
-    payload = {"model": model_id, "messages": pplx_messages, "max_tokens": 8000}
+    payload = {"model": model_id, "messages": pplx_messages, "max_tokens": _provider_max_tokens('perplexity', model_id)}
 
     # Model-specific timeouts (connect_timeout, read_timeout)
     PERPLEXITY_TIMEOUTS = {
@@ -839,7 +899,7 @@ def call_perplexity(api_key, model_id, system_prompt, messages):
 def call_mistral(api_key, model_id, system_prompt, messages):
     headers = {"Authorization": "Bearer " + api_key, "Content-Type": "application/json"}
     mistral_messages = [{"role": "system", "content": system_prompt}] + messages
-    payload = {"model": model_id, "messages": mistral_messages, "max_tokens": 8192}
+    payload = {"model": model_id, "messages": mistral_messages, "max_tokens": _provider_max_tokens('mistral', model_id)}
     r = requests.post("https://api.mistral.ai/v1/chat/completions", headers=headers, json=payload, timeout=60)
     return r.json()["choices"][0]["message"]["content"]
 
@@ -2354,14 +2414,34 @@ def call_anthropic(api_key, model_id, system_prompt, messages):
     from anthropic import Anthropic
     _sanitize_anthropic_images(messages)
     client = Anthropic(api_key=api_key)
-    r = client.messages.create(model=model_id, max_tokens=8192, system=system_prompt, messages=messages)
+    _max = _provider_max_tokens('anthropic', model_id)
+    # Per-Request-Timeout hochsetzen: das SDK erzwingt sonst Streaming bei
+    # max_tokens > ~20k (heuristisch: 10min-Limit / Tokens-pro-Sekunde).
+    # 30min = 1800s deckt 32k Output mit Sicherheitspuffer ab.
+    _timeout = 1800.0 if _max > 16000 else 600.0
+    try:
+        r = client.messages.create(
+            model=model_id, max_tokens=_max, system=system_prompt,
+            messages=messages, timeout=_timeout,
+        )
+    except Exception as e:
+        # Falls die API max_tokens als zu hoch ablehnt (z.B. neue Modell-Variante
+        # mit Limit < 32k), automatisch auf 8192 fallen.
+        if 'max_tokens' in str(e).lower() and _max > 8192:
+            print(f"[ANTHROPIC] max_tokens={_max} abgelehnt fuer {model_id}, retry mit 8192", flush=True)
+            r = client.messages.create(
+                model=model_id, max_tokens=8192, system=system_prompt,
+                messages=messages, timeout=600.0,
+            )
+        else:
+            raise
     return r.content[0].text
 
 def call_openai(api_key, model_id, system_prompt, messages):
     import openai
     client = openai.OpenAI(api_key=api_key)
     oai_messages = [{"role": "system", "content": system_prompt}] + messages
-    r = client.chat.completions.create(model=model_id, messages=oai_messages, max_tokens=8192)
+    r = client.chat.completions.create(model=model_id, messages=oai_messages, max_tokens=_provider_max_tokens('openai', model_id))
     return r.choices[0].message.content
 
 def call_deepseek(api_key, model_id, system_prompt, messages):
@@ -2370,7 +2450,7 @@ def call_deepseek(api_key, model_id, system_prompt, messages):
     import openai
     client = openai.OpenAI(api_key=api_key, base_url="https://api.deepseek.com/v1")
     ds_messages = [{"role": "system", "content": system_prompt}] + messages
-    r = client.chat.completions.create(model=model_id, messages=ds_messages, max_tokens=8000)
+    r = client.chat.completions.create(model=model_id, messages=ds_messages, max_tokens=_provider_max_tokens('deepseek', model_id))
     return r.choices[0].message.content
 
 def call_ollama(api_key, model_id, system_prompt, messages):
@@ -2380,7 +2460,7 @@ def call_ollama(api_key, model_id, system_prompt, messages):
         base_url="http://127.0.0.1:11434/v1",
     )
     ollama_messages = [{"role": "system", "content": system_prompt}] + messages
-    r = client.chat.completions.create(model=model_id, messages=ollama_messages, max_tokens=8192)
+    r = client.chat.completions.create(model=model_id, messages=ollama_messages, max_tokens=_provider_max_tokens('ollama', model_id))
     return r.choices[0].message.content
 
 def call_perplexity(api_key, model_id, system_prompt, messages):
@@ -2423,7 +2503,7 @@ def call_perplexity(api_key, model_id, system_prompt, messages):
         merged.append({'role': 'user', 'content': '.'})
     pplx_messages = [{"role": "system", "content": system_prompt}] + merged
     headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
-    payload = {"model": model_id, "messages": pplx_messages, "max_tokens": 8000}
+    payload = {"model": model_id, "messages": pplx_messages, "max_tokens": _provider_max_tokens('perplexity', model_id)}
 
     # Model-specific timeouts (connect_timeout, read_timeout)
     PERPLEXITY_TIMEOUTS = {
@@ -2479,7 +2559,7 @@ def call_perplexity(api_key, model_id, system_prompt, messages):
 def call_mistral(api_key, model_id, system_prompt, messages):
     headers = {"Authorization": "Bearer " + api_key, "Content-Type": "application/json"}
     mistral_messages = [{"role": "system", "content": system_prompt}] + messages
-    payload = {"model": model_id, "messages": mistral_messages, "max_tokens": 8192}
+    payload = {"model": model_id, "messages": mistral_messages, "max_tokens": _provider_max_tokens('mistral', model_id)}
     r = requests.post("https://api.mistral.ai/v1/chat/completions", headers=headers, json=payload, timeout=60)
     return r.json()["choices"][0]["message"]["content"]
 

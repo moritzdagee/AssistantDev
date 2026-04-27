@@ -4705,23 +4705,54 @@ except Exception as _e:
     test("Model-Catalog models.json check", False, str(_e))
 
 
-section("CREATE_FILE Truncation-Detection + max_tokens 8192 (2026-04-27)")
+section("CREATE_FILE Truncation-Detection + Provider-aware max_tokens (2026-04-27)")
 
 try:
     with open(os.path.expanduser("~/AssistantDev/src/web_server.py")) as _f:
         _ws = _f.read()
 
-    # max_tokens-Bump: alle chat-completion Aufrufe auf 8192 (statt 4096)
-    test("call_anthropic max_tokens=8192 (beide Bloecke)",
-         _ws.count("max_tokens=8192, system=system_prompt") == 2)
-    test("call_openai max_tokens=8192 (beide Bloecke)",
-         _ws.count("max_tokens=8192") >= 4)
-    test("call_ollama max_tokens=8192 (beide Bloecke)",
-         _ws.count("messages=ollama_messages, max_tokens=8192") == 2)
-    test("Mistral payload max_tokens=8192",
-         _ws.count('"max_tokens": 8192') >= 1)
-    test("kein max_tokens=4096 mehr in chat-completion calls",
+    # Provider-aware max_tokens via _provider_max_tokens-Helper
+    test("_provider_max_tokens-Helper definiert",
+         "def _provider_max_tokens(provider, model_id):" in _ws)
+    test("Helper kennt Anthropic Opus/Sonnet -> 32000",
+         "return 32000" in _ws and "if 'haiku' in m" in _ws)
+    test("Helper kennt Anthropic Haiku -> 8192 Fallback",
+         "if 'haiku' in m:\n            return 8192" in _ws)
+    test("Helper kennt OpenAI GPT-5.x -> 16384",
+         "if p == 'openai':\n        return 16384" in _ws)
+    test("Helper kennt DeepSeek V4 -> 16000",
+         "if p == 'deepseek':\n        return 16000" in _ws)
+    test("Helper kennt Mistral -> 16384",
+         "if p == 'mistral':\n        return 16384" in _ws)
+    test("Helper kennt Ollama -> 16384",
+         "if p == 'ollama':\n        return 16384" in _ws)
+
+    # Helper wird konsistent in allen Adapter-Calls genutzt
+    test("call_anthropic nutzt _provider_max_tokens",
+         _ws.count("_provider_max_tokens('anthropic', model_id)") == 2)
+    test("call_openai nutzt _provider_max_tokens",
+         _ws.count("_provider_max_tokens('openai', model_id)") == 2)
+    test("call_ollama nutzt _provider_max_tokens",
+         _ws.count("_provider_max_tokens('ollama', model_id)") == 2)
+    test("Mistral nutzt _provider_max_tokens",
+         _ws.count("_provider_max_tokens('mistral', model_id)") == 2)
+    test("Perplexity nutzt _provider_max_tokens",
+         _ws.count("_provider_max_tokens('perplexity', model_id)") == 2)
+    test("DeepSeek nutzt _provider_max_tokens",
+         _ws.count("_provider_max_tokens('deepseek', model_id)") == 2)
+
+    # Anthropic-Timeout wird hochgesetzt wenn max_tokens > 16000
+    # (sonst wirft das SDK 'streaming required for >10min')
+    test("call_anthropic erhoeht timeout auf 1800s bei _max > 16000",
+         "_timeout = 1800.0 if _max > 16000 else 600.0" in _ws)
+    test("call_anthropic uebergibt timeout an create()",
+         "timeout=_timeout" in _ws)
+
+    # Hardcoded Werte sollten weg sein (ausser im Fallback)
+    test("kein hardcoded max_tokens=4096 mehr",
          _ws.count("max_tokens=4096") == 0 and _ws.count('"max_tokens": 4096') == 0)
+    test("kein hardcoded max_tokens=8000 mehr",
+         _ws.count("max_tokens=8000") == 0 and _ws.count('"max_tokens": 8000') == 0)
 
     # Truncation-Detection: unclosed [CREATE_FILE: wird nicht mehr silent gedropped
     test("CREATE_FILE-Truncation-Detection ergaenzt",
