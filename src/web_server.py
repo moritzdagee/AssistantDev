@@ -14473,17 +14473,24 @@ _MSG_OWN_EMAILS = {
 # `group`: visuelle Gruppierung im Header (Inflow-Channel).
 # `label`: sichtbar in der Spalte. Fuer E-Mails: eigene Adresse (eindeutig).
 _MSG_SOURCES = [
-    {"key": "email_privat",         "label": "moritz.cremer@me.com",            "agent": "privat",         "icon": "\u2709", "type": "email", "group": "E-Mail"},
+    # E-Mail-Quellen IMMER zuerst — User-Hauptfokus liegt auf der E-Mail-Inbox.
+    # email_signicat / email_trustedcarrier / email_privat sind die drei
+    # konkreten Postfaecher; alles was nicht dort matcht landet in
+    # email_standard (jetzt sichtbar als "Sonstige" — frueheres Label
+    # "Standard / uebrige E-Mails" war doppelt mit "Privat" und verwirrte).
     {"key": "email_signicat",       "label": "moritz.cremer@signicat.com",      "agent": "signicat",       "icon": "\u2709", "type": "email", "group": "E-Mail"},
     {"key": "email_trustedcarrier", "label": "moritz.cremer@trustedcarrier.net","agent": "trustedcarrier", "icon": "\u2709", "type": "email", "group": "E-Mail"},
-    {"key": "email_standard",       "label": "Standard / uebrige E-Mails",      "agent": "standard",       "icon": "\u2709", "type": "email", "group": "E-Mail"},
+    {"key": "email_privat",         "label": "moritz.cremer@me.com",            "agent": "privat",         "icon": "\u2709", "type": "email", "group": "E-Mail"},
+    {"key": "email_standard",       "label": "Sonstige",                         "agent": "standard",       "icon": "\u2709", "type": "email", "group": "E-Mail"},
     # "System Ward" existiert als Agent, hat aber keinen eigenen Mail-Inflow —
     # Spalte ausgeblendet (vorher sichtbar mit 0 gesamt).
     {"key": "whatsapp",             "label": "WhatsApp",                        "agent": None,             "icon": "\U0001F4F1", "type": "whatsapp", "group": "Messaging"},
     {"key": "imessage",             "label": "iMessage",                        "agent": "privat",         "icon": "\U0001F4AC", "type": "imessage", "group": "Messaging"},
-    {"key": "kchat",                "label": "kChat",                           "agent": "privat",         "icon": "\U0001F4AC", "type": "kchat",    "group": "Messaging"},
-    # "Chat-Verlauf" war interne Agent-Konversations-History (konversation_*.txt),
-    # kein Inflow-Channel — raus aus dem Dashboard.
+    # kChat-Source 2026-04-27 entfernt: User nutzt das nicht aktiv, der
+    # Watcher hat regelmaessig 401-Token-Probleme, der Bucket war leerer
+    # Noise im Dashboard. Falls jemals zurueckgewollt: Eintrag wieder rein
+    # plus _msg_scan_kchat_source. Watcher-LaunchAgent bleibt, nur die
+    # Dashboard-Spalte ist weg.
 ]
 
 # Mapping Source -> empfohlener Agent fuer "Antworten"-Workflow
@@ -14994,7 +15001,8 @@ def _msg_normalize_email_content(fpath, fname, source_key, agent_name, only_head
 
     from_raw = fields.get("von", fields.get("from", ""))
     to_raw = fields.get("an", fields.get("to", fields.get("kanal", "")))
-    subject = fields.get("betreff", fields.get("subject", "")).strip()
+    raw_subject = fields.get("betreff", fields.get("subject", "")).strip()
+    subject = raw_subject
     if not subject:
         first_body_line = next((l for l in body.splitlines() if l.strip()), "").strip()
         subject = (first_body_line[:100] if first_body_line else fname)[:200]
@@ -15003,6 +15011,18 @@ def _msg_normalize_email_content(fpath, fname, source_key, agent_name, only_head
     m_addr = _MSG_EMAIL_ADDR_RE.search(from_raw)
     if m_addr:
         sender_email = m_addr.group(0).lower()
+
+    # Phantom-Mails rausfiltern: Email-Watcher hat in der Vergangenheit
+    # leere Header-Mails geschrieben (Von:/An:/Betreff: alle leer). Im
+    # Dashboard kollabierten alle 24+ davon zu EINEM Phantom-Thread mit
+    # conversation_id "em:|" — Klicks/Mark-as-Read gingen ins Leere.
+    # Wenn weder Absender NOCH lesbarer Betreff vorhanden sind, liefert
+    # die Mail dem User keinen Wert -> aus dem Inbox-Stream raus.
+    if not sender_email and (
+        not raw_subject
+        or raw_subject.lower() in ("(kein betreff)", "(no subject)", "kein betreff", "no subject")
+    ):
+        return None
 
     sender_name = from_raw
     if "<" in from_raw and ">" in from_raw:
@@ -15085,8 +15105,16 @@ def _msg_normalize_email_content(fpath, fname, source_key, agent_name, only_head
         "is_junk": _msg_is_junk(sender_email, subject, preview),
         "is_archived": False,
         # Conversation = normalisierter Subject ohne Re:/Fwd:/AW:-Prefixe,
-        # damit das Frontend Thread-Aggregation machen kann.
-        "conversation_id": "em:" + _apple_mail_match_key(sender_email, subject),
+        # damit das Frontend Thread-Aggregation machen kann. Ohne sender_email
+        # waere der Key fuer alle Sender-leeren Mails identisch ("|<subject>")
+        # und sie wuerden unzulaessig kollabieren — daher per-File-Hash als
+        # Fallback-Sender-Slot, damit jede einzelne Mail ihre eigene
+        # Konversation behaelt.
+        "conversation_id": (
+            "em:" + _apple_mail_match_key(sender_email, subject)
+            if sender_email
+            else f"em:orphan_{_msg_hash_path(fpath)}|{_normalize_subject(subject)}"
+        ),
     }
 
 
@@ -15856,14 +15884,26 @@ def api_messages_sources():
         messages = _msg_get_all()
     except Exception as e:
         return jsonify({"ok": False, "error": str(e)}), 500
+    # Junk-Mode konsistent mit /api/messages: hide/show/only
+    junk_mode = (request.args.get("junk") or "hide").lower()
     by_src = {}
     for m in messages:
         by_src.setdefault(m["source"], []).append(m)
     out = []
     for src in _MSG_SOURCES:
         items = by_src.get(src["key"], [])
-        count = len(items)
-        unread = sum(1 for m in items if not m["read"])
+        # Junk-Counts separat ausweisen, damit Frontend einen Badge zeigen
+        # kann ("23 Newsletter") und der Count beim Toggle stimmt.
+        junk_items = [m for m in items if m.get("is_junk")]
+        nonjunk_items = [m for m in items if not m.get("is_junk")]
+        if junk_mode == "hide":
+            visible = nonjunk_items
+        elif junk_mode == "only":
+            visible = junk_items
+        else:
+            visible = items
+        count = len(visible)
+        unread = sum(1 for m in visible if not m["read"])
         entry = {
             "key": src["key"],
             "label": src["label"],
@@ -15873,6 +15913,9 @@ def api_messages_sources():
             "available": count > 0,
             "count": count,
             "unread": unread,
+            "junk_count": len(junk_items),
+            "junk_unread": sum(1 for m in junk_items if not m["read"]),
+            "total_including_junk": len(items),
             "recommended_agent": _MSG_SOURCE_TO_AGENT.get(src["key"]),
             # BACKEND_TODO_UNREAD_EMAIL_ONLY: Frontend rendert Read-Toggle +
             # Unread-Badge NUR wenn supports_read=true. WhatsApp/iMessage/kChat
@@ -16006,6 +16049,20 @@ def api_messages():
         messages = [m for m in messages
                     if (m.get("type") == "email") and not _msg_is_work_email(m)]
     # 'inbox' -> kein Filter
+
+    # ── junk-Filter ──────────────────────────────────────────────────────
+    # User-Wunsch (2026-04-27): Toggle fuer Newsletter / Bounces /
+    # automatisierte Mails. _msg_is_junk klassifiziert pro Mail bereits beim
+    # Scan. Drei Modi:
+    #   ?junk=hide  (Default) — versteckt is_junk=True
+    #   ?junk=show              — zeigt alles
+    #   ?junk=only              — nur is_junk=True (Junk-Inbox)
+    junk_mode = (request.args.get("junk") or "hide").lower()
+    if junk_mode == "hide":
+        messages = [m for m in messages if not m.get("is_junk")]
+    elif junk_mode == "only":
+        messages = [m for m in messages if m.get("is_junk")]
+    # 'show' -> kein Filter
 
     try:
         per_source_limit = int(request.args.get("limit", "500"))

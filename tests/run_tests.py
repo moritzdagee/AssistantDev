@@ -4705,6 +4705,73 @@ except Exception as _e:
     test("Model-Catalog models.json check", False, str(_e))
 
 
+section("Message-Dashboard Cleanup 2026-04-27 (kChat raus, Sonstige-Label, Phantom-Fix, Junk-Toggle)")
+
+try:
+    with open(os.path.expanduser("~/AssistantDev/src/web_server.py")) as _f:
+        _ws = _f.read()
+
+    # _MSG_SOURCES: kChat raus, E-Mail-Sources zuerst, "Sonstige"-Label
+    test("_MSG_SOURCES enthaelt kChat NICHT mehr",
+         '"key": "kchat"' not in _ws.split("_MSG_SOURCES = [")[1].split("]")[0])
+    # 'Sonstige' ist das aktive Label; 'Standard / uebrige E-Mails' kommt nur
+    # noch im Erklaerungs-Kommentar des Stable-Bucket vor.
+    test("email_standard heisst jetzt 'Sonstige' (statt 'Standard / uebrige')",
+         '"label": "Sonstige"' in _ws)
+    # E-Mail-Quellen vor Messaging in der Definition-Reihenfolge
+    _src_block = _ws.split("_MSG_SOURCES = [")[1].split("]")[0]
+    _signicat_pos = _src_block.find('"key": "email_signicat"')
+    _whatsapp_pos = _src_block.find('"key": "whatsapp"')
+    test("E-Mail-Quellen stehen vor Messaging-Quellen in _MSG_SOURCES",
+         0 <= _signicat_pos < _whatsapp_pos)
+
+    # Phantom-Mail-Filter: keine sender + (kein betreff) -> None
+    test("Email-Normalizer filtert Phantom-Mails (no sender + no subject)",
+         "if not sender_email and (" in _ws and
+         '"(kein betreff)"' in _ws and
+         "aus dem Inbox-Stream raus" in _ws)
+    # conversation_id eindeutig pro File wenn sender_email leer
+    test("conversation_id pro File-Hash wenn sender_email leer",
+         'em:orphan_{_msg_hash_path(fpath)}' in _ws)
+
+    # Junk-Toggle Backend
+    test("/api/messages: junk=hide|show|only Filter",
+         'junk_mode = (request.args.get("junk") or "hide").lower()' in _ws)
+    test("/api/messages: junk=hide ist Default",
+         'if junk_mode == "hide":\n        messages = [m for m in messages if not m.get("is_junk")]' in _ws)
+    test("/api/messages: junk=only zeigt nur Junk",
+         'elif junk_mode == "only":\n        messages = [m for m in messages if m.get("is_junk")]' in _ws)
+    # /api/messages/sources expose junk_count + total_including_junk
+    test("/api/messages/sources liefert junk_count pro Quelle",
+         '"junk_count": len(junk_items)' in _ws)
+    test("/api/messages/sources liefert total_including_junk",
+         '"total_including_junk": len(items)' in _ws)
+except Exception as _e:
+    test("Message-Dashboard-Cleanup grep", False, str(_e))
+
+# Live: Phantom-Mails sollten nicht mehr im Inbox-Stream sein
+try:
+    _r = requests.get(BASE_URL + "/api/messages?source=email_privat&junk=hide&limit=500", timeout=30)
+    _msgs = _r.json().get("messages", []) if _r.ok else []
+    _phantom = [m for m in _msgs if m.get("subject") == "(kein Betreff)" and not m.get("sender_address")]
+    test("Live: keine Phantom-Mails (kein Betreff + kein sender) im Inbox-Stream",
+         len(_phantom) == 0)
+except Exception as _e:
+    test("Live phantom-mail check", False, str(_e))
+
+# Live: Sources-Endpoint enthaelt kein kchat mehr
+try:
+    _r = requests.get(BASE_URL + "/api/messages/sources", timeout=30)
+    _data = _r.json() if _r.ok else {}
+    _keys = [s["key"] for s in _data.get("sources", [])]
+    test("Live: kchat NICHT mehr in /api/messages/sources",
+         "kchat" not in _keys)
+    test("Live: Sources liefern junk_count-Feld",
+         all("junk_count" in s for s in _data.get("sources", [])))
+except Exception as _e:
+    test("Live sources check", False, str(_e))
+
+
 section("CREATE_FILE Truncation-Detection + Provider-aware max_tokens (2026-04-27)")
 
 try:
