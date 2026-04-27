@@ -4632,6 +4632,172 @@ except Exception as _e:
     test("models.json check", False, str(_e))
 
 
+section("Model Catalog Refresh 2026-04-26 (Opus 4.7 + GPT-5.x + Gemini 3.1 Flash-Lite)")
+
+try:
+    with open(os.path.expanduser("~/AssistantDev/src/web_server.py")) as _f:
+        _ws = _f.read()
+
+    # Anthropic Opus 4.7
+    test("MODEL_DISPLAY hat claude-opus-4-7",
+         "'claude-opus-4-7': 'Claude Opus 4.7'" in _ws)
+
+    # OpenAI GPT-5.x Familie
+    test("MODEL_DISPLAY hat gpt-5.5",
+         "'gpt-5.5': 'GPT-5.5'" in _ws)
+    test("MODEL_DISPLAY hat gpt-5.5-pro",
+         "'gpt-5.5-pro': 'GPT-5.5 Pro'" in _ws)
+    test("MODEL_DISPLAY hat gpt-5.4",
+         "'gpt-5.4': 'GPT-5.4'" in _ws)
+    test("MODEL_DISPLAY hat gpt-5.4-mini",
+         "'gpt-5.4-mini': 'GPT-5.4 Mini'" in _ws)
+    test("MODEL_DISPLAY hat gpt-5.4-nano",
+         "'gpt-5.4-nano': 'GPT-5.4 Nano'" in _ws)
+    test("MODEL_DISPLAY hat gpt-5",
+         "'gpt-5': 'GPT-5'" in _ws)
+    test("MODEL_DISPLAY hat gpt-5.3-codex",
+         "'gpt-5.3-codex': 'GPT-5.3 Codex'" in _ws)
+    test("MODEL_DISPLAY hat o3-pro",
+         "'o3-pro': 'o3 Pro'" in _ws)
+
+    # Gemini 3.1 Flash-Lite
+    test("MODEL_DISPLAY hat gemini-3.1-flash-lite-preview",
+         "'gemini-3.1-flash-lite-preview':" in _ws)
+except Exception as _e:
+    test("Model-Catalog-Refresh grep", False, str(_e))
+
+# models.json: neue Provider-Modelle
+try:
+    _models_path = os.path.expanduser(
+        "~/Library/Mobile Documents/com~apple~CloudDocs/Downloads shared/claude_datalake/config/models.json"
+    )
+    if os.path.exists(_models_path):
+        with open(_models_path) as _f:
+            _models = json.load(_f)
+        _provs = _models.get('providers', {})
+
+        if 'anthropic' in _provs:
+            _an_ids = [m['id'] for m in _provs['anthropic'].get('models', [])]
+            test("models.json: claude-opus-4-7 gelistet", 'claude-opus-4-7' in _an_ids)
+            test("models.json: claude-sonnet-4-6 weiter gelistet", 'claude-sonnet-4-6' in _an_ids)
+            test("models.json: Opus 4.7 steht VOR Opus 4.6 (sortiert nach Aktualitaet)",
+                 _an_ids.index('claude-opus-4-7') < _an_ids.index('claude-opus-4-6'))
+
+        if 'openai' in _provs:
+            _oa_ids = [m['id'] for m in _provs['openai'].get('models', [])]
+            test("models.json: gpt-5.5 gelistet", 'gpt-5.5' in _oa_ids)
+            test("models.json: gpt-5.5-pro gelistet", 'gpt-5.5-pro' in _oa_ids)
+            test("models.json: gpt-5.4-mini gelistet", 'gpt-5.4-mini' in _oa_ids)
+            test("models.json: o3-pro gelistet", 'o3-pro' in _oa_ids)
+            test("models.json: gpt-5 gelistet", 'gpt-5' in _oa_ids)
+            test("models.json: gpt-5.3-codex gelistet", 'gpt-5.3-codex' in _oa_ids)
+
+        if 'gemini' in _provs:
+            _gem_ids = [m['id'] for m in _provs['gemini'].get('models', [])]
+            test("models.json: gemini-3.1-flash-lite-preview gelistet",
+                 'gemini-3.1-flash-lite-preview' in _gem_ids)
+except Exception as _e:
+    test("Model-Catalog models.json check", False, str(_e))
+
+
+section("Conversation Cleanup Purge 2026-04-26")
+
+try:
+    with open(os.path.expanduser("~/AssistantDev/src/web_server.py")) as _f:
+        _ws = _f.read()
+
+    # Helpers + Regex
+    test("_JUNK_TEST_RE definiert",
+         "_JUNK_TEST_RE = re.compile(" in _ws)
+    test("_meaningful_length-Helper definiert",
+         "def _meaningful_length(text):" in _ws)
+    test("_is_junk_conversation-Helper definiert",
+         "def _is_junk_conversation(entry):" in _ws)
+
+    # Junk-Detection-Pfade (Spiegelt Frontend isJunk())
+    test("Junk-Reason: Leere Session Titel-Praefix",
+         "title.startswith('Leere Session')" in _ws)
+    test("Junk-Reason: 0 messages",
+         "'0 messages'" in _ws)
+    test("Junk-Reason: 0 user messages",
+         "'0 user messages'" in _ws)
+    test("Junk-Reason: <8 meaningful chars",
+         "_meaningful_length(preview) < 8" in _ws)
+    test("Junk-Reason: title matches test pattern",
+         "_JUNK_TEST_RE.match(title)" in _ws)
+    test("Junk-Reason: preview matches test pattern",
+         "_JUNK_TEST_RE.match(preview)" in _ws)
+
+    # Filter im GET /api/conversations
+    test("include_junk-Query-Param verarbeitet",
+         "request.args.get('include_junk'" in _ws)
+    test("Default-Filter entfernt junk Eintraege",
+         "if not include_junk:" in _ws and "_is_junk_conversation(r)[0]" in _ws)
+
+    # POST /api/conversations/cleanup Endpoint
+    test("/api/conversations/cleanup POST registered",
+         "@app.route('/api/conversations/cleanup', methods=['POST'])" in _ws)
+    test("api_conversations_cleanup-Handler",
+         "def api_conversations_cleanup():" in _ws)
+    test("dry_run Default = True",
+         "body.get('dry_run', True)" in _ws)
+    test("Soft-Delete via .deleted_<ISO>/ (kein unlink)",
+         "f'.deleted_{timestamp}'" in _ws and "os.rename(full_path" in _ws)
+    test("Cleanup nutzt os.rename (NICHT os.remove/unlink)",
+         "[CONV-CLEANUP]" in _ws and "os.unlink" not in _ws.split("def api_conversations_cleanup")[1].split("@app.route")[0])
+    test("Examples deterministisch sortiert",
+         "junk_entries.sort(key=lambda x: x[0]['id'])" in _ws)
+    test("Examples auf max 20 begrenzt",
+         "junk_entries[:20]" in _ws)
+    test("Response enthaelt scanned/junk/moved/destination/examples",
+         "'scanned': scanned" in _ws and "'junk': len(junk_entries)" in _ws and "'moved': moved" in _ws)
+except Exception as _e:
+    test("ConversationCleanup grep", False, str(_e))
+
+# Live-Tests: gegen den laufenden Server prufen
+try:
+    r = requests.post(
+        "http://localhost:8080/api/conversations/cleanup",
+        json={"dry_run": True},
+        timeout=10,
+    )
+    test("/api/conversations/cleanup POST 200 (dry-run)", r.status_code == 200)
+    if r.status_code == 200:
+        _data = r.json()
+        test("cleanup-Response hat scanned-Feld",
+             isinstance(_data.get('scanned'), int))
+        test("cleanup-Response hat junk-Feld",
+             isinstance(_data.get('junk'), int))
+        test("cleanup dry-run: moved == 0",
+             _data.get('moved') == 0)
+        test("cleanup dry-run: destination ist .deleted_*",
+             isinstance(_data.get('destination'), str)
+             and _data['destination'].startswith('.deleted_'))
+        test("cleanup-Response hat examples-Liste",
+             isinstance(_data.get('examples'), list))
+        test("cleanup-Response examples max 20",
+             len(_data.get('examples', [])) <= 20)
+        test("cleanup-Response dry_run echo true",
+             _data.get('dry_run') is True)
+
+    # GET /api/conversations: Default filtert Junk raus
+    r_default = requests.get("http://localhost:8080/api/conversations", timeout=10)
+    r_with_junk = requests.get(
+        "http://localhost:8080/api/conversations?include_junk=1", timeout=10
+    )
+    test("/api/conversations 200 (default)", r_default.status_code == 200)
+    test("/api/conversations?include_junk=1 200", r_with_junk.status_code == 200)
+    if r_default.status_code == 200 and r_with_junk.status_code == 200:
+        _default_count = len(r_default.json())
+        _all_count = len(r_with_junk.json())
+        test("include_junk=1 liefert mindestens so viele Eintraege wie Default",
+             _all_count >= _default_count)
+except requests.exceptions.RequestException as _e:
+    test("ConversationCleanup live", False, f"server not reachable: {_e}")
+except Exception as _e:
+    test("ConversationCleanup live", False, str(_e))
+
+
 _cleanup_test_artifacts()
 
 # ============================================================

@@ -891,17 +891,35 @@ PROVIDER_DISPLAY = {
 
 # Human-readable model names
 MODEL_DISPLAY = {
+    'claude-opus-4-7': 'Claude Opus 4.7',
     'claude-sonnet-4-6': 'Claude Sonnet 4.6',
     'claude-opus-4-6': 'Claude Opus 4.6',
     'claude-haiku-4-5': 'Claude Haiku 4.5',
+    'claude-haiku-4-5-20251001': 'Claude Haiku 4.5',
     'claude-sonnet-4-20250514': 'Claude Sonnet 4',
     'claude-3-5-sonnet-20241022': 'Claude 3.5 Sonnet',
-    'gpt-4o': 'GPT-4o',
-    'gpt-4o-mini': 'GPT-4o Mini',
-    'o1': 'o1',
-    'o1-mini': 'o1 Mini',
+    'gpt-5.5': 'GPT-5.5',
+    'gpt-5.5-pro': 'GPT-5.5 Pro',
+    'gpt-5.4': 'GPT-5.4',
+    'gpt-5.4-pro': 'GPT-5.4 Pro',
+    'gpt-5.4-mini': 'GPT-5.4 Mini',
+    'gpt-5.4-nano': 'GPT-5.4 Nano',
+    'gpt-5.3-codex': 'GPT-5.3 Codex',
+    'gpt-5': 'GPT-5',
+    'gpt-5-mini': 'GPT-5 Mini',
+    'gpt-5-nano': 'GPT-5 Nano',
+    'o3': 'o3',
+    'o3-pro': 'o3 Pro',
+    'gpt-4o': 'GPT-4o (legacy)',
+    'gpt-4o-mini': 'GPT-4o Mini (legacy)',
+    'o1': 'o1 (legacy)',
+    'o1-mini': 'o1 Mini (legacy)',
     'mistral-large-latest': 'Mistral Large',
+    'mistral-medium-latest': 'Mistral Medium',
     'mistral-small-latest': 'Mistral Small',
+    'magistral-medium-latest': 'Magistral Medium (Reasoning)',
+    'magistral-small-latest': 'Magistral Small (Reasoning)',
+    'codestral-latest': 'Codestral (Code)',
     'open-mistral-nemo': 'Mistral Nemo',
     'gemini-2.0-flash': 'Gemini 2.0 Flash',
     'gemini-2.5-pro': 'Gemini 2.5 Pro',
@@ -909,6 +927,7 @@ MODEL_DISPLAY = {
     'gemini-3-flash-preview': 'Gemini 3 Flash',
     'gemini-3-pro-preview': 'Gemini 3 Pro',
     'gemini-3.1-pro-preview': 'Gemini 3.1 Pro',
+    'gemini-3.1-flash-lite-preview': 'Gemini 3.1 Flash-Lite',
     'gemini-2.5-flash-lite': 'Gemini 2.5 Flash Lite',
     'gemini-1.5-pro': 'Gemini 1.5 Pro',
     'sonar': 'Sonar',
@@ -8712,6 +8731,54 @@ def api_system_prompt(agent, sub=None):
     return jsonify(result)
 
 
+# ── Junk-Konversations-Filter (BACKEND_TODO_CONVERSATION_CLEANUP_PURGE) ────
+# Mirror der Frontend-Logik aus src/pages/Memory.tsx → isJunk() / TEST_RE.
+# Sobald A+B+C live sind, kann der Frontend-Filter zu reinem Fallback degradieren.
+
+_JUNK_TEST_RE = re.compile(
+    r"^(test\b.*|testok|ok+|ping|pong|hi+|hallo|hey+|jo+|na+|"
+    r"asdf+|qwerty|foo+|bar+|baz+|lorem.*|sag\s+nur\s+das\s+wort.*|"
+    r"antworte\s+nur\s+(mit\s+)?(ok|ja|test).*|"
+    r"wie\s+geht'?s\??|funktioniert['\s]?es\??|"
+    r"funktioniert\s+das\??|kannst\s+du\s+mich\s+hören\??)$",
+    re.IGNORECASE,
+)
+
+
+def _meaningful_length(text):
+    """Strip Whitespace/Punktuation, gibt verbleibende Zeichenanzahl zurück."""
+    return len(re.sub(r"[\s.!?:;,–—-]+", "", text or ""))
+
+
+def _is_junk_conversation(entry):
+    """Spiegelt frontend isJunk() (Memory.tsx:168) auf einem /api/conversations Entry.
+
+    Returns: (is_junk: bool, reason: str). reason ist leer wenn nicht junk.
+    """
+    title = (entry.get('title') or '').strip()
+    preview = (entry.get('preview') or '').strip()
+    msg_count = entry.get('message_count') or 0
+    user_count = entry.get('user_message_count')
+    if user_count is None:
+        # Fallback fuer aeltere Eintraege ohne user_message_count.
+        user_count = msg_count
+    if title.startswith('Leere Session'):
+        return True, 'fallback title "Leere Session"'
+    if msg_count == 0:
+        return True, '0 messages'
+    if user_count == 0:
+        return True, '0 user messages'
+    if msg_count <= 1 and _meaningful_length(preview) < 8:
+        return True, 'single message, <8 meaningful chars'
+    if _JUNK_TEST_RE.match(title):
+        return True, f'title matches test pattern: {title[:40]!r}'
+    if preview and _JUNK_TEST_RE.match(preview):
+        return True, f'preview matches test pattern: {preview[:40]!r}'
+    if len(title) <= 4 and ' ' not in title and re.match(r'^[a-z]+$', title, re.IGNORECASE):
+        return True, f'short title without whitespace: {title!r}'
+    return False, ''
+
+
 # ── /api/conversations (flache Session-Liste) ──────────────────────────────
 @app.route('/api/conversations')
 def api_conversations():
@@ -8720,8 +8787,15 @@ def api_conversations():
     Response pro Eintrag: {id, agent, title, preview, updated_at, updatedAt,
     message_count, file, modified, size}. Aliase updated_at/updatedAt/modified
     zeigen alle auf denselben ISO-Timestamp — Frontend kann wahlen.
+
+    Query-Param ?include_junk=1 (default 0) liefert auch leere/Test-Sessions.
+    Per Default werden Junk-Sessions herausgefiltert (siehe
+    BACKEND_TODO_CONVERSATION_CLEANUP_PURGE §C).
     """
     agent_filter = request.args.get('agent')
+    include_junk = request.args.get('include_junk', '0').strip().lower() in (
+        '1', 'true', 'yes', 'on',
+    )
     agent_names = [agent_filter] if agent_filter else [
         f.replace('.txt', '') for f in os.listdir(AGENTS_DIR)
         if f.endswith('.txt') and '.backup_' not in f and '.deleted_' not in f
@@ -8781,8 +8855,130 @@ def api_conversations():
                 'modified': mtime_iso,
                 'size': stat.st_size,
             })
+    if not include_junk:
+        result = [r for r in result if not _is_junk_conversation(r)[0]]
     result.sort(key=lambda x: x['updated_at'], reverse=True)
     return jsonify(result)
+
+
+@app.route('/api/conversations/cleanup', methods=['POST'])
+def api_conversations_cleanup():
+    """Purge leerer & Test-Konversationen (BACKEND_TODO_CONVERSATION_CLEANUP_PURGE §B).
+
+    Body: { "dry_run": true|false }
+      - dry_run=true (default): nur scannen + Beispiele zurueckgeben.
+      - dry_run=false: Junk-Files nach <speicher>/.deleted_<ISO>/ verschieben
+        (NIEMALS unlinken — CLAUDE.md: "Niemals loeschen, nur ins backups/").
+
+    Response:
+      {
+        scanned: int,
+        junk: int,
+        moved: int,                # 0 wenn dry_run
+        destination: ".deleted_<ISO>/",
+        examples: [{id, agent, reason, preview}, ...]   # max 20, deterministisch sortiert
+      }
+    """
+    body = request.get_json(silent=True) or {}
+    dry_run = bool(body.get('dry_run', True))
+    timestamp = datetime.datetime.now().strftime('%Y-%m-%dT%H-%M-%S')
+    deleted_subdir = f'.deleted_{timestamp}'
+
+    agent_names = [
+        f.replace('.txt', '') for f in os.listdir(AGENTS_DIR)
+        if f.endswith('.txt') and '.backup_' not in f and '.deleted_' not in f
+    ]
+    scanned = 0
+    junk_entries = []  # tuple: (entry, reason, full_path, speicher)
+    for name in agent_names:
+        speicher = get_agent_speicher(name)
+        if not speicher or not os.path.isdir(speicher):
+            continue
+        for fn in sorted(os.listdir(speicher)):
+            if not fn.startswith('konversation_') or not fn.endswith('.txt'):
+                continue
+            scanned += 1
+            full = os.path.join(speicher, fn)
+            try:
+                stat = os.stat(full)
+                with open(full, encoding='utf-8', errors='replace') as fh:
+                    full_text = fh.read()
+            except OSError:
+                continue
+            # Build entry mit gleichen Feldern wie /api/conversations
+            title = ''
+            first_user = ''
+            for line in full_text.split('\n'):
+                if not title and line.strip() and not line.startswith('['):
+                    title = line.strip()[:120]
+                if line.startswith('Du: ') and not first_user:
+                    first_user = line[4:].strip()
+                if title and first_user:
+                    break
+            if not title:
+                parts = fn.replace('.txt', '').split('_')
+                title = (
+                    f'{parts[1]} {parts[2].replace("-", ":")}'
+                    if len(parts) >= 3 else fn
+                )
+            user_count = full_text.count('Du: ')
+            assistant_count = full_text.count('Assistant: ')
+            entry = {
+                'id': fn.replace('.txt', ''),
+                'agent': name,
+                'title': title,
+                'preview': (
+                    first_user or full_text[:1000].replace('\n', ' ').strip()
+                )[:160],
+                'message_count': user_count + assistant_count,
+                'user_message_count': user_count,
+            }
+            is_junk, reason = _is_junk_conversation(entry)
+            if is_junk:
+                junk_entries.append((entry, reason, full, speicher))
+
+    # Deterministische Examples (sortiert nach id), max 20.
+    junk_entries.sort(key=lambda x: x[0]['id'])
+    examples = [
+        {
+            'id': e[0]['id'],
+            'agent': e[0]['agent'],
+            'reason': e[1],
+            'preview': e[0]['preview'],
+        }
+        for e in junk_entries[:20]
+    ]
+
+    moved = 0
+    if not dry_run:
+        for entry, _reason, full_path, speicher in junk_entries:
+            target_dir = os.path.join(speicher, deleted_subdir)
+            try:
+                os.makedirs(target_dir, exist_ok=True)
+                target_path = os.path.join(target_dir, os.path.basename(full_path))
+                # Falls Ziel bereits existiert (selten — gleicher Lauf doppelt):
+                # Suffix mit Counter, damit kein Overwrite.
+                counter = 1
+                while os.path.exists(target_path):
+                    base = os.path.basename(full_path).replace('.txt', '')
+                    target_path = os.path.join(
+                        target_dir, f'{base}.{counter}.txt'
+                    )
+                    counter += 1
+                os.rename(full_path, target_path)
+                moved += 1
+            except OSError as e:
+                # Single-File-Fehler nicht den ganzen Lauf abbrechen lassen.
+                print(f'[CONV-CLEANUP] Konnte {full_path} nicht verschieben: {e}')
+
+    return jsonify({
+        'scanned': scanned,
+        'junk': len(junk_entries),
+        'moved': moved,
+        'destination': deleted_subdir + '/',
+        'dry_run': dry_run,
+        'examples': examples,
+    })
 
 
 @app.route('/api/conversations/<conv_id>/messages')
