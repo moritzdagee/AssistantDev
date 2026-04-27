@@ -17197,7 +17197,27 @@ def api_messages_mark_read():
                 effective_cid = raw_id
 
     if not target_msgs:
-        return jsonify({"ok": False, "error": "no messages matched"}), 404
+        # Wenn `conversation_id` EXPLIZIT geschickt wurde (oder mode=conversation),
+        # ist eine leere Match-Liste idempotent OK — die Conv hat dann 0 Messages
+        # zu markieren. Frontend kann dadurch ohne 404-Stress beliebige conv_ids
+        # markieren ("alle als gelesen") und das QA-Probe in
+        # AdminQAChecklist.tsx erkennt dass das Feld supportet ist.
+        if conv_id or mode == 'conversation':
+            return jsonify({
+                "ok": True,
+                "read": read,
+                "conversation_id": effective_cid or None,
+                "message_id": None,
+                "message_ids": [],
+                "count": 0,
+                "note": "conversation_id accepted but no messages matched (idempotent)",
+            })
+        # Strict message_id Pfad: 404 bleibt — Frontend soll bemerken,
+        # dass die Message verschwunden ist (z.B. archiviert/geloescht).
+        return jsonify({
+            "ok": False,
+            "error": "no messages matched message_id (try conversation_id for chat sources)",
+        }), 404
 
     mids = [m["id"] for m in target_msgs if m.get("id")]
     with _MSG_STATE_LOCK:

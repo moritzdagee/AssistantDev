@@ -4134,8 +4134,11 @@ try:
          "conversation_id" in (_mr_body.get("error") or ""))
     r = requests.post(_base + "/api/messages/mark-read",
                       json={"conversation_id": "__nope__"}, timeout=5)
-    test("mark-read {conversation_id:...} wird akzeptiert (404 weil bogus)",
-         r.status_code == 404)
+    # Verhalten geaendert per BACKEND_TODO_MARK_READ_CONV_ID_2026-04-27:
+    # bogus conversation_id ist idempotent 200 (count=0), nicht mehr 404.
+    # Strict-404 bleibt nur fuer ungueltige message_id.
+    test("mark-read {conversation_id:...} wird akzeptiert (200 idempotent, count=0)",
+         r.status_code == 200 and r.json().get("count") == 0)
 
     # §3 Changelog-Parser: one-liner + legacy gemischt
     r = requests.get(_base + "/api/changelog", timeout=5)
@@ -5290,6 +5293,52 @@ except requests.exceptions.RequestException as _e:
     test("Permissions live", False, f"server not reachable: {_e}")
 except Exception as _e:
     test("Permissions live", False, str(_e))
+
+
+section("mark-read idempotent fuer conversation_id 2026-04-27")
+
+try:
+    with open(os.path.expanduser("~/AssistantDev/src/web_server.py")) as _f:
+        _ws = _f.read()
+    test("mark-read: idempotent 200 wenn conv_id explizit + leer",
+         "conversation_id accepted but no messages matched (idempotent)" in _ws)
+    test("mark-read: 404-Pfad nur fuer message_id (Strict)",
+         "no messages matched message_id (try conversation_id for chat sources)" in _ws)
+except Exception as _e:
+    test("mark-read grep", False, str(_e))
+
+try:
+    # Mock-Probe wie das Frontend QA-Checklist tut
+    r = requests.post(
+        "http://localhost:8080/api/messages/mark-read",
+        json={"conversation_id": "__qa_probe__"},
+        timeout=10,
+    )
+    test("Live: mark-read mit nicht-existenter conv_id -> 200 idempotent",
+         r.status_code == 200)
+    if r.status_code == 200:
+        d = r.json()
+        test("Live: idempotent-Response hat count=0",
+             d.get("count") == 0)
+        test("Live: idempotent-Response Note erwaehnt 'conversation_id accepted'",
+             "conversation_id accepted" in (d.get("note") or ""))
+
+    # Strict message_id-Pfad: 404 bleibt
+    r2 = requests.post(
+        "http://localhost:8080/api/messages/mark-read",
+        json={"message_id": "__nonexistent_xyz__"},
+        timeout=10,
+    )
+    test("Live: mark-read mit nicht-existenter message_id -> 404 (Strict)",
+         r2.status_code == 404)
+    if r2.status_code == 404:
+        body = r2.json()
+        test("Live: 404-error nennt conversation_id-Hinweis",
+             "conversation_id" in (body.get("error") or ""))
+except requests.exceptions.RequestException as _e:
+    test("mark-read live", False, f"server not reachable: {_e}")
+except Exception as _e:
+    test("mark-read live", False, str(_e))
 
 
 section("CREATE_FILE Truncation-Detection + Provider-aware max_tokens (2026-04-27)")
