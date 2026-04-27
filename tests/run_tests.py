@@ -4705,6 +4705,42 @@ except Exception as _e:
     test("Model-Catalog models.json check", False, str(_e))
 
 
+section("CREATE_FILE Truncation-Detection + max_tokens 8192 (2026-04-27)")
+
+try:
+    with open(os.path.expanduser("~/AssistantDev/src/web_server.py")) as _f:
+        _ws = _f.read()
+
+    # max_tokens-Bump: alle chat-completion Aufrufe auf 8192 (statt 4096)
+    test("call_anthropic max_tokens=8192 (beide Bloecke)",
+         _ws.count("max_tokens=8192, system=system_prompt") == 2)
+    test("call_openai max_tokens=8192 (beide Bloecke)",
+         _ws.count("max_tokens=8192") >= 4)
+    test("call_ollama max_tokens=8192 (beide Bloecke)",
+         _ws.count("messages=ollama_messages, max_tokens=8192") == 2)
+    test("Mistral payload max_tokens=8192",
+         _ws.count('"max_tokens": 8192') >= 1)
+    test("kein max_tokens=4096 mehr in chat-completion calls",
+         _ws.count("max_tokens=4096") == 0 and _ws.count('"max_tokens": 4096') == 0)
+
+    # Truncation-Detection: unclosed [CREATE_FILE: wird nicht mehr silent gedropped
+    test("CREATE_FILE-Truncation-Detection ergaenzt",
+         "_cf_open_count = text.count('[CREATE_FILE:')" in _ws)
+    test("Truncation-Marker erklaert max_tokens-Limit",
+         "mid-JSON abgeschnitten (max_tokens-Limit erreicht)" in _ws)
+    test("Failed-JSON-Debug-Log nach logs/create_file_failures.log",
+         "create_file_failures.log" in _ws)
+    test("Fehlermeldung enthaelt ftype + actual error msg",
+         "Datei-Erstellung fehlgeschlagen ({ftype}): {err_msg}" in _ws)
+
+    # Generische 'JSON-Format ungueltig'-Maskierung wurde entfernt — User sieht
+    # jetzt den echten Parser-Fehler.
+    test("Generische 'JSON-Format ungueltig'-Maske entfernt",
+         "JSON-Format ungueltig. Bitte versuche es erneut." not in _ws)
+except Exception as _e:
+    test("CREATE_FILE-Truncation grep", False, str(_e))
+
+
 section("Ollama lokale 14B-Modelle 2026-04-26")
 
 try:

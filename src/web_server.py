@@ -714,14 +714,14 @@ def call_anthropic(api_key, model_id, system_prompt, messages):
     from anthropic import Anthropic
     _sanitize_anthropic_images(messages)
     client = Anthropic(api_key=api_key)
-    r = client.messages.create(model=model_id, max_tokens=4096, system=system_prompt, messages=messages)
+    r = client.messages.create(model=model_id, max_tokens=8192, system=system_prompt, messages=messages)
     return r.content[0].text
 
 def call_openai(api_key, model_id, system_prompt, messages):
     import openai
     client = openai.OpenAI(api_key=api_key)
     oai_messages = [{"role": "system", "content": system_prompt}] + messages
-    r = client.chat.completions.create(model=model_id, messages=oai_messages, max_tokens=4096)
+    r = client.chat.completions.create(model=model_id, messages=oai_messages, max_tokens=8192)
     return r.choices[0].message.content
 
 def call_deepseek(api_key, model_id, system_prompt, messages):
@@ -740,7 +740,7 @@ def call_ollama(api_key, model_id, system_prompt, messages):
         base_url="http://127.0.0.1:11434/v1",
     )
     ollama_messages = [{"role": "system", "content": system_prompt}] + messages
-    r = client.chat.completions.create(model=model_id, messages=ollama_messages, max_tokens=4096)
+    r = client.chat.completions.create(model=model_id, messages=ollama_messages, max_tokens=8192)
     return r.choices[0].message.content
 
 def call_perplexity(api_key, model_id, system_prompt, messages):
@@ -839,7 +839,7 @@ def call_perplexity(api_key, model_id, system_prompt, messages):
 def call_mistral(api_key, model_id, system_prompt, messages):
     headers = {"Authorization": "Bearer " + api_key, "Content-Type": "application/json"}
     mistral_messages = [{"role": "system", "content": system_prompt}] + messages
-    payload = {"model": model_id, "messages": mistral_messages, "max_tokens": 4096}
+    payload = {"model": model_id, "messages": mistral_messages, "max_tokens": 8192}
     r = requests.post("https://api.mistral.ai/v1/chat/completions", headers=headers, json=payload, timeout=60)
     return r.json()["choices"][0]["message"]["content"]
 
@@ -2354,14 +2354,14 @@ def call_anthropic(api_key, model_id, system_prompt, messages):
     from anthropic import Anthropic
     _sanitize_anthropic_images(messages)
     client = Anthropic(api_key=api_key)
-    r = client.messages.create(model=model_id, max_tokens=4096, system=system_prompt, messages=messages)
+    r = client.messages.create(model=model_id, max_tokens=8192, system=system_prompt, messages=messages)
     return r.content[0].text
 
 def call_openai(api_key, model_id, system_prompt, messages):
     import openai
     client = openai.OpenAI(api_key=api_key)
     oai_messages = [{"role": "system", "content": system_prompt}] + messages
-    r = client.chat.completions.create(model=model_id, messages=oai_messages, max_tokens=4096)
+    r = client.chat.completions.create(model=model_id, messages=oai_messages, max_tokens=8192)
     return r.choices[0].message.content
 
 def call_deepseek(api_key, model_id, system_prompt, messages):
@@ -2380,7 +2380,7 @@ def call_ollama(api_key, model_id, system_prompt, messages):
         base_url="http://127.0.0.1:11434/v1",
     )
     ollama_messages = [{"role": "system", "content": system_prompt}] + messages
-    r = client.chat.completions.create(model=model_id, messages=ollama_messages, max_tokens=4096)
+    r = client.chat.completions.create(model=model_id, messages=ollama_messages, max_tokens=8192)
     return r.choices[0].message.content
 
 def call_perplexity(api_key, model_id, system_prompt, messages):
@@ -2479,7 +2479,7 @@ def call_perplexity(api_key, model_id, system_prompt, messages):
 def call_mistral(api_key, model_id, system_prompt, messages):
     headers = {"Authorization": "Bearer " + api_key, "Content-Type": "application/json"}
     mistral_messages = [{"role": "system", "content": system_prompt}] + messages
-    payload = {"model": model_id, "messages": mistral_messages, "max_tokens": 4096}
+    payload = {"model": model_id, "messages": mistral_messages, "max_tokens": 8192}
     r = requests.post("https://api.mistral.ai/v1/chat/completions", headers=headers, json=payload, timeout=60)
     return r.json()["choices"][0]["message"]["content"]
 
@@ -12137,10 +12137,38 @@ def process_single_message(msg, kontext_override=None, state=None, **kwargs):
                         pass
                 text = text.replace(full_block, '')
             except Exception as fe:
+                # Konkreter Fehler statt generisches "ungueltig" — sonst kann der
+                # User nichts debuggen. JSON-Errors enthalten Position+Snippet.
                 err_msg = str(fe)
-                if 'double quotes' in err_msg or 'Expecting' in err_msg:
-                    err_msg = 'JSON-Format ungueltig. Bitte versuche es erneut.'
-                text = text.replace(full_block, f'\n*Datei-Erstellung fehlgeschlagen: {err_msg}*\n')
+                # Debug-Log: schreibe das fehlgeschlagene JSON ins logs/ damit wir
+                # post-mortem sehen, was der LLM emittierte.
+                try:
+                    _logd = os.path.expanduser('~/AssistantDev/logs')
+                    os.makedirs(_logd, exist_ok=True)
+                    with open(os.path.join(_logd, 'create_file_failures.log'), 'a') as _lf:
+                        _lf.write(f"\n=== {time.strftime('%Y-%m-%d %H:%M:%S')} type={ftype} err={err_msg!r}\n{json_str}\n")
+                except Exception:
+                    pass
+                text = text.replace(full_block, f'\n*Datei-Erstellung fehlgeschlagen ({ftype}): {err_msg}. Tipp: kuerzere Inhalte, oder Liste in mehreren CREATE_FILE-Bloecken aufteilen.*\n')
+
+        # CREATE_FILE-Truncation-Detect: extract_blocks hat nur Bloecke mit
+        # passendem `}]`-Ende geliefert. Wenn `[CREATE_FILE:` im Text steht, aber
+        # extract_blocks keinen Match dafuer hatte, ist der Block truncated/
+        # unclosed (LLM lief in max_tokens). Vorher: silent-drop, User sah den
+        # Tag im Output stehen ohne Erklaerung.
+        _cf_open_count = text.count('[CREATE_FILE:')
+        if _cf_open_count > 0:
+            # Replace alle uebrig-gebliebenen `[CREATE_FILE:...` Reste durch
+            # eine klare Fehlermeldung. Wir matchen vom Tag bis Ende-of-text
+            # ODER bis zum naechsten Doppelten Newline (heuristik fuer "Block
+            # ist hier zu Ende").
+            import re as _re_cf
+            text = _re_cf.sub(
+                r'\[CREATE_FILE:[^\n]*(?:\n[^\n]*)*?(?=\n\n|$)',
+                '\n*Datei-Erstellung fehlgeschlagen: CREATE_FILE-Block wurde mid-JSON abgeschnitten (max_tokens-Limit erreicht). Bitte den Inhalt kuerzen oder in mehrere CREATE_FILE-Bloecke aufteilen.*\n',
+                text,
+                flags=_re_cf.MULTILINE,
+            )
 
         # Resolve session_id for task-status attribution
         _task_session_id = kwargs.get('_session_id')
