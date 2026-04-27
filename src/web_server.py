@@ -680,19 +680,25 @@ _recover_pending_markers()
 def _provider_max_tokens(provider, model_id):
     """Pro Provider/Modell der maximale Output-Token-Wert.
 
-    Wichtig fuer User-Use-Case "20-seitige Dokumente exportieren": ein
-    20-Seiter generiert ~10k Tokens an JSON-Spec (Inhalt + Overhead).
+    Wichtig fuer User-Use-Cases:
+    - "20-seitige Dokumente exportieren" (~10-15k Tokens JSON-Spec)
+    - "Sonar Deep Research liefert mehrseitige Reports" (~30-60k Tokens)
+
     Default-Werte verschiedener SDKs (4096-8192) reichen dafuer NICHT.
-    Wir gehen pro Provider an die offiziellen Output-Limits — der
-    User zahlt eh nur fuer das, was wirklich emittiert wird.
+    Wir gehen pro Provider+Modell an die offiziellen Output-Limits —
+    der User zahlt eh nur fuer das, was wirklich emittiert wird.
 
     Limits (Stand 2026-04, aus den jeweiligen API-Docs):
     - Anthropic Claude 4 Opus/Sonnet: 32000 Output-Tokens
-    - Anthropic Claude Haiku 4.5: 8192 (Fallback fuer kleinere Models)
+    - Anthropic Claude Haiku 4.5: 8192 (Modell-Cap)
     - OpenAI GPT-5.x: 16384 Output-Tokens
     - DeepSeek V4: 16000 (Reasoning + Content brauchen Platz)
     - Mistral Large/Medium/Small: 16384
-    - Perplexity Sonar: 8000 (Search-anchored, kurze Antworten)
+    - Perplexity Sonar:           4000  (Lightweight, kurze grounded Antworten)
+    - Perplexity Sonar Pro:       8000  (echtes Hard-Cap)
+    - Perplexity Sonar Reasoning: 16000 (Reasoning-Tokens zaehlen mit)
+    - Perplexity Deep Research:   32000 (mehrseitige Reports — sonst Truncation
+                                          bei Papers; community-verifiziert)
     - Ollama lokal: 16384 (haengt vom Modell-Context ab; 14B mit 32k-Context
       koennen 16k Output liefern)
 
@@ -711,7 +717,15 @@ def _provider_max_tokens(provider, model_id):
     if p == 'mistral':
         return 16384
     if p == 'perplexity':
-        return 8000
+        # Pro Sonar-Modell sehr unterschiedlich: Deep-Research erzeugt Papers
+        # mit zigtausenden Tokens; Sonar lite ist auf kurze Antworten ausgelegt.
+        if 'deep-research' in m:
+            return 32000
+        if 'reasoning' in m:
+            return 16000
+        if 'pro' in m:
+            return 8000
+        return 4000
     if p == 'ollama':
         return 16384
     return 8192

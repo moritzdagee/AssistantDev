@@ -4727,6 +4727,16 @@ try:
     test("Helper kennt Ollama -> 16384",
          "if p == 'ollama':\n        return 16384" in _ws)
 
+    # Perplexity per-Modell (vorher: pauschal 8000)
+    test("Helper kennt Perplexity sonar-deep-research -> 32000",
+         "if 'deep-research' in m:\n            return 32000" in _ws)
+    test("Helper kennt Perplexity reasoning -> 16000",
+         "if 'reasoning' in m:\n            return 16000" in _ws)
+    test("Helper kennt Perplexity sonar-pro -> 8000",
+         "if 'pro' in m:\n            return 8000" in _ws)
+    test("Helper kennt Perplexity sonar (lite) -> 4000",
+         "return 4000" in _ws)
+
     # Helper wird konsistent in allen Adapter-Calls genutzt
     test("call_anthropic nutzt _provider_max_tokens",
          _ws.count("_provider_max_tokens('anthropic', model_id)") == 2)
