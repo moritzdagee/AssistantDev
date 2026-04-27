@@ -4417,6 +4417,43 @@ except Exception as _e:
     test("WhatsApp-Ambiguity grep", False, str(_e))
 
 
+section("WhatsApp Group-Chat Search Fallback 2026-04-26")
+
+try:
+    with open(os.path.expanduser("~/AssistantDev/src/web_server.py")) as _f:
+        _ws = _f.read()
+
+    test("_open_whatsapp_with_chat_search-Helper definiert",
+         "def _open_whatsapp_with_chat_search(chat_name, message):" in _ws)
+    test("Helper aktiviert WhatsApp.app",
+         'tell application "WhatsApp" to activate' in _ws)
+    test("Helper triggert Cmd+F (Chat-Suche)",
+         'keystroke "f" using command down' in _ws)
+    test("Helper sendet Return (key code 36) zum Auswaehlen",
+         "key code 36" in _ws)
+    test("Helper paste'd Nachricht via Cmd+V",
+         'keystroke "v" using command down' in _ws)
+    test("Helper escaped \" und \\ im chat_name",
+         "chat_name.replace('\\\\\\\\', '\\\\\\\\\\\\\\\\').replace('\"', '\\\\\\\\\"')" in _ws or
+         "esc_name = chat_name.replace" in _ws)
+    test("Helper kopiert Nachricht ins Clipboard via pbcopy",
+         "subprocess.run(['pbcopy'], input=message.encode" in _ws)
+
+    # Wiring im CREATE_WHATSAPP-Parser
+    test("CREATE_WHATSAPP-Parser ruft chat-search bei wa_phone is None",
+         "wa_phone is None and src_type == 'whatsapp' and src_conv" in _ws)
+    test("Parser nimmt chat_target aus source_conversation_id",
+         "src_conv[3:] if src_conv.startswith('wa:') else src_conv" in _ws)
+    test("created_whatsapps liefert chat_search-Flag",
+         "'chat_search': chat_search_used" in _ws)
+    test("clipboard_fallback ist False wenn chat_search erfolgreich",
+         "wa_phone is None and not chat_search_used" in _ws)
+    test("Action-Marker bei chat_search erwaehnt 'Suche geoeffnet'",
+         "via Suche geoeffnet" in _ws)
+except Exception as _e:
+    test("WhatsApp-ChatSearch grep", False, str(_e))
+
+
 section("Frontend-TODOs CRUD + Reply-Context + Chat-Signature 2026-04-26")
 
 try:

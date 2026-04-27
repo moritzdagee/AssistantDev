@@ -1709,6 +1709,59 @@ end tell'''
         raise Exception(f"AppleScript Fehler: {result.stderr.strip()}")
     return True
 
+def _open_whatsapp_with_chat_search(chat_name, message):
+    """Oeffnet WhatsApp.app und triggert die Chat-Suche (Cmd+F) mit `chat_name`,
+    waehlt den ersten Treffer per Return. Klebt anschliessend die Nachricht aus
+    dem Clipboard ins Eingabefeld (Cmd+V) — sendet aber NICHT automatisch, der
+    User reviewt vor Return.
+
+    Use case: Gruppen-Chats und unbekannte 1:1-Kontakte, fuer die kein Phone
+    aufloesbar ist. macOS Contacts kennt keine Gruppen, also nutzen wir
+    WhatsApps eigene Suche mit dem Klartext-Namen aus source_conversation_id.
+
+    Returns: True bei Erfolg, False bei Fehler. Crashes nie — die Fallback-
+    Strategie (Clipboard) bleibt funktionsfaehig.
+    """
+    import subprocess
+    try:
+        if message:
+            subprocess.run(['pbcopy'], input=message.encode('utf-8'), timeout=5)
+    except Exception:
+        pass
+    # Doppelte Anfuehrungszeichen + Backslashes escapen, damit der Name als
+    # AppleScript-String robust eingefuegt werden kann.
+    esc_name = chat_name.replace('\\', '\\\\').replace('"', '\\"')
+    script = f'''
+    tell application "WhatsApp" to activate
+    delay 0.4
+    tell application "System Events"
+        tell process "WhatsApp"
+            keystroke "f" using command down
+            delay 0.25
+            keystroke "{esc_name}"
+            delay 0.5
+            key code 36
+            delay 0.5
+            keystroke "v" using command down
+        end tell
+    end tell
+    '''
+    try:
+        result = subprocess.run(
+            ['osascript', '-e', script],
+            capture_output=True, text=True, timeout=15
+        )
+        if result.returncode != 0:
+            print(f"[WHATSAPP] chat-search fuer {chat_name!r} fehlgeschlagen: "
+                  f"{result.stderr.strip()}", flush=True)
+            return False
+        return True
+    except Exception as e:
+        print(f"[WHATSAPP] chat-search-Exception fuer {chat_name!r}: {e}",
+              flush=True)
+        return False
+
+
 def _is_real_phone(phone):
     """True wenn `phone` plausibel ist (>=8 Ziffern, keine offensichtliche
     Platzhalter-Sequenz wie +490000000000 oder 0000000000). LLMs
@@ -11760,12 +11813,33 @@ def process_single_message(msg, kontext_override=None, state=None, **kwargs):
                         if 'phone' in wspec and not _is_real_phone(wspec.get('phone')):
                             wspec.pop('phone', None)
                     wa_to, wa_phone, wa_hint = send_whatsapp_draft(wspec, agent_name)
+                    chat_search_used = False
+                    # Fallback fuer Gruppen-Chats und unbekannte Kontakte:
+                    # wenn Phone-Lookup fehlschlug UND wir aus einer WhatsApp-
+                    # Konversation antworten, oeffnen wir den Chat per Namens-
+                    # Suche direkt in WhatsApp (Cmd+F). macOS Contacts kennt
+                    # keine Gruppen — fuer "Familia" etc. ist das der einzig
+                    # robuste Weg.
+                    if wa_phone is None and src_type == 'whatsapp' and src_conv:
+                        chat_target = src_conv[3:] if src_conv.startswith('wa:') else src_conv
+                        if chat_target:
+                            chat_search_used = _open_whatsapp_with_chat_search(
+                                chat_target, wspec.get('message', '')
+                            )
                     created_whatsapps.append({
                         'ok': True, 'to': wa_to, 'phone': wa_phone,
-                        'clipboard_fallback': wa_phone is None,
+                        'clipboard_fallback': wa_phone is None and not chat_search_used,
+                        'chat_search': chat_search_used,
                         'ambiguity_hint': wa_hint,
                     })
-                    if wa_hint:
+                    if chat_search_used:
+                        # WhatsApp wurde per Cmd+F + Chat-Name geoeffnet, die
+                        # Nachricht ist eingefuegt — der User reviewt und sendet
+                        # selbst per Return.
+                        marker = (f'\n[WhatsApp-Chat {wa_to!r} via Suche geoeffnet, '
+                                  f'Nachricht eingefuegt — bitte in WhatsApp '
+                                  f'pruefen und mit Return senden.]\n')
+                    elif wa_hint:
                         # Mehrdeutiger oder unauflösbarer Lookup — der User soll
                         # das sehen, statt dass die App still eine falsche
                         # Nummer benutzt. Marker explizit ausweisen.
