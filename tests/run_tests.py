@@ -4705,6 +4705,129 @@ except Exception as _e:
     test("Model-Catalog models.json check", False, str(_e))
 
 
+section("Agent-Lifecycle robust 2026-04-27 (Create+Rename+Delete+Restore mit Storage)")
+
+try:
+    with open(os.path.expanduser("~/AssistantDev/src/web_server.py")) as _f:
+        _ws = _f.read()
+
+    # Helper-Funktionen
+    test("_default_agent_system_prompt-Helper definiert",
+         "def _default_agent_system_prompt(label: str, description: str) -> str:" in _ws)
+    test("Default-Template enthaelt OUTPUT-BLOCK KONVENTION",
+         "## OUTPUT-BLOCK KONVENTION" in _ws)
+    test("_create_agent_storage_skeleton-Helper definiert",
+         "def _create_agent_storage_skeleton(slug: str)" in _ws)
+    test("Skeleton legt memory/ + working_memory/ + contacts.json + _manifest.json an",
+         "memdir = os.path.join(speicher, 'memory')" in _ws and
+         "wmdir = os.path.join(speicher, 'working_memory')" in _ws and
+         "'contacts.json'" in _ws and
+         "'_manifest.json'" in _ws)
+    test("_move_agent_storage-Helper definiert",
+         "def _move_agent_storage(old_slug: str, new_slug: str):" in _ws)
+    test("_archive_agent-Helper definiert",
+         "def _archive_agent(slug: str, reason: str = 'user_delete')" in _ws)
+    test("_restore_agent-Helper definiert",
+         "def _restore_agent(archive_id: str)" in _ws)
+    test("_deleted_agents_dir-Helper definiert",
+         "def _deleted_agents_dir():" in _ws)
+
+    # POST /agents: Skeleton + Template + fsync
+    test("POST /agents nutzt _default_agent_system_prompt",
+         "_default_agent_system_prompt(label, description)" in _ws)
+    test("POST /agents legt Skeleton an + fsync",
+         "skel = _create_agent_storage_skeleton(slug)" in _ws and
+         "os.fsync(fh.fileno())" in _ws)
+    test("POST /agents Rollback bei Fehler",
+         "Rollback bei Fehler: angelegte System-Prompt wieder weg" in _ws)
+
+    # PATCH /agents: storage-dir migriert mit
+    test("PATCH /agents migriert Storage-Dir mit",
+         "_move_agent_storage(name, new_slug)" in _ws)
+    test("PATCH /agents Rollback bei Storage-Fehler",
+         "[AGENT-RENAME] Rollback wegen Storage-Move-Fehler" in _ws)
+    test("PATCH /agents 409 wenn Storage-Dir existiert",
+         "Storage-Dir fuer \"{new_slug}\" existiert bereits" in _ws)
+
+    # DELETE /agents: archive nach .deleted_agents/
+    test("DELETE /agents ruft _archive_agent",
+         "meta = _archive_agent(name, reason=reason)" in _ws)
+    test("DELETE /agents-Response hat archive_id + restore_endpoint",
+         "'archive_id': meta['archive_id']" in _ws and
+         "'restore_endpoint': f\"/agents/restore/{meta['archive_id']}\"" in _ws)
+    test("Archive enthaelt _meta.json mit Stats",
+         "'storage_stats':" in _ws and
+         "email_count = 0" in _ws and
+         "conv_count = sum(1 for fn" in _ws)
+
+    # Restore + Archive-List Endpoints
+    test("POST /agents/restore/<archive_id> registered",
+         "@app.route('/agents/restore/<archive_id>', methods=['POST'])" in _ws)
+    test("GET /agents/archive registered",
+         "@app.route('/agents/archive', methods=['GET'])" in _ws)
+    test("Restore: 409 wenn Slug aktiv schon belegt",
+         "Agent {slug} existiert bereits aktiv" in _ws)
+
+    # Subagent-CRUD konsistent
+    test("Subagent POST nutzt Default-Template",
+         "_default_agent_system_prompt(\n        f'{label} (Sub-Agent von {parent})'" in _ws)
+    test("Subagent DELETE archiviert nach .deleted_agents/",
+         "[SUBAGENT-DELETE] archived" in _ws and
+         "moved_storage': False,  # subagents teilen Parent's storage" in _ws)
+except Exception as _e:
+    test("Agent-Lifecycle grep", False, str(_e))
+
+
+# Live: full Lifecycle smoke-test
+try:
+    # CREATE
+    _r = requests.post(BASE_URL + "/agents",
+                       json={"label": "lifecycle_smoke_2026", "description": "auto-test"},
+                       timeout=10)
+    test("Live: POST /agents 201 + storage_initialized=true",
+         _r.status_code == 201 and (_r.json() or {}).get("storage_initialized") is True)
+
+    if _r.status_code == 201:
+        # contacts.json + _manifest.json existieren?
+        _datalake = os.path.expanduser("~/Library/Mobile Documents/com~apple~CloudDocs/Downloads shared/claude_datalake")
+        test("Live: contacts.json nach POST angelegt",
+             os.path.isfile(os.path.join(_datalake, "lifecycle_smoke_2026/memory/contacts.json")))
+        test("Live: working_memory _manifest.json nach POST angelegt",
+             os.path.isfile(os.path.join(_datalake, "lifecycle_smoke_2026/working_memory/_manifest.json")))
+
+        # RENAME
+        _r2 = requests.patch(BASE_URL + "/agents/lifecycle_smoke_2026",
+                             json={"label": "lifecycle_smoke_renamed_2026"},
+                             timeout=10)
+        test("Live: PATCH /agents Rename ok + renamed_to gesetzt",
+             _r2.status_code == 200 and (_r2.json() or {}).get("renamed_to") == "lifecycle_smoke_renamed_2026")
+        test("Live: alter Storage-Pfad nach Rename weg",
+             not os.path.isdir(os.path.join(_datalake, "lifecycle_smoke_2026")))
+        test("Live: neuer Storage-Pfad mit memory/+ working_memory/",
+             os.path.isdir(os.path.join(_datalake, "lifecycle_smoke_renamed_2026/memory")))
+
+        # DELETE
+        _r3 = requests.delete(BASE_URL + "/agents/lifecycle_smoke_renamed_2026",
+                              json={"reason": "smoketest"}, timeout=10)
+        _archive_id = (_r3.json() or {}).get("archive_id")
+        test("Live: DELETE /agents 200 + archive_id geliefert",
+             _r3.status_code == 200 and bool(_archive_id))
+        test("Live: Storage-Dir nach DELETE weg, Archive-Dir da",
+             not os.path.isdir(os.path.join(_datalake, "lifecycle_smoke_renamed_2026"))
+             and _archive_id and os.path.isdir(os.path.join(_datalake, ".deleted_agents", _archive_id)))
+
+        # ARCHIVE-LIST
+        _r4 = requests.get(BASE_URL + "/agents/archive", timeout=10)
+        archives = (_r4.json() or {}).get("archives", [])
+        test("Live: GET /agents/archive enthaelt unseren Archive-Eintrag",
+             any(a.get("archive_id") == _archive_id for a in archives))
+
+        # Final-Cleanup: archivieren bleibt — wir lassen den Eintrag in
+        # .deleted_agents/ stehen (Soft-Delete-Konvention).
+except Exception as _e:
+    test("Lifecycle live", False, str(_e))
+
+
 section("3 Backend-TODOs 2026-04-27 (Agent-Persist + Cleanup-Global + iMessage-FDA)")
 
 try:

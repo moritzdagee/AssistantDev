@@ -7996,6 +7996,231 @@ def _agent_exists(name: str) -> bool:
     return os.path.isfile(os.path.join(AGENTS_DIR, name + '.txt'))
 
 
+# ── Agent-Lifecycle: Helper fuer Create/Rename/Delete ───────────────────────
+# Robuste CRUD-Operations fuer Agents (BACKEND_TODO 2026-04-27 "Agent-
+# Creierung umbenennen + sauber abgespeichert in allen Orten"). Vor diesem
+# Refactor:
+# - CREATE schrieb nur die .txt; memory/working_memory blieb leer
+# - RENAME aenderte nur die .txt; storage-dir blieb unter altem Namen
+# - DELETE benannte nur die .txt um; ALLE Konversationen + memory blieben
+# Jetzt: konsistente Operationen die ALLE referenzierten Pfade behandeln.
+
+_DEFAULT_AGENT_PROMPT_TEMPLATE = '''Du bist {label}, ein hilfreicher Assistent fuer Moritz Cremer. {description}
+
+Antworte praezise in der Sprache der Frage. Halte Antworten knapp.
+
+## OUTPUT-BLOCK KONVENTION
+Wenn deine Antwort einen isolierten Output enthaelt (E-Mail, Skript, Dokument, Konfiguration, Prompt etc.) — also etwas das der User direkt verwenden will — dann wrap diesen Teil in:
+
+<output>
+[dein Output hier]
+</output>
+
+- Alles ausserhalb ist Erklaerungstext (vor oder nach dem Block)
+- Der <output>-Tag wird im Frontend als visuell hervorgehobener Block gerendert
+- Der Kopieren-Button kopiert NUR den Inhalt des Output-Blocks
+- Verwende dies bei: E-Mails, Skripten, Dokumenten, Konfigurationen, Claude Code Prompts
+- Pro Antwort maximal ein <output>-Block
+'''
+
+
+# Wo archivierte Agents landen. Per-Agent-Sub-Folder mit Timestamp.
+def _deleted_agents_dir():
+    return os.path.join(BASE, '.deleted_agents')
+
+
+def _default_agent_system_prompt(label: str, description: str) -> str:
+    """Erzeugt den Basis-Prompt fuer einen frisch angelegten Agent.
+
+    Strukturell identisch zu den existierenden Agents:
+    - User-editierbarer Block oben
+    - Spaeter haengt das System den AUTO-GENERATED-Capabilities-Block per
+      `_capabilities_update_agent_files` an (auf Server-Start).
+    """
+    desc = (description or '').strip()
+    if desc:
+        # User-Description einbetten — als zweiten Satz nach dem "Du bist..."-Lead
+        body = _DEFAULT_AGENT_PROMPT_TEMPLATE.format(label=label, description=desc)
+    else:
+        body = _DEFAULT_AGENT_PROMPT_TEMPLATE.format(
+            label=label, description='Hilf bei allem, was Moritz fuer diesen Kontext braucht.',
+        )
+    return body
+
+
+def _create_agent_storage_skeleton(slug: str) -> dict:
+    """Legt das vollstaendige Storage-Layout fuer einen Top-Level-Agent an.
+
+    Pfade:
+      <base>/<slug>/                       — Storage-Root
+      <base>/<slug>/memory/                — E-Mails, Web-Clips, etc.
+      <base>/<slug>/memory/contacts.json   — Kontakt-DB-Schale
+      <base>/<slug>/working_memory/        — Working-Memory-Dir
+      <base>/<slug>/working_memory/_manifest.json — Manifest-Schale
+
+    Idempotent: vorhandene Files werden nicht ueberschrieben (existsiert oft
+    schon bei Re-Setup). Returns: dict mit den Pfaden, die effektiv neu
+    angelegt wurden — Logging-Material.
+    """
+    speicher = os.path.join(BASE, slug)
+    memdir = os.path.join(speicher, 'memory')
+    wmdir = os.path.join(speicher, 'working_memory')
+    contacts_path = os.path.join(memdir, 'contacts.json')
+    manifest_path = os.path.join(wmdir, '_manifest.json')
+
+    created = []
+    for d in (speicher, memdir, wmdir):
+        if not os.path.isdir(d):
+            os.makedirs(d, exist_ok=True)
+            created.append(d)
+
+    # contacts.json mit leerer Schale (Email-Watcher fuellt sie spaeter)
+    if not os.path.exists(contacts_path):
+        try:
+            with open(contacts_path, 'w', encoding='utf-8') as fh:
+                json.dump({
+                    'contacts': [],
+                    'updated_at': datetime.datetime.now(datetime.timezone.utc).isoformat(),
+                    'created_by': 'agent_create_skeleton',
+                }, fh, indent=2, ensure_ascii=False)
+                fh.flush()
+                os.fsync(fh.fileno())
+            created.append(contacts_path)
+        except OSError:
+            pass
+
+    # working_memory _manifest.json
+    if not os.path.exists(manifest_path):
+        try:
+            with open(manifest_path, 'w', encoding='utf-8') as fh:
+                json.dump({
+                    'max_tokens': 8000,
+                    'auto_cleanup': True,
+                    'files': [],
+                }, fh, indent=2, ensure_ascii=False)
+                fh.flush()
+                os.fsync(fh.fileno())
+            created.append(manifest_path)
+        except OSError:
+            pass
+
+    return {'speicher': speicher, 'created': created}
+
+
+def _move_agent_storage(old_slug: str, new_slug: str):
+    """Benennt den Storage-Root eines Top-Level-Agents um.
+
+    Atomar: Wenn das Ziel existiert, Fehler. Wenn der Quell-Dir nicht
+    existiert, kein Fehler (frisch angelegter Agent ohne Aktivitaet).
+    Memory + Konversationen wandern komplett mit.
+    """
+    old_root = os.path.join(BASE, old_slug)
+    new_root = os.path.join(BASE, new_slug)
+    if not os.path.isdir(old_root):
+        return False  # nichts zu tun
+    if os.path.exists(new_root):
+        raise FileExistsError(f"Ziel-Dir existiert: {new_root}")
+    os.rename(old_root, new_root)
+    return True
+
+
+def _archive_agent(slug: str, reason: str = 'user_delete') -> dict:
+    """Archiviert einen Agent nach <base>/.deleted_agents/<slug>_<ts>/.
+
+    Verschiebt:
+    - <agents_dir>/<slug>.txt -> archive/agent.txt
+    - <base>/<slug>/         -> archive/storage/
+
+    Plus _meta.json mit Stats fuer spaetere Restore-Operationen.
+    Soft-Delete-Konvention (CLAUDE.md): nichts wird unlinked, alles
+    bleibt rekonstruierbar im Archive-Folder.
+    """
+    archives_root = _deleted_agents_dir()
+    os.makedirs(archives_root, exist_ok=True)
+    ts = datetime.datetime.now().strftime('%Y-%m-%d_%H-%M-%S')
+    archive_id = f'{slug}_{ts}'
+    archive_dir = os.path.join(archives_root, archive_id)
+    os.makedirs(archive_dir, exist_ok=False)
+
+    # 1) System-Prompt-File
+    src_prompt = os.path.join(AGENTS_DIR, slug + '.txt')
+    moved_prompt = False
+    if os.path.isfile(src_prompt):
+        os.rename(src_prompt, os.path.join(archive_dir, 'agent.txt'))
+        moved_prompt = True
+
+    # 2) Storage-Root (memory + working_memory + Konversationen)
+    src_storage = os.path.join(BASE, slug)
+    moved_storage = False
+    storage_stats = {}
+    if os.path.isdir(src_storage):
+        # Stats sammeln BEVOR wir verschieben
+        try:
+            mem_dir = os.path.join(src_storage, 'memory')
+            email_count = 0
+            if os.path.isdir(mem_dir):
+                for fn in os.listdir(mem_dir):
+                    if '_IN_' in fn or '_OUT_' in fn:
+                        email_count += 1
+            conv_count = sum(1 for fn in os.listdir(src_storage)
+                             if fn.startswith('konversation_') and fn.endswith('.txt'))
+            storage_stats = {'emails': email_count, 'conversations': conv_count}
+        except Exception:
+            storage_stats = {}
+        os.rename(src_storage, os.path.join(archive_dir, 'storage'))
+        moved_storage = True
+
+    # 3) Meta-File fuer spaetere Restore-Operationen
+    meta = {
+        'agent': slug,
+        'archive_id': archive_id,
+        'archived_at': datetime.datetime.now(datetime.timezone.utc).isoformat(),
+        'reason': reason,
+        'moved_prompt': moved_prompt,
+        'moved_storage': moved_storage,
+        'storage_stats': storage_stats,
+    }
+    with open(os.path.join(archive_dir, '_meta.json'), 'w', encoding='utf-8') as fh:
+        json.dump(meta, fh, indent=2, ensure_ascii=False)
+        fh.flush()
+        os.fsync(fh.fileno())
+    return meta
+
+
+def _restore_agent(archive_id: str) -> dict:
+    """Stellt einen archivierten Agent aus .deleted_agents/<archive_id>/
+    wieder her. Inverse Operation zu _archive_agent.
+
+    Fehler wenn:
+    - Archive-Dir existiert nicht
+    - Ein Agent mit gleichem Namen existiert bereits aktiv
+    """
+    archive_dir = os.path.join(_deleted_agents_dir(), archive_id)
+    if not os.path.isdir(archive_dir):
+        raise FileNotFoundError(f"Archive {archive_id} nicht gefunden")
+    meta_path = os.path.join(archive_dir, '_meta.json')
+    if not os.path.isfile(meta_path):
+        raise FileNotFoundError(f"_meta.json fehlt in {archive_id}")
+    with open(meta_path, encoding='utf-8') as fh:
+        meta = json.load(fh)
+    slug = meta['agent']
+    if _agent_exists(slug):
+        raise FileExistsError(f"Agent {slug} existiert bereits aktiv — nicht ueberschrieben")
+    # Wenn Storage-Dir aktiv existiert, ebenfalls Konflikt
+    if os.path.isdir(os.path.join(BASE, slug)):
+        raise FileExistsError(f"Storage-Dir fuer {slug} existiert bereits — nicht ueberschrieben")
+
+    # Inverse-Move
+    arch_prompt = os.path.join(archive_dir, 'agent.txt')
+    if meta.get('moved_prompt') and os.path.isfile(arch_prompt):
+        os.rename(arch_prompt, os.path.join(AGENTS_DIR, slug + '.txt'))
+    arch_storage = os.path.join(archive_dir, 'storage')
+    if meta.get('moved_storage') and os.path.isdir(arch_storage):
+        os.rename(arch_storage, os.path.join(BASE, slug))
+    # Archive-Dir entkernen — nur _meta.json bleibt als Trail
+    return {'restored': slug, 'archive_id': archive_id, 'meta': meta}
+
+
 # ── /api/health (Schema laut LIVE_API_QA §7) ───────────────────────────────
 @app.route('/api/health')
 def api_health_v2():
@@ -9309,7 +9534,9 @@ def api_agent_create():
     if _agent_exists(slug):
         return jsonify({'error': f'Name "{slug}" existiert bereits.'}), 409
     path = os.path.join(AGENTS_DIR, slug + '.txt')
-    prompt = description or f'Du bist {label}, ein hilfreicher Assistent.'
+    # Default-Template ergibt einen voll funktionalen System-Prompt mit
+    # OUTPUT-Block-Konvention. Falls description gesetzt: einbetten.
+    prompt = _default_agent_system_prompt(label, description)
     try:
         # Synchroner Disk-Write: fh.flush() + os.fsync() bevor wir 201 melden,
         # damit das Frontend bei HTTP-200 garantiert weiss, dass der Agent
@@ -9319,69 +9546,175 @@ def api_agent_create():
             fh.write(prompt)
             fh.flush()
             os.fsync(fh.fileno())
-        speicher = get_agent_speicher(slug)
-        os.makedirs(speicher, exist_ok=True)
+        # Volles Storage-Skelett: memory/ + working_memory/ + contacts.json +
+        # _manifest.json. Ohne das laufen Email-Watcher, Working-Memory und
+        # Kontakt-Sync auf NotFound-Fehler beim ersten Zugriff.
+        skel = _create_agent_storage_skeleton(slug)
     except OSError as e:
         print(f"[AGENT-CREATE] FEHLER fuer slug={slug!r}: {e}", flush=True)
+        # Rollback bei Fehler: angelegte System-Prompt wieder weg
+        try:
+            if os.path.isfile(path):
+                os.remove(path)
+        except OSError:
+            pass
         return jsonify({'error': str(e)}), 500
-    print(f"[AGENT-CREATE] agent_created name={slug} label={label!r} path={path}", flush=True)
+    print(f"[AGENT-CREATE] agent_created name={slug} label={label!r} "
+          f"path={path} skeleton_paths={len(skel.get('created', []))}", flush=True)
     return jsonify({
         'name': slug, 'label': label, 'description': description,
-        'has_subagents': False, 'subagents': []
+        'has_subagents': False, 'subagents': [],
+        'storage_initialized': bool(skel.get('created')),
     }), 201
 
 
 @app.route('/agents/<name>', methods=['PATCH'])
 def api_agent_update(name):
+    """PATCH eines Agenten — Description-Update und/oder Slug-Rename.
+
+    Slug-Rename ist atomar:
+    - System-Prompt-File <slug>.txt -> <new_slug>.txt
+    - Storage-Root <base>/<slug>/ -> <base>/<new_slug>/  (memory + working_memory +
+      konversation_*.txt wandern alle mit)
+    Bei Fehler bei Schritt 2: rollback Schritt 1 (rename zurueck).
+    """
     if not _agent_exists(name):
         return jsonify({'error': f'agent "{name}" not found'}), 404
     body = request.get_json(silent=True) or {}
     path = os.path.join(AGENTS_DIR, name + '.txt')
     new_label = body.get('label')
     new_description = body.get('description')
-    # Rename ist komplexer (Dateiname aendert sich) — wir erlauben nur description-Update
-    # fuer jetzt; label-Rename erzeugt einen neuen Agent und migriert nicht.
+
+    # Description-Update — System-Prompt-File ueberschreiben mit fsync
     if new_description is not None:
         try:
             with open(path, 'w', encoding='utf-8') as fh:
                 fh.write(new_description)
+                fh.flush()
+                os.fsync(fh.fileno())
         except OSError as e:
             return jsonify({'error': str(e)}), 500
-    # Rename: wenn label einen anderen Slug ergeben wuerde
+
+    # Slug-Rename — komplette Pfad-Migration
+    renamed_to = None
     if new_label:
         new_slug = _slugify_agent_name(new_label)
         if new_slug and new_slug != name:
             new_path = os.path.join(AGENTS_DIR, new_slug + '.txt')
             if os.path.exists(new_path):
                 return jsonify({'error': f'Name "{new_slug}" existiert bereits.'}), 409
+            new_storage = os.path.join(BASE, new_slug)
+            if os.path.exists(new_storage):
+                return jsonify({'error': f'Storage-Dir fuer "{new_slug}" existiert bereits.'}), 409
+            # Schritt 1: System-Prompt-File rename
             try:
                 os.rename(path, new_path)
-                name = new_slug
             except OSError as e:
-                return jsonify({'error': str(e)}), 500
+                return jsonify({'error': f'rename .txt fehlgeschlagen: {e}'}), 500
+            # Schritt 2: Storage-Dir rename — bei Fehler Rollback
+            try:
+                _move_agent_storage(name, new_slug)
+            except Exception as storage_err:
+                # Rollback System-Prompt-Rename
+                try:
+                    os.rename(new_path, path)
+                except OSError:
+                    pass
+                print(f"[AGENT-RENAME] Rollback wegen Storage-Move-Fehler: {storage_err}", flush=True)
+                return jsonify({'error': f'storage rename fehlgeschlagen: {storage_err}'}), 500
+            print(f"[AGENT-RENAME] {name} -> {new_slug} (storage + prompt migriert)", flush=True)
+            name = new_slug
+            renamed_to = new_slug
+
     return jsonify({
-        'name': name, 'label': new_label or name,
+        'name': name,
+        'label': new_label or name,
         'description': new_description or _agent_description(name),
+        'renamed_to': renamed_to,
     })
 
 
 @app.route('/agents/<name>', methods=['DELETE'])
 def api_agent_delete(name):
-    path = os.path.join(AGENTS_DIR, name + '.txt')
-    if not os.path.isfile(path):
+    """DELETE: Agent VOLLSTAENDIG archivieren — System-Prompt + Storage +
+    Konversationen wandern nach <base>/.deleted_agents/<slug>_<ts>/.
+
+    Vorher: nur die <slug>.txt wurde mit `.deleted_<ts>`-Suffix versehen, der
+    gesamte Storage-Dir blieb stehen. Memory war "verwaist" und blockierte
+    z.B. die Wiederverwendung des Agent-Namens. Jetzt: alles unter einem
+    Archive-Folder, mit _meta.json fuer Stats + Restore.
+
+    Restore via POST /agents/restore/<archive_id>.
+    """
+    if not _agent_exists(name):
         return jsonify({'error': f'agent "{name}" not found'}), 404
-    # Niemals loeschen — nach backup verschieben (CLAUDE.md-Regel)
-    stamp = datetime.datetime.now().strftime('%Y%m%d_%H%M%S')
-    backup_path = path + f'.deleted_{stamp}'
+    body = request.get_json(silent=True) or {}
+    reason = (body.get('reason') or 'user_delete').strip()[:100]
     try:
-        os.rename(path, backup_path)
+        meta = _archive_agent(name, reason=reason)
     except OSError as e:
         return jsonify({'error': str(e)}), 500
-    return jsonify({'ok': True, 'backup': os.path.basename(backup_path)})
+    print(f"[AGENT-DELETE] archived name={name} archive_id={meta['archive_id']} "
+          f"emails={meta.get('storage_stats', {}).get('emails', 0)} "
+          f"conversations={meta.get('storage_stats', {}).get('conversations', 0)}", flush=True)
+    return jsonify({
+        'ok': True,
+        'archive_id': meta['archive_id'],
+        'archive_path': os.path.join(_deleted_agents_dir(), meta['archive_id']),
+        'archived_at': meta['archived_at'],
+        'storage_stats': meta.get('storage_stats', {}),
+        'restore_endpoint': f"/agents/restore/{meta['archive_id']}",
+    })
+
+
+@app.route('/agents/restore/<archive_id>', methods=['POST'])
+def api_agent_restore(archive_id):
+    """Stellt einen archivierten Agent wieder her.
+
+    409 wenn der Slug aktiv schon belegt ist (User muss den aktiven Agent
+    erst archivieren oder umbenennen).
+    """
+    try:
+        result = _restore_agent(archive_id)
+    except FileNotFoundError as e:
+        return jsonify({'error': str(e)}), 404
+    except FileExistsError as e:
+        return jsonify({'error': str(e)}), 409
+    except OSError as e:
+        return jsonify({'error': str(e)}), 500
+    print(f"[AGENT-RESTORE] restored name={result['restored']} from {archive_id}", flush=True)
+    return jsonify({'ok': True, **result})
+
+
+@app.route('/agents/archive', methods=['GET'])
+def api_agents_archive_list():
+    """Listet alle archivierten Agents (.deleted_agents/<slug>_<ts>/_meta.json)."""
+    archives_root = _deleted_agents_dir()
+    if not os.path.isdir(archives_root):
+        return jsonify({'archives': []})
+    out = []
+    for entry in sorted(os.listdir(archives_root)):
+        meta_path = os.path.join(archives_root, entry, '_meta.json')
+        if not os.path.isfile(meta_path):
+            continue
+        try:
+            with open(meta_path, encoding='utf-8') as fh:
+                meta = json.load(fh)
+            out.append(meta)
+        except Exception:
+            continue
+    out.sort(key=lambda m: m.get('archived_at', ''), reverse=True)
+    return jsonify({'archives': out})
 
 
 @app.route('/agents/<parent>/subagents', methods=['POST'])
 def api_subagent_create(parent):
+    """POST: Sub-Agent unter einem Parent anlegen.
+
+    Sub-Agents teilen sich Storage mit dem Parent (memory + working_memory)
+    — daher kein eigenes Storage-Skelett. Sub-Agent ist primaer ein
+    System-Prompt-Variant fuer einen spezifischen Sub-Kontext.
+    """
     if not _agent_exists(parent):
         return jsonify({'error': f'parent agent "{parent}" not found'}), 404
     body = request.get_json(silent=True) or {}
@@ -9396,12 +9729,19 @@ def api_subagent_create(parent):
     if _agent_exists(full_name):
         return jsonify({'error': f'Name "{full_name}" existiert bereits.'}), 409
     path = os.path.join(AGENTS_DIR, full_name + '.txt')
-    prompt = description or f'Du bist {label} (Sub-Agent von {parent}), ein hilfreicher Assistent.'
+    # Standard-Template auch fuer Subagents — User-Description wird einbettet
+    prompt = _default_agent_system_prompt(
+        f'{label} (Sub-Agent von {parent})',
+        description,
+    )
     try:
         with open(path, 'w', encoding='utf-8') as fh:
             fh.write(prompt)
+            fh.flush()
+            os.fsync(fh.fileno())
     except OSError as e:
         return jsonify({'error': str(e)}), 500
+    print(f"[SUBAGENT-CREATE] {full_name} parent={parent}", flush=True)
     return jsonify({
         'name': full_name, 'label': label, 'description': description, 'parent': parent,
     }), 201
@@ -9409,6 +9749,11 @@ def api_subagent_create(parent):
 
 @app.route('/agents/<parent>/subagents/<name>', methods=['PATCH'])
 def api_subagent_update(parent, name):
+    """PATCH: Sub-Agent description-update und/oder rename.
+
+    Rename ist hier einfacher als bei Top-Level-Agents — Sub-Agent hat
+    keinen eigenen Storage-Dir, nur eine .txt im Agents-Dir.
+    """
     full_name = name if name.startswith(f'{parent}_') else f'{parent}_{name}'
     if not _agent_exists(full_name):
         return jsonify({'error': f'subagent "{full_name}" not found'}), 404
@@ -9419,6 +9764,8 @@ def api_subagent_update(parent, name):
         try:
             with open(path, 'w', encoding='utf-8') as fh:
                 fh.write(new_description)
+                fh.flush()
+                os.fsync(fh.fileno())
         except OSError as e:
             return jsonify({'error': str(e)}), 500
     new_label = body.get('label')
@@ -9433,6 +9780,7 @@ def api_subagent_update(parent, name):
             try:
                 os.rename(path, new_path)
                 renamed = new_full
+                print(f"[SUBAGENT-RENAME] {full_name} -> {new_full}", flush=True)
             except OSError as e:
                 return jsonify({'error': str(e)}), 500
     return jsonify({'name': renamed, 'parent': parent, 'label': new_label or name})
@@ -9440,17 +9788,48 @@ def api_subagent_update(parent, name):
 
 @app.route('/agents/<parent>/subagents/<name>', methods=['DELETE'])
 def api_subagent_delete(parent, name):
+    """DELETE: Sub-Agent archivieren.
+
+    Sub-Agent hat keinen eigenen Storage-Dir, nur die .txt. Wir archivieren
+    sie nach <base>/.deleted_agents/<full_name>_<ts>/agent.txt mit _meta.json
+    — analog zu Top-Level-Agents, damit Restore moeglich ist.
+    """
     full_name = name if name.startswith(f'{parent}_') else f'{parent}_{name}'
     path = os.path.join(AGENTS_DIR, full_name + '.txt')
     if not os.path.isfile(path):
         return jsonify({'error': f'subagent "{full_name}" not found'}), 404
-    stamp = datetime.datetime.now().strftime('%Y%m%d_%H%M%S')
-    backup_path = path + f'.deleted_{stamp}'
+    archives_root = _deleted_agents_dir()
+    os.makedirs(archives_root, exist_ok=True)
+    ts = datetime.datetime.now().strftime('%Y-%m-%d_%H-%M-%S')
+    archive_id = f'{full_name}_{ts}'
+    archive_dir = os.path.join(archives_root, archive_id)
+    os.makedirs(archive_dir, exist_ok=False)
     try:
-        os.rename(path, backup_path)
+        os.rename(path, os.path.join(archive_dir, 'agent.txt'))
+        meta = {
+            'agent': full_name,
+            'parent': parent,
+            'is_subagent': True,
+            'archive_id': archive_id,
+            'archived_at': datetime.datetime.now(datetime.timezone.utc).isoformat(),
+            'reason': 'user_delete',
+            'moved_prompt': True,
+            'moved_storage': False,  # subagents teilen Parent's storage
+            'storage_stats': {},
+        }
+        with open(os.path.join(archive_dir, '_meta.json'), 'w', encoding='utf-8') as fh:
+            json.dump(meta, fh, indent=2, ensure_ascii=False)
+            fh.flush()
+            os.fsync(fh.fileno())
     except OSError as e:
         return jsonify({'error': str(e)}), 500
-    return jsonify({'ok': True, 'backup': os.path.basename(backup_path)})
+    print(f"[SUBAGENT-DELETE] archived {full_name} archive_id={archive_id}", flush=True)
+    return jsonify({
+        'ok': True,
+        'archive_id': archive_id,
+        'archive_path': archive_dir,
+        'restore_endpoint': f'/agents/restore/{archive_id}',
+    })
 
 
 @app.route('/models')
