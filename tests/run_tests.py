@@ -4798,6 +4798,81 @@ except Exception as _e:
     test("ConversationCleanup live", False, str(_e))
 
 
+section("Chat-Response Provider+Model Signatur 2026-04-26")
+
+try:
+    with open(os.path.expanduser("~/AssistantDev/src/web_server.py")) as _f:
+        _ws = _f.read()
+
+    # Happy-Path /chat (process_single_message) — bereits vorhanden, hier
+    # nochmal damit die Suite explizit gegen Regression schuetzt
+    test("process_single_message-Response liefert 'provider'",
+         "'provider': PROVIDER_DISPLAY.get(provider_key" in _ws)
+    test("process_single_message-Response liefert 'model'",
+         "'model': MODEL_DISPLAY.get(model_id" in _ws)
+
+    # execute_delegation MUSS die neuen Keys ebenfalls liefern
+    _exec_block = _ws.split("def execute_delegation(", 1)[-1].split("def ", 1)[0]
+    test("execute_delegation-Return enthaelt 'provider'-Key",
+         "'provider': PROVIDER_DISPLAY.get(provider_key" in _exec_block)
+    test("execute_delegation-Return enthaelt 'model'-Key",
+         "'model': MODEL_DISPLAY.get(model_id" in _exec_block)
+
+    # /api/subagent_confirm (confirmed-path) MUSS die neuen Keys reichen
+    _conf_block = _ws.split("def subagent_confirm()", 1)[-1].split("@app.route", 1)[0]
+    test("/api/subagent_confirm Response enthaelt 'provider'-Key",
+         "'provider': deleg_result.get('provider'" in _conf_block)
+    test("/api/subagent_confirm Response enthaelt 'model'-Key",
+         "'model': deleg_result.get('model'" in _conf_block)
+except Exception as _e:
+    test("ChatResponseSignature grep", False, str(_e))
+
+
+# Live: tatsaechlich verwendete Combo MUSS sich aendern, wenn /select_model
+# eine andere Combo setzt (Anthropic-Modelle, weil garantiert verfuegbar).
+try:
+    import uuid as _u_chat
+    _SID = str(_u_chat.uuid4())
+    requests.post("http://localhost:8080/select_agent",
+                  json={"agent": "privat", "session_id": _SID}, timeout=5)
+
+    # Switch 1: Sonnet
+    requests.post("http://localhost:8080/select_model",
+                  json={"provider": "anthropic",
+                        "model_id": "claude-sonnet-4-6",
+                        "session_id": _SID}, timeout=5)
+    r1 = requests.post("http://localhost:8080/chat",
+                       json={"message": "sag nur ok", "session_id": _SID},
+                       timeout=60).json()
+    test("/chat (Sonnet): Response hat string-feld 'provider'",
+         isinstance(r1.get("provider"), str) and len(r1["provider"]) > 0)
+    test("/chat (Sonnet): Response hat string-feld 'model'",
+         isinstance(r1.get("model"), str) and len(r1["model"]) > 0)
+    test("/chat (Sonnet): provider == 'Anthropic'",
+         r1.get("provider") == "Anthropic")
+    test("/chat (Sonnet): model spiegelt aktive Auswahl ('Sonnet' im Namen)",
+         "Sonnet" in (r1.get("model") or ""))
+
+    # Switch 2: Haiku — Response MUSS jetzt Haiku zeigen, nicht Sonnet
+    requests.post("http://localhost:8080/select_model",
+                  json={"provider": "anthropic",
+                        "model_id": "claude-haiku-4-5-20251001",
+                        "session_id": _SID}, timeout=5)
+    r2 = requests.post("http://localhost:8080/chat",
+                       json={"message": "sag nur ok", "session_id": _SID},
+                       timeout=60).json()
+    test("/chat (Haiku): Response zeigt 'Haiku' im model-Feld (kein Cache vom alten Pick)",
+         "Haiku" in (r2.get("model") or ""))
+    test("/chat: model-String matched /models-Endpoint (Catalog-Konsistenz)",
+         r2.get("model") in [m["name"]
+                             for p in (requests.get("http://localhost:8080/models").json() or [])
+                             for m in (p.get("models") or [])])
+except requests.exceptions.RequestException as _e:
+    test("ChatResponseSignature live", False, f"server not reachable: {_e}")
+except Exception as _e:
+    test("ChatResponseSignature live", False, str(_e))
+
+
 _cleanup_test_artifacts()
 
 # ============================================================

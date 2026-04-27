@@ -2262,6 +2262,8 @@ def execute_delegation(sub_agent_name, original_msg, kontext_items, state=None):
         'model_name': model_name,
         'provider_display': PROVIDER_DISPLAY.get(provider_key, provider_key),
         'model_display': MODEL_DISPLAY.get(model_id, model_name),
+        'provider': PROVIDER_DISPLAY.get(provider_key, provider_key),
+        'model': MODEL_DISPLAY.get(model_id, model_name),
         'delegated_to': sub_agent_name,
         'delegated_display': display_name,
     }
@@ -12315,6 +12317,8 @@ def subagent_confirm():
             'model_name': model_name,
             'provider_display': deleg_result.get('provider_display', ''),
             'model_display': deleg_result.get('model_display', ''),
+            'provider': deleg_result.get('provider', deleg_result.get('provider_display', '')),
+            'model': deleg_result.get('model', deleg_result.get('model_display', '')),
             'auto_loaded': pending.get('auto_loaded', []),
             'auto_search_info': pending.get('auto_search_info', ''),
             'agent': state['agent'],
