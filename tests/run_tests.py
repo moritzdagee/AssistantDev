@@ -6354,6 +6354,209 @@ except Exception as _e:
     test("e2e lifecycle /chat", False, str(_e))
 
 
+section("Pattern Analyzer 2026-04-27 (Feature 5 — Roadmap April 2026)")
+
+# Modul-Datei + Import
+try:
+    _pa_path = os.path.expanduser("~/AssistantDev/src/pattern_analyzer.py")
+    test("src/pattern_analyzer.py existiert", os.path.exists(_pa_path))
+    sys.path.insert(0, os.path.expanduser("~/AssistantDev/src"))
+    import pattern_analyzer as _pa
+    test("pattern_analyzer importierbar", True)
+    for _fn in ("analyze_logs", "list_patterns", "respond",
+                "activate_pattern", "register_with_heartbeat",
+                "get_pattern"):
+        test(f"pattern_analyzer.{_fn} vorhanden",
+             callable(getattr(_pa, _fn, None)))
+    test("pattern_analyzer.MIN_OCCURRENCES == 3", _pa.MIN_OCCURRENCES == 3)
+    test("CATEGORY_TO_SKILL hat Mapping fuer 'coding'",
+         _pa.CATEGORY_TO_SKILL.get("coding") == "coding")
+    test("CATEGORY_TO_SKILL hat Mapping fuer 'image'",
+         _pa.CATEGORY_TO_SKILL.get("image") == "image_generation")
+    test("CATEGORY_TO_SKILL hat Mapping fuer 'video'",
+         _pa.CATEGORY_TO_SKILL.get("video") == "video_generation")
+    test("WEEKDAY_DE hat 7 Eintraege",
+         isinstance(_pa.WEEKDAY_DE, list) and len(_pa.WEEKDAY_DE) == 7)
+except Exception as _e:
+    test("pattern_analyzer sanity", False, str(_e))
+
+
+# Time-Bucket-Klassifikation
+try:
+    _cases = [(8, "morning"), (10, "morning"), (12, "forenoon"),
+              (15, "afternoon"), (19, "evening"),
+              (23, "night"), (3, "night")]
+    for _h, _expected in _cases:
+        test(f"_time_bucket({_h}) == {_expected}",
+             _pa._time_bucket(_h) == _expected)
+except Exception as _e:
+    test("time bucket", False, str(_e))
+
+
+# Key-Terms (Stop-Word-Filter + Top-Tokens)
+try:
+    _terms = _pa._key_terms("Schreib mir bitte einen Pipeline-Report mit Analyse")
+    test("_key_terms ist Tuple", isinstance(_terms, tuple))
+    test("_key_terms haelt Stop-Words raus",
+         "der" not in _terms and "mit" not in _terms and "bitte" not in _terms)
+    test("_key_terms enthaelt 'pipeline' oder 'analyse'",
+         "pipeline" in _terms or "analyse" in _terms)
+    test("_key_terms('') == ()", _pa._key_terms("") == ())
+except Exception as _e:
+    test("key_terms", False, str(_e))
+
+
+# analyze_logs Live (echte usage_logs)
+try:
+    _summary = _pa.analyze_logs(push_notifications=False)
+    test("analyze_logs liefert dict", isinstance(_summary, dict))
+    test("analyze_logs ok=True", _summary.get("ok") is True)
+    test("analyze_logs hat 'total_entries'", "total_entries" in _summary)
+    test("analyze_logs hat 'clusters_total'", "clusters_total" in _summary)
+    test("analyze_logs hat 'patterns_qualifying'",
+         "patterns_qualifying" in _summary)
+    test("analyze_logs hat 'patterns_new'-Liste",
+         isinstance(_summary.get("patterns_new"), list))
+    test("analyze_logs hat 'patterns_updated'-Liste",
+         isinstance(_summary.get("patterns_updated"), list))
+    test("analyze_logs hat 'patterns_resurfaced'-Liste",
+         isinstance(_summary.get("patterns_resurfaced"), list))
+except Exception as _e:
+    test("analyze_logs run", False, str(_e))
+
+
+# Pattern-Liste + Schema
+try:
+    _patterns = _pa.list_patterns()
+    test("list_patterns ist Liste", isinstance(_patterns, list))
+    if _patterns:
+        _p = _patterns[0]
+        for _key in ("id", "description", "occurrences", "user_response",
+                     "automation_active", "suggested_schedule",
+                     "later_threshold", "agent", "category", "weekday",
+                     "time_bucket"):
+            test(f"Pattern hat '{_key}'", _key in _p)
+        test("Pattern.id startet mit 'pattern_'",
+             _p["id"].startswith("pattern_"))
+        test("Pattern.suggested_schedule ist dict mit 'kind'",
+             isinstance(_p.get("suggested_schedule"), dict)
+             and "kind" in _p["suggested_schedule"])
+except Exception as _e:
+    test("list_patterns schema", False, str(_e))
+
+
+# respond() Lifecycle: yes -> active=True, no -> active=False, later -> threshold
+try:
+    _patterns = _pa.list_patterns()
+    if _patterns:
+        _pid = _patterns[0]["id"]
+        _r1 = _pa.respond(_pid, "later")
+        test("respond('later') ok=True", _r1.get("ok") is True)
+        test("respond('later') user_response='later'",
+             _r1["pattern"].get("user_response") == "later")
+
+        _r2 = _pa.respond(_pid, "no")
+        test("respond('no') automation_active=False",
+             _r2["pattern"].get("automation_active") is False)
+
+        _r3 = _pa.respond(_pid, "yes")
+        test("respond('yes') ok=True", _r3.get("ok") is True)
+        # automation_active haengt davon ab ob heartbeat verfuegbar ist
+        test("respond('yes') user_response='yes'",
+             _r3["pattern"].get("user_response") == "yes")
+
+        _r_bad = _pa.respond(_pid, "maybe")
+        test("respond mit invalidem Wert -> ok=False",
+             _r_bad.get("ok") is False)
+
+        _r_unknown = _pa.respond("pattern_doesnotexist", "yes")
+        test("respond mit unbekannter ID -> ok=False",
+             _r_unknown.get("ok") is False)
+
+        # Reset auf neutralen State fuer Folge-Tests
+        _pa.respond(_pid, "later")
+except Exception as _e:
+    test("pattern respond lifecycle", False, str(_e))
+
+
+# Live-Endpoints
+try:
+    r = requests.get("http://localhost:8080/api/patterns", timeout=10)
+    test("/api/patterns 200", r.status_code == 200)
+    if r.status_code == 200:
+        _data = r.json()
+        test("/api/patterns liefert dict", isinstance(_data, dict))
+        test("/api/patterns hat 'patterns'-Liste",
+             isinstance(_data.get("patterns"), list))
+        test("/api/patterns hat 'count'", "count" in _data)
+except Exception as _e:
+    test("/api/patterns live", False, str(_e))
+
+try:
+    r = requests.post("http://localhost:8080/api/patterns/analyze",
+                      json={"push": False}, timeout=30)
+    test("/api/patterns/analyze 200", r.status_code == 200)
+    if r.status_code == 200:
+        _data = r.json()
+        test("/api/patterns/analyze liefert 'ok'",
+             "ok" in _data)
+        test("/api/patterns/analyze hat 'patterns_qualifying'",
+             "patterns_qualifying" in _data)
+except Exception as _e:
+    test("/api/patterns/analyze live", False, str(_e))
+
+try:
+    # respond braucht eine echte Pattern-ID
+    r = requests.get("http://localhost:8080/api/patterns", timeout=10).json()
+    _pids = [p["id"] for p in r.get("patterns", []) if p.get("id")]
+    if _pids:
+        _test_pid = _pids[0]
+        r2 = requests.post("http://localhost:8080/api/patterns/respond",
+                           json={"id": _test_pid, "response": "later"},
+                           timeout=10)
+        test("/api/patterns/respond ok 200", r2.status_code == 200)
+        if r2.status_code == 200:
+            _data = r2.json()
+            test("/respond liefert 'ok' True",
+                 _data.get("ok") is True)
+
+    # invalid response
+    if _pids:
+        r3 = requests.post("http://localhost:8080/api/patterns/respond",
+                           json={"id": _pids[0], "response": "maybe"},
+                           timeout=10)
+        test("/respond invalid value -> 400", r3.status_code == 400)
+
+    # missing id
+    r4 = requests.post("http://localhost:8080/api/patterns/respond",
+                       json={"response": "yes"}, timeout=10)
+    test("/respond missing id -> 400", r4.status_code == 400)
+
+    # unknown id -> 404
+    r5 = requests.post("http://localhost:8080/api/patterns/respond",
+                       json={"id": "pattern_does_not_exist",
+                             "response": "yes"}, timeout=10)
+    test("/respond unknown id -> 404", r5.status_code == 404)
+except Exception as _e:
+    test("/api/patterns/respond live", False, str(_e))
+
+
+# Wiring im web_server
+try:
+    with open(os.path.expanduser("~/AssistantDev/src/web_server.py")) as _f:
+        _ws_pa = _f.read()
+    test("web_server importiert pattern_analyzer",
+         "import pattern_analyzer" in _ws_pa)
+    test("web_server registriert pattern_analyzer beim heartbeat",
+         "_pat.register_with_heartbeat()" in _ws_pa)
+    for _route in ("'/api/patterns'", "'/api/patterns/respond'",
+                   "'/api/patterns/analyze'"):
+        test(f"Route {_route} registriert",
+             f"@app.route({_route}" in _ws_pa)
+except Exception as _e:
+    test("pattern_analyzer wiring", False, str(_e))
+
+
 _cleanup_test_artifacts()
 
 # ============================================================

@@ -96,6 +96,21 @@ except Exception as _bfe:
     print(f"[benchmark_fetcher] Import fehlgeschlagen: {_bfe}", flush=True)
     _bench = None
 
+# Pattern Analyzer (Feature 5 — Roadmap April 2026)
+# Registriert sich beim Heartbeat als wochentlicher Cron-Job (Sonntag 22:00).
+try:
+    import pattern_analyzer as _pat
+    try:
+        _pat.register_with_heartbeat()
+        print("[pattern_analyzer] Wochen-Cron registriert (Sonntag 22:00)",
+              flush=True)
+    except Exception as _pae:
+        print(f"[pattern_analyzer] Cron-Registrierung fehlgeschlagen: {_pae}",
+              flush=True)
+except Exception as _pae:
+    print(f"[pattern_analyzer] Import fehlgeschlagen: {_pae}", flush=True)
+    _pat = None
+
 
 def _usage_logger_after_turn(ctx):
     """Lifecycle-Subscriber fuer AFTER_TURN: schreibt einen Turn ins JSONL.
@@ -13150,6 +13165,62 @@ def subagent_confirm():
         return jsonify(response_payload)
     except Exception as e:
         return jsonify({'error': str(e)})
+
+
+@app.route('/api/patterns', methods=['GET'])
+def api_patterns_list():
+    """Liefert alle erkannten Patterns (Feature 5, Roadmap 2026-04)."""
+    if _pat is None:
+        return jsonify({'available': False, 'error': 'pattern_analyzer nicht geladen',
+                       'patterns': []})
+    try:
+        patterns = _pat.list_patterns()
+        return jsonify({
+            'available': True,
+            'patterns': patterns,
+            'count': len(patterns),
+        })
+    except Exception as e:
+        return jsonify({'available': False, 'error': str(e), 'patterns': []})
+
+
+@app.route('/api/patterns/respond', methods=['POST'])
+def api_patterns_respond():
+    """User-Response auf einen Pattern-Vorschlag.
+    Body: {id: <pattern_id>, response: 'yes'|'no'|'later'}.
+    yes -> Pattern als Cron-Job aktivieren. later -> nach later_threshold
+    weiteren Vorkommen erneut anbieten. no -> ablehnen."""
+    if _pat is None:
+        return jsonify({'ok': False, 'error': 'pattern_analyzer nicht geladen'})
+    body = request.get_json(silent=True) or {}
+    pid = body.get('id') or body.get('pattern_id')
+    resp = body.get('response')
+    if not pid:
+        return jsonify({'ok': False, 'error': "id fehlt"}), 400
+    if resp not in ('yes', 'no', 'later'):
+        return jsonify({'ok': False, 'error': "response muss yes|no|later sein"}), 400
+    try:
+        result = _pat.respond(pid, resp)
+        if not result.get('ok'):
+            return jsonify(result), 404
+        return jsonify(result)
+    except Exception as e:
+        return jsonify({'ok': False, 'error': str(e)})
+
+
+@app.route('/api/patterns/analyze', methods=['POST'])
+def api_patterns_analyze():
+    """Manueller Trigger fuer den Pattern-Analyse-Lauf (Sonntag 22:00 Cron).
+    Body optional {push: bool} um Notifications zu unterdruecken (Test-Modus)."""
+    if _pat is None:
+        return jsonify({'ok': False, 'error': 'pattern_analyzer nicht geladen'})
+    body = request.get_json(silent=True) or {}
+    push = bool(body.get('push', True))
+    try:
+        summary = _pat.analyze_logs(push_notifications=push)
+        return jsonify(summary)
+    except Exception as e:
+        return jsonify({'ok': False, 'error': str(e)})
 
 
 @app.route('/api/heartbeat/notifications', methods=['GET'])
