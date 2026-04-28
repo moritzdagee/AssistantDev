@@ -12560,8 +12560,25 @@ def process_single_message(msg, kontext_override=None, state=None, **kwargs):
             raise ValueError('Unbekannter Anbieter: ' + provider_key)
         text = adapter(api_key, model_id, state['system_prompt'], state['verlauf'])
 
-        # Parse MEMORY_SEARCH in agent response and re-query if found
+        # Parse MEMORY_SEARCH in agent response and re-query if found.
+        # WICHTIG (Reply-Session-Bug 2026-04-28): in Reply-Sessions ist der
+        # vollstaendige Konversations-Kontext schon im initial_messages-Array.
+        # Wenn der LLM dann ein MEMORY_SEARCH gibt (typisch bei truncated
+        # body wahrnehmung), wuerden zufaellige Files aus dem Memory-Ordner
+        # nachgezogen und als 'Kontext' in den Prompt gestopft — das ist
+        # genau der Bug 'random files im Reply'. Daher in Reply-Sessions:
+        # MEMORY_SEARCH unterdruecken und den LLM darauf hinweisen.
         ms_match = re.search(r'MEMORY_SEARCH:\s*(\{[^}]+\})', text)
+        if ms_match and state.get('source_conversation_id'):
+            blocked_marker = (
+                '\n[MEMORY_SEARCH unterdrueckt: Reply-Session — der vollstaendige '
+                'Konversations-Kontext steht bereits im Prompt (siehe Konversations-'
+                'Kontext-Block oben). Bitte beantworte die Frage mit den dort '
+                'sichtbaren Informationen, ohne weitere Files zu laden.]\n'
+            )
+            text = text.replace(ms_match.group(0), blocked_marker)
+            ms_match = None
+            print(f"[MEMORY_SEARCH] blocked in reply session (cid={state.get('source_conversation_id')!r})", flush=True)
         if ms_match and state.get('speicher'):
             try:
                 ms_params = json.loads(ms_match.group(1))
@@ -18273,6 +18290,22 @@ def api_agent_sessions(agent):
                     lines.append(f"  cc:         {', '.join(cc_addrs)}")
                 if reply_to_hdr and reply_to_hdr.lower() != from_addr.lower():
                     lines.append(f"  reply_to:   {reply_to_hdr}  (aus Reply-To-Header)")
+                # Anti-Hallucination + Anti-Random-Memory-Loading-Hinweise
+                # (BACKEND_TODO_REPLY_RANDOM_FILES_2026-04-28):
+                lines.extend([
+                    "",
+                    "WICHTIGE HINWEISE FUER DEINE ANTWORT:",
+                    "  - Der oben gezeigte Konversations-Verlauf ist der VOLLSTAENDIGE"
+                    " Kontext fuer diese Antwort. Kein MEMORY_SEARCH und keine weiteren",
+                    "    File-Loads sind noetig oder hilfreich — die werden in dieser",
+                    "    Reply-Session sowieso unterdrueckt.",
+                    "  - Beruecksichtige die Timestamps der Messages: die letzte (juengste)",
+                    "    Message ist die, auf die du antwortest. Aeltere Messages liefern",
+                    "    Hintergrund — nicht Aktion.",
+                    "  - Beim CREATE_EMAIL_REPLY: nutze EXAKT die oben aufgelisteten",
+                    "    Felder (message_id, from, to, subject). Halluziniere keine ID.",
+                    "  - Falls dir Information fehlt: frage den User, statt zu raten.",
+                ])
                 email_reply_hint = "\n".join(lines) + "\n"
             kontext_text = (
                 f"Konversations-Kontext ({src_kind}):\n"

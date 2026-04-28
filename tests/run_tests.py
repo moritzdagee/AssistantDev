@@ -5375,6 +5375,14 @@ try:
          "reply_to_hdr" in _ws and "eml_msg.get('Reply-To')" in _ws)
     test("Reply-Felder-Block sammelt cc bei >2 Teilnehmern",
          "cc_addrs" in _ws and "', '.join(cc_addrs)" in _ws)
+    # BACKEND_TODO_REPLY_RANDOM_FILES_2026-04-28
+    test("MEMORY_SEARCH wird in Reply-Sessions blockiert",
+         "MEMORY_SEARCH unterdrueckt: Reply-Session" in _ws)
+    test("Reply-Hint warnt vor MEMORY_SEARCH + erinnert an Timestamps",
+         "Kein MEMORY_SEARCH und keine weiteren" in _ws and
+         "Beruecksichtige die Timestamps der Messages" in _ws)
+    test("Reply-Hint erinnert an exakte Reply-Felder (kein Halluzinieren)",
+         "Halluziniere keine ID" in _ws)
 except Exception as _e:
     test("Agent PUT-Alias grep", False, str(_e))
 
