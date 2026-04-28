@@ -7,6 +7,7 @@ import copy
 import re
 import signal
 import sys
+import functools
 try:
     import setproctitle
     setproctitle.setproctitle("AssistantDev WebServer")
@@ -10875,7 +10876,51 @@ WICHTIG: Slack-Nachrichten werden NIEMALS automatisch gesendet. Die App wird geo
                     'recovered_messages': new_verlauf if new_verlauf else []})
 
 
+# ── Legacy-Endpoint-Deprecation-Helper (BACKEND_TODO_LEGACY_ENDPOINTS_CHECK_2026-04-28) ─
+# Die alten Routen bleiben funktional, bekommen aber:
+#  - Deprecation: true Header (RFC 9745)
+#  - Sunset: <Datum> Header
+#  - Link: <neuer-Pfad>; rel="successor-version"
+#  - Server-Log einmalig pro Endpoint (rate-limited)
+_DEPRECATED_LOG_SEEN = set()
+_DEPRECATION_SUNSET_DATE = 'Wed, 30 Sep 2026 23:59:59 GMT'
+
+
+def _deprecated_legacy(successor):
+    """Decorator: markiert die Route als Legacy + verweist auf die Nachfolger-Route.
+
+    Verwendung:
+        @app.route('/old', methods=['POST'])
+        @_deprecated_legacy("POST /api/new")
+        def old_route(): ...
+    """
+    def decorator(view_fn):
+        @functools.wraps(view_fn)
+        def wrapper(*args, **kwargs):
+            ep = request.path
+            if ep not in _DEPRECATED_LOG_SEEN:
+                _DEPRECATED_LOG_SEEN.add(ep)
+                print(f"[DEPRECATED] {ep} -> use {successor}", flush=True)
+            resp = view_fn(*args, **kwargs)
+            # Falls Response ein (body, status) tuple ist, in Response konvertieren
+            if isinstance(resp, tuple):
+                resp = make_response(*resp)
+            elif not hasattr(resp, 'headers'):
+                resp = make_response(resp)
+            resp.headers['Deprecation'] = 'true'
+            resp.headers['Sunset'] = _DEPRECATION_SUNSET_DATE
+            resp.headers['Link'] = f'<{successor}>; rel="successor-version"'
+            resp.headers['X-Deprecation-Notice'] = (
+                f'This endpoint is deprecated. Use: {successor}. '
+                f'Sunset: {_DEPRECATION_SUNSET_DATE}.'
+            )
+            return resp
+        return wrapper
+    return decorator
+
+
 @app.route('/new_conversation', methods=['POST'])
+@_deprecated_legacy("POST /api/agents/<name>/sessions")
 def new_conversation():
     session_id = request.json.get('session_id', 'default')
     state = get_session(session_id)
@@ -11540,6 +11585,7 @@ loadMatrix();
     return html
 
 @app.route('/get_prompt', methods=['GET'])
+@_deprecated_legacy("GET /api/system_prompt/<agent>[/<sub>]")
 def get_prompt():
     session_id = request.args.get('session_id', 'default')
     state = get_session(session_id)
@@ -11560,6 +11606,7 @@ def get_prompt():
     return jsonify({'ok': True, 'prompt': raw.strip(), 'has_memory': False})
 
 @app.route('/save_prompt', methods=['POST'])
+@_deprecated_legacy("PATCH /agents/<name> {description: ...}")
 def save_prompt():
     session_id = request.json.get('session_id', 'default')
     state = get_session(session_id)
@@ -11586,6 +11633,7 @@ def save_prompt():
         return jsonify({'ok': False, 'error': str(e)})
 
 @app.route('/create_agent', methods=['POST'])
+@_deprecated_legacy("POST /agents {name, label, description}")
 def create_agent():
     session_id = request.json.get('session_id', 'default')
     state = get_session(session_id)
@@ -11654,6 +11702,7 @@ def open_in_finder():
         return jsonify({'ok': False, 'error': str(e)})
 
 @app.route('/get_history', methods=['GET'])
+@_deprecated_legacy("GET /api/conversations?agent=<name>")
 def get_history():
     session_id = request.args.get('session_id', 'default')
     state = get_session(session_id)
@@ -11744,6 +11793,7 @@ def get_history():
     return jsonify({'sessions': result})
 
 @app.route('/load_conversation', methods=['POST'])
+@_deprecated_legacy("GET /api/conversations/<id>/messages")
 def load_conversation():
     session_id = request.json.get('session_id', 'default')
     state = get_session(session_id)
@@ -12092,6 +12142,19 @@ def _get_email_cache(sdir):
 
 @app.route('/api/email-search')
 def email_search_route():
+    """E-Mail-spezifische Volltextsuche mit Field-Filtern (NICHT Legacy).
+
+    NICHT redundant zu /api/messages/search (BACKEND_TODO_LEGACY_ENDPOINTS_CHECK_2026-04-28):
+      /api/messages/search ?source=email_X&q=...   -> generischer Source-Filter,
+                                                       sucht in subject + preview
+      /api/email-search    ?agent=X&q=...&from=...&subject=...&to=...&body=...
+                                                    -> Field-spezifische Filter,
+                                                       inkl. Body-Volltext, sucht
+                                                       in memory_dir + email_inbox/.
+    Use-Case: 'Mails von foo@bar mit Subject "Rechnung"' — geht nur hier.
+
+    Request: GET /api/email-search?agent=X&q=...&from=...&subject=...&to=...&body=...
+    """
     agent = request.args.get('agent', 'standard')
     q = request.args.get('q', '').strip().lower()
     from_filter = request.args.get('from', '').strip().lower()
@@ -14012,6 +14075,19 @@ def poll_responses():
 
 @app.route('/available_subagents', methods=['GET'])
 def available_subagents():
+    """Session-spezifische Subagents-Liste mit Keyword-Routing-Hints.
+
+    NICHT redundant zu /agents (BACKEND_TODO_AVAILABLE_SUBAGENTS_REDUNDANT_2026-04-28):
+      /agents              -> globale Liste aller Agents + Subagents (statisch)
+      /available_subagents -> Subagents des AKTIVEN Parents in der Session
+                              + 'keywords' (welche Wortfelder triggern den Sub)
+
+    Use-Cases im Frontend: Sub-Agent-Picker im Chat, Auto-Routing-Hints
+    fuer den User. /agents kann das nicht — dort fehlen die Keywords.
+
+    Request: GET /available_subagents?session_id=<sid>&agent=<parent>
+    Response: { ok: bool, parent: <name>, subagents: [{name, label, display, keywords}] }
+    """
     session_id = request.args.get('session_id', 'default')
     state = get_session(session_id)
     agent = request.args.get('agent', state.get('agent', ''))
@@ -14765,19 +14841,47 @@ def add_file():
 
 @app.route('/remove_ctx', methods=['POST'])
 def remove_ctx():
-    session_id = request.json.get('session_id', 'default')
+    """Entfernt einen einzelnen Kontext-Eintrag aus dem Session-State.
+
+    Request: POST /remove_ctx
+        Body (JSON): { "session_id": "<sid>", "name": "<filename-or-url>" }
+    Response: 200 { "ok": true }
+              400 falls 'name' fehlt
+
+    Wichtig (BACKEND_TODO_REMOVE_CTX_NOT_CALLED_2026-04-28): der Server
+    haelt kontext_items pro Session in einem dict — clientseitiges Entfernen
+    ohne diesen Call laesst die Files beim naechsten /chat trotzdem im
+    Prompt-Kontext. Frontend MUSS diesen Endpoint rufen.
+    """
+    body = request.get_json(silent=True) or {}
+    session_id = body.get('session_id', 'default')
+    name = body.get('name')
+    if not name:
+        return jsonify({'ok': False, 'error': 'name required'}), 400
     state = get_session(session_id)
-    name = request.json['name']
-    state['kontext_items'] = [i for i in state['kontext_items'] if i['name'] != name]
-    return jsonify({'ok':True})
+    before = len(state.get('kontext_items') or [])
+    state['kontext_items'] = [i for i in (state.get('kontext_items') or [])
+                              if i.get('name') != name]
+    after = len(state['kontext_items'])
+    return jsonify({'ok': True, 'removed': before - after, 'remaining': after})
 
 
 @app.route('/remove_all_ctx', methods=['POST'])
 def remove_all_ctx():
-    session_id = request.json.get('session_id', 'default')
+    """Entfernt ALLE Kontext-Files/URLs aus dem Session-State.
+
+    Request: POST /remove_all_ctx
+        Body (JSON): { "session_id": "<sid>" }
+    Response: 200 { "ok": true, "removed": <int> }
+
+    Vgl. BACKEND_TODO_REMOVE_CTX_NOT_CALLED_2026-04-28.
+    """
+    body = request.get_json(silent=True) or {}
+    session_id = body.get('session_id', 'default')
     state = get_session(session_id)
+    removed = len(state.get('kontext_items') or [])
     state['kontext_items'] = []
-    return jsonify({'ok':True})
+    return jsonify({'ok': True, 'removed': removed})
 
 
 # ── ADMIN-BEREICH (added 2026-04-15) ───────────────────────────────────────

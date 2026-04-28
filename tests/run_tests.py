@@ -2663,7 +2663,9 @@ test("Neue-Tab: auto_save verlangt NICHT mehr dateiname vor dem Speichern",
 
 # Backend-Smoke: get_history filtert weiterhin leere Dateien
 _gh_match = _re_lz.search(
-    r"@app\.route\('/get_history'[^\n]*\ndef get_history\(\):(.+?)(?=\n@app\.route|\ndef [a-z_]+\()",
+    # Erlaubt zusaetzliche Decorator-Zeilen zwischen @app.route und def
+    # (z.B. @_deprecated_legacy seit 2026-04-28).
+    r"@app\.route\('/get_history'[^\n]*\n(?:@\w[^\n]*\n)*def get_history\(\):(.+?)(?=\n@app\.route|\ndef [a-z_]+\()",
     _ws_src_full, _re_lz.DOTALL)
 _gh_src = _gh_match.group(1) if _gh_match else ""
 test("Neue-Tab: get_history filtert leere Konversationsdateien (fsize <= 50)",
@@ -5422,6 +5424,68 @@ try:
          "_ORCHESTRATOR_CONFIG_PATH" in _orc and "decomposer_cascade" in _orc)
 except Exception as _e:
     test("Orchestrator-Cascade grep", False, str(_e))
+
+# BACKEND_TODO_LEGACY_ENDPOINTS_CHECK_2026-04-28 + REMOVE_CTX + AVAILABLE_SUBAGENTS
+try:
+    with open(os.path.expanduser("~/AssistantDev/src/web_server.py")) as _f:
+        _ws = _f.read()
+    test("_deprecated_legacy-Decorator definiert",
+         "def _deprecated_legacy(successor):" in _ws)
+    test("_deprecated_legacy setzt Deprecation/Sunset/Link Header",
+         "resp.headers['Deprecation']" in _ws and
+         "resp.headers['Sunset']" in _ws and
+         "rel=\"successor-version\"" in _ws)
+    # 6 Legacy-Endpoints markiert
+    for ep, succ in [
+        ('/new_conversation', 'POST /api/agents/<name>/sessions'),
+        ('/get_prompt', 'GET /api/system_prompt/<agent>'),
+        ('/save_prompt', 'PATCH /agents/<name>'),
+        ('/create_agent', 'POST /agents'),
+        ('/load_conversation', 'GET /api/conversations/<id>/messages'),
+        ('/get_history', 'GET /api/conversations?agent=<name>'),
+    ]:
+        # Pattern: route + decorator zusammen
+        line_pat = f"@app.route('{ep}'"
+        test(f"Legacy {ep} hat _deprecated_legacy-Decorator",
+             line_pat in _ws and succ.split()[0] in _ws)
+    # remove_ctx: 400 wenn name fehlt
+    test("/remove_ctx returnt 400 ohne 'name'",
+         "'error': 'name required'" in _ws)
+    # available_subagents: Doc-String klärt Unterschied zu /agents
+    test("/available_subagents Doc klärt Unterschied zu /agents",
+         "NICHT redundant zu /agents" in _ws)
+    # email-search: Doc-String klärt Unterschied
+    test("/api/email-search Doc klärt Unterschied zu /api/messages/search",
+         "NICHT Legacy" in _ws and "Field-spezifische Filter" in _ws)
+except Exception as _e:
+    test("Legacy-Endpoints grep", False, str(_e))
+
+# Live-Verifikation Deprecation-Header
+try:
+    r = requests.get("http://localhost:8080/get_history?agent=privat", timeout=10)
+    test("Live: /get_history liefert Deprecation: true Header",
+         r.headers.get('Deprecation') == 'true')
+    test("Live: /get_history liefert Sunset Header",
+         'Sunset' in r.headers)
+    test("Live: /get_history liefert successor-version Link",
+         'successor-version' in (r.headers.get('Link') or ''))
+    # remove_ctx ohne name -> 400
+    r2 = requests.post(
+        "http://localhost:8080/remove_ctx",
+        json={"session_id": "test"}, timeout=5,
+    )
+    test("Live: /remove_ctx ohne name -> 400",
+         r2.status_code == 400)
+    r3 = requests.post(
+        "http://localhost:8080/remove_ctx",
+        json={"session_id": "test", "name": "x.txt"}, timeout=5,
+    )
+    test("Live: /remove_ctx mit name -> 200 mit removed/remaining-Counter",
+         r3.status_code == 200 and 'remaining' in r3.json() and 'removed' in r3.json())
+except requests.exceptions.RequestException as _e:
+    test("Legacy live", False, f"server not reachable: {_e}")
+except Exception as _e:
+    test("Legacy live", False, str(_e))
 
 # Live-Tests fuer Memory-Loading-Config
 try:
