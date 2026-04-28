@@ -6557,6 +6557,265 @@ except Exception as _e:
     test("pattern_analyzer wiring", False, str(_e))
 
 
+section("Orchestrator 2026-04-27 (Feature 6 — Roadmap April 2026)")
+
+# Modul-Datei + Import
+try:
+    _orc_path = os.path.expanduser("~/AssistantDev/src/orchestrator.py")
+    test("src/orchestrator.py existiert", os.path.exists(_orc_path))
+    sys.path.insert(0, os.path.expanduser("~/AssistantDev/src"))
+    import orchestrator as _orc_t
+    test("orchestrator importierbar", True)
+    for _fn in ("should_orchestrate", "propose", "list_proposals",
+                "get_proposal", "respond", "execute_step",
+                "set_llm_invoker", "decompose", "select_models"):
+        test(f"orchestrator.{_fn} vorhanden",
+             callable(getattr(_orc_t, _fn, None)))
+    test("MIN_WORDS_FOR_ORCHESTRATION == 50",
+         _orc_t.MIN_WORDS_FOR_ORCHESTRATION == 50)
+    test("CATEGORY_TO_SKILL hat Mapping fuer image -> image_generation",
+         _orc_t.CATEGORY_TO_SKILL.get("image") == "image_generation")
+except Exception as _e:
+    test("orchestrator sanity", False, str(_e))
+
+
+# should_orchestrate: heuristische Entscheidungen
+try:
+    _r = _orc_t.should_orchestrate("Hi")
+    test("should_orchestrate('Hi') -> False", _r["orchestrate"] is False)
+
+    _r = _orc_t.should_orchestrate(
+        "Recherchiere Stripe und Adyen, schreib daraus einen Report "
+        "und erzeuge eine Infografik dazu")
+    test("should_orchestrate Multi-Cat -> True", _r["orchestrate"] is True)
+    test("should_orchestrate liefert >= 2 categories",
+         len(_r["categories"]) >= 2)
+
+    _bullet_msg = """Bitte:
+- Recherchiere X
+- Schreibe einen Report
+- Erzeuge eine Grafik"""
+    _r = _orc_t.should_orchestrate(_bullet_msg)
+    test("should_orchestrate Bullet-Liste -> True",
+         _r["orchestrate"] is True)
+    test("should_orchestrate erkennt has_bullets",
+         _r["has_bullets"] is True)
+    test("should_orchestrate Bullet-Reason erwaehnt 'Bullet'",
+         "Bullet" in (_r.get("reason") or ""))
+
+    # Force-Override
+    _r = _orc_t.should_orchestrate("kurz", force=True)
+    test("should_orchestrate force=True overridet",
+         _r["orchestrate"] is True)
+
+    # Empty
+    _r = _orc_t.should_orchestrate("")
+    test("should_orchestrate('') -> False", _r["orchestrate"] is False)
+    _r = _orc_t.should_orchestrate(None)
+    test("should_orchestrate(None) -> False", _r["orchestrate"] is False)
+except Exception as _e:
+    test("should_orchestrate logic", False, str(_e))
+
+
+# Decompose-Heuristik (kein LLM-Invoker noetig fuer den Fallback-Pfad)
+try:
+    # Bullet-Liste
+    _msg = """Plan:
+- Recherchiere Stripe vs Adyen
+- Schreibe einen Report dazu
+- Erzeuge eine Infografik"""
+    _decomp = _orc_t._decompose_heuristic(_msg)
+    test("Heuristik: Bullet-Liste -> Liste",
+         isinstance(_decomp, list) and len(_decomp) == 3)
+    if _decomp:
+        test("Heuristik step 1 hat 'description'",
+             "description" in _decomp[0])
+        test("Heuristik step 1 hat 'category'",
+             "category" in _decomp[0])
+        test("Heuristik step 1 hat step=1",
+             _decomp[0]["step"] == 1)
+
+    # Mehrere Saetze mit unterschiedlichen Kategorien
+    _msg2 = ("Recherchiere Stripe und Adyen. "
+             "Schreib mir bitte einen Report. "
+             "Erzeuge auch eine Infografik dazu.")
+    _decomp2 = _orc_t._decompose_heuristic(_msg2)
+    test("Heuristik: Multi-Cat-Saetze -> >=2 Subtasks",
+         _decomp2 and len(_decomp2) >= 2)
+except Exception as _e:
+    test("decompose heuristic", False, str(_e))
+
+
+# select_models: jeder Subtask bekommt model
+try:
+    _subs = [
+        {"step": 1, "description": "Recherche", "category": "research"},
+        {"step": 2, "description": "Bild erstellen", "category": "image"},
+        {"step": 3, "description": "Text schreiben", "category": "writing"},
+    ]
+    _withm = _orc_t.select_models(_subs)
+    test("select_models liefert gleiche Anzahl",
+         len(_withm) == 3)
+    test("Subtask 'image' bekommt Image-Generator-Modell",
+         (_withm[1].get("model") or {}).get("provider") in ("gemini", "openai")
+         and (_withm[1].get("model") or {}).get("rating") == 5)
+    test("Subtask 'research' bekommt Modell mit research_long-Rating",
+         (_withm[0].get("model") or {}).get("skill_used") == "research_long")
+except Exception as _e:
+    test("select_models", False, str(_e))
+
+
+# propose: Heuristik-Pfad (LLM-Invoker bleibt unset im Test-Modus)
+try:
+    # Reset invoker fuer reine Heuristik-Path-Pruefung
+    _saved_invoker = _orc_t._llm_invoker
+    _orc_t.set_llm_invoker(None)
+    _msg = """Plan:
+- Recherchiere
+- Schreibe Report
+- Mache Infografik"""
+    _prop = _orc_t.propose(_msg, session_id="test_orc_smoke")
+    test("propose ok=True", _prop.get("ok") is True)
+    test("propose orchestrate=True", _prop.get("orchestrate") is True)
+    test("propose liefert proposal_id",
+         isinstance(_prop.get("proposal_id"), str)
+         and _prop["proposal_id"].startswith("orch_"))
+    test("propose liefert plan-dict",
+         isinstance(_prop.get("plan"), dict))
+    test("plan.subtasks ist Liste >= 2",
+         isinstance((_prop.get("plan") or {}).get("subtasks"), list)
+         and len(_prop["plan"]["subtasks"]) >= 2)
+    test("plan.decomposition_method == 'heuristic'",
+         (_prop.get("plan") or {}).get("decomposition_method") == "heuristic")
+    test("plan.status == 'proposed'",
+         (_prop.get("plan") or {}).get("status") == "proposed")
+
+    _pid = _prop["proposal_id"]
+    # respond Lifecycle
+    _r1 = _orc_t.respond(_pid, "no")
+    test("respond('no') -> status='declined'",
+         _r1.get("ok") and _r1["proposal"].get("status") == "declined")
+
+    _r2 = _orc_t.respond(_pid, "yes")
+    test("respond('yes') -> status='accepted'",
+         _r2.get("ok") and _r2["proposal"].get("status") == "accepted")
+
+    _r3 = _orc_t.respond(_pid, "edit", edited_plan=[
+        {"step": 1, "description": "Nur ein Schritt", "category": "writing"}
+    ])
+    test("respond('edit') -> status='edited'",
+         _r3.get("ok") and _r3["proposal"].get("status") == "edited")
+    test("respond('edit') aktualisiert subtasks",
+         len(_r3["proposal"].get("subtasks", [])) == 1)
+
+    _r_bad = _orc_t.respond(_pid, "maybe")
+    test("respond invalid -> ok=False", _r_bad.get("ok") is False)
+    _r_unknown = _orc_t.respond("orch_does_not_exist", "yes")
+    test("respond unknown id -> ok=False", _r_unknown.get("ok") is False)
+
+    # invoker zuruecksetzen
+    _orc_t.set_llm_invoker(_saved_invoker)
+except Exception as _e:
+    _orc_t.set_llm_invoker(_saved_invoker if '_saved_invoker' in dir() else None)
+    test("propose+respond pipeline", False, str(_e))
+
+
+# Live-Endpoints
+try:
+    r = requests.post("http://localhost:8080/api/orchestrate/check",
+                      json={"message": "Hi"}, timeout=10)
+    test("/api/orchestrate/check 200", r.status_code == 200)
+    if r.status_code == 200:
+        _data = r.json()
+        test("check liefert 'orchestrate' bool",
+             isinstance(_data.get("orchestrate"), bool))
+        test("check 'Hi' -> orchestrate=False",
+             _data.get("orchestrate") is False)
+except Exception as _e:
+    test("/api/orchestrate/check live", False, str(_e))
+
+try:
+    r = requests.post("http://localhost:8080/api/orchestrate/check",
+                      json={"message": ("Recherchiere Stripe und Adyen, "
+                                        "schreib daraus einen Report und "
+                                        "erzeuge eine Infografik")}, timeout=10)
+    test("/api/orchestrate/check Multi -> 200", r.status_code == 200)
+    if r.status_code == 200:
+        _data = r.json()
+        test("check Multi-Cat -> orchestrate=True",
+             _data.get("orchestrate") is True)
+        test("check categories list>=2",
+             isinstance(_data.get("categories"), list)
+             and len(_data["categories"]) >= 2)
+except Exception as _e:
+    test("/api/orchestrate/check Multi live", False, str(_e))
+
+try:
+    # Propose ohne 'message' -> 400
+    r = requests.post("http://localhost:8080/api/orchestrate/propose",
+                      json={}, timeout=10)
+    test("/api/orchestrate/propose ohne message -> 400",
+         r.status_code == 400)
+except Exception as _e:
+    test("/api/orchestrate/propose missing live", False, str(_e))
+
+try:
+    r = requests.get("http://localhost:8080/api/orchestrate/proposals",
+                     timeout=10)
+    test("/api/orchestrate/proposals 200", r.status_code == 200)
+    if r.status_code == 200:
+        _data = r.json()
+        test("/proposals hat 'proposals'-Liste",
+             isinstance(_data.get("proposals"), list))
+except Exception as _e:
+    test("/api/orchestrate/proposals live", False, str(_e))
+
+try:
+    # respond
+    r = requests.post("http://localhost:8080/api/orchestrate/respond",
+                      json={"id": "orch_does_not_exist", "response": "yes"},
+                      timeout=10)
+    test("/api/orchestrate/respond unknown -> 404", r.status_code == 404)
+
+    r2 = requests.post("http://localhost:8080/api/orchestrate/respond",
+                       json={"response": "yes"}, timeout=10)
+    test("/api/orchestrate/respond ohne id -> 400", r2.status_code == 400)
+
+    r3 = requests.post("http://localhost:8080/api/orchestrate/respond",
+                       json={"id": "orch_x", "response": "maybe"}, timeout=10)
+    test("/api/orchestrate/respond invalid response -> 400",
+         r3.status_code == 400)
+except Exception as _e:
+    test("/api/orchestrate/respond live", False, str(_e))
+
+try:
+    r = requests.post("http://localhost:8080/api/orchestrate/execute_step",
+                      json={"id": "orch_xx"}, timeout=10)
+    test("/api/orchestrate/execute_step ohne step_index -> 400",
+         r.status_code == 400)
+except Exception as _e:
+    test("/api/orchestrate/execute_step live", False, str(_e))
+
+
+# Wiring im web_server
+try:
+    with open(os.path.expanduser("~/AssistantDev/src/web_server.py")) as _f:
+        _ws_orc = _f.read()
+    test("web_server importiert orchestrator",
+         "import orchestrator" in _ws_orc)
+    test("web_server registriert LLM-Invoker beim orchestrator",
+         "_orch.set_llm_invoker" in _ws_orc)
+    for _route in ("'/api/orchestrate/check'", "'/api/orchestrate/propose'",
+                   "'/api/orchestrate/proposals'",
+                   "'/api/orchestrate/proposal/<proposal_id>'",
+                   "'/api/orchestrate/respond'",
+                   "'/api/orchestrate/execute_step'"):
+        test(f"Route {_route} registriert",
+             f"@app.route({_route}" in _ws_orc)
+except Exception as _e:
+    test("orchestrator wiring", False, str(_e))
+
+
 _cleanup_test_artifacts()
 
 # ============================================================

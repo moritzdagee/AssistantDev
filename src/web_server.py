@@ -111,6 +111,28 @@ except Exception as _pae:
     print(f"[pattern_analyzer] Import fehlgeschlagen: {_pae}", flush=True)
     _pat = None
 
+# Orchestrator (Feature 6 — Roadmap April 2026)
+# Komplexe Anfragen werden in Teilaufgaben zerlegt + an bestes Modell pro
+# Skill delegiert. LLM-Invoker wird per set_llm_invoker eingehaengt — der
+# Orchestrator kennt die ADAPTERS-Implementierung nicht direkt.
+try:
+    import orchestrator as _orch
+    def _orch_llm_invoker(provider, model_id, system_prompt, messages):
+        # ADAPTERS + MODELS_FILE werden weiter unten in dieser Datei definiert.
+        # Beim Aufruf (zur Laufzeit, nicht beim Import) sind sie verfuegbar.
+        adapter = ADAPTERS.get(provider)
+        if adapter is None:
+            raise ValueError(f"Unbekannter Provider: {provider}")
+        with open(MODELS_FILE, 'r', encoding='utf-8') as _mf:
+            _cfg = json.load(_mf)
+        api_key = (_cfg.get('providers', {}).get(provider, {}) or {}).get('api_key', '')
+        return adapter(api_key, model_id, system_prompt, messages)
+    _orch.set_llm_invoker(_orch_llm_invoker)
+    print("[orchestrator] LLM-Invoker registriert", flush=True)
+except Exception as _oe:
+    print(f"[orchestrator] Import/Wiring fehlgeschlagen: {_oe}", flush=True)
+    _orch = None
+
 
 def _usage_logger_after_turn(ctx):
     """Lifecycle-Subscriber fuer AFTER_TURN: schreibt einen Turn ins JSONL.
@@ -13165,6 +13187,109 @@ def subagent_confirm():
         return jsonify(response_payload)
     except Exception as e:
         return jsonify({'error': str(e)})
+
+
+@app.route('/api/orchestrate/check', methods=['POST'])
+def api_orchestrate_check():
+    """Prueft (heuristisch) ob eine Message orchestriert werden sollte —
+    OHNE Decomposition. Body: {message: str, force?: bool}. Schnell."""
+    if _orch is None:
+        return jsonify({'available': False, 'error': 'orchestrator nicht geladen'})
+    body = request.get_json(silent=True) or {}
+    msg = body.get('message') or body.get('msg') or ''
+    force = bool(body.get('force', False))
+    try:
+        return jsonify({'available': True,
+                       **_orch.should_orchestrate(msg, force=force)})
+    except Exception as e:
+        return jsonify({'available': False, 'error': str(e)})
+
+
+@app.route('/api/orchestrate/propose', methods=['POST'])
+def api_orchestrate_propose():
+    """Liefert einen Plan-Vorschlag fuer eine komplexe Anfrage.
+    Body: {message: str, session_id?: str, force?: bool}."""
+    if _orch is None:
+        return jsonify({'ok': False, 'error': 'orchestrator nicht geladen'})
+    body = request.get_json(silent=True) or {}
+    msg = body.get('message') or body.get('msg')
+    if not msg or not isinstance(msg, str):
+        return jsonify({'ok': False, 'error': 'message fehlt'}), 400
+    sid = body.get('session_id')
+    force = bool(body.get('force', False))
+    try:
+        return jsonify(_orch.propose(msg, session_id=sid, force=force))
+    except Exception as e:
+        return jsonify({'ok': False, 'error': str(e)})
+
+
+@app.route('/api/orchestrate/proposals', methods=['GET'])
+def api_orchestrate_list():
+    """Liste aller bisherigen Proposals (proposed/accepted/declined/...)."""
+    if _orch is None:
+        return jsonify({'available': False, 'proposals': []})
+    try:
+        return jsonify({'available': True,
+                       'proposals': _orch.list_proposals()})
+    except Exception as e:
+        return jsonify({'available': False, 'error': str(e),
+                       'proposals': []})
+
+
+@app.route('/api/orchestrate/proposal/<proposal_id>', methods=['GET'])
+def api_orchestrate_get(proposal_id):
+    if _orch is None:
+        return jsonify({'available': False})
+    try:
+        p = _orch.get_proposal(proposal_id)
+        if p is None:
+            return jsonify({'available': True, 'error': 'unbekannt'}), 404
+        return jsonify({'available': True, 'proposal': p})
+    except Exception as e:
+        return jsonify({'available': False, 'error': str(e)})
+
+
+@app.route('/api/orchestrate/respond', methods=['POST'])
+def api_orchestrate_respond():
+    """User-Response: 'yes', 'no', 'edit'. Bei edit: edited_plan-Liste."""
+    if _orch is None:
+        return jsonify({'ok': False, 'error': 'orchestrator nicht geladen'})
+    body = request.get_json(silent=True) or {}
+    pid = body.get('id') or body.get('proposal_id')
+    resp = body.get('response')
+    edited = body.get('edited_plan')
+    if not pid:
+        return jsonify({'ok': False, 'error': 'id fehlt'}), 400
+    if resp not in ('yes', 'no', 'edit'):
+        return jsonify({'ok': False, 'error': 'response muss yes|no|edit sein'}), 400
+    try:
+        result = _orch.respond(pid, resp, edited_plan=edited)
+        if not result.get('ok'):
+            return jsonify(result), 404
+        return jsonify(result)
+    except Exception as e:
+        return jsonify({'ok': False, 'error': str(e)})
+
+
+@app.route('/api/orchestrate/execute_step', methods=['POST'])
+def api_orchestrate_execute_step():
+    """Fuehrt einen einzelnen Schritt eines akzeptierten Proposals aus.
+    Body: {id, step_index, prior_output?}. Sequentiell vom Frontend gesteuert."""
+    if _orch is None:
+        return jsonify({'ok': False, 'error': 'orchestrator nicht geladen'})
+    body = request.get_json(silent=True) or {}
+    pid = body.get('id') or body.get('proposal_id')
+    try:
+        idx = int(body.get('step_index', -1))
+    except Exception:
+        idx = -1
+    prior = body.get('prior_output')
+    if not pid or idx < 0:
+        return jsonify({'ok': False, 'error': 'id + step_index erforderlich'}), 400
+    try:
+        return jsonify(_orch.execute_step(pid, idx, prior_output=prior))
+    except Exception as e:
+        return jsonify({'ok': False, 'error': str(e)})
 
 
 @app.route('/api/patterns', methods=['GET'])
