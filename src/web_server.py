@@ -12775,10 +12775,13 @@ def process_single_message(msg, kontext_override=None, state=None, **kwargs):
                     text = text[:eridx] + marker + text[erjend+1:]
                     eri = eridx + len(marker)
                 except Exception as ere:
-                    created_emails.append({'ok': False, 'subject': spec.get('subject',''), 'to': '', 'error': str(ere), 'body': spec.get('body',''), 'reply': True})
-                    marker = '\n[E-Mail-Reply fehlgeschlagen]\n'
+                    err_str = str(ere)[:200] or type(ere).__name__
+                    created_emails.append({'ok': False, 'subject': spec.get('subject',''), 'to': '', 'error': err_str, 'body': spec.get('body',''), 'reply': True})
+                    # Marker mit Fehler-Detail — User sieht WARUM, nicht nur DASS.
+                    marker = f'\n[E-Mail-Reply fehlgeschlagen: {err_str}]\n'
                     text = text[:eridx] + marker + text[erjend+1:]
                     eri = eridx + len(marker)
+                    print(f'[CREATE_EMAIL_REPLY] Fehler: {err_str} | spec.message_id={spec.get("message_id","")[:80]!r}')
             else:
                 eri = eridx + 1
 
