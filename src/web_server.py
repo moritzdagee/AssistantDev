@@ -9861,9 +9861,13 @@ def api_agent_create():
     }), 201
 
 
-@app.route('/agents/<name>', methods=['PATCH'])
+@app.route('/agents/<name>', methods=['PATCH', 'PUT'])
 def api_agent_update(name):
-    """PATCH eines Agenten — Description-Update und/oder Slug-Rename.
+    """PATCH/PUT eines Agenten — Description-Update und/oder Slug-Rename.
+
+    PUT ist als Alias zu PATCH akzeptiert (Frontend schickt teils PUT, REST-
+    Streit zwischen partial-Update und full-replace ist hier irrelevant —
+    Backend mergt body-Felder ueber den existierenden Stand).
 
     Slug-Rename ist atomar:
     - System-Prompt-File <slug>.txt -> <new_slug>.txt
@@ -10057,9 +10061,9 @@ def api_subagent_create(parent):
     }), 201
 
 
-@app.route('/agents/<parent>/subagents/<name>', methods=['PATCH'])
+@app.route('/agents/<parent>/subagents/<name>', methods=['PATCH', 'PUT'])
 def api_subagent_update(parent, name):
-    """PATCH: Sub-Agent description-update und/oder rename.
+    """PATCH/PUT: Sub-Agent description-update und/oder rename. PUT ist Alias.
 
     Rename ist hier einfacher als bei Top-Level-Agents — Sub-Agent hat
     keinen eigenen Storage-Dir, nur eine .txt im Agents-Dir.

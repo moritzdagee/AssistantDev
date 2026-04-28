@@ -5341,6 +5341,37 @@ except Exception as _e:
     test("mark-read live", False, str(_e))
 
 
+section("Agent-Update PUT Alias 2026-04-28")
+
+try:
+    with open(os.path.expanduser("~/AssistantDev/src/web_server.py")) as _f:
+        _ws = _f.read()
+    test("Top-Level Agent: PATCH+PUT methods registriert",
+         "@app.route('/agents/<name>', methods=['PATCH', 'PUT'])" in _ws)
+    test("Sub-Agent: PATCH+PUT methods registriert",
+         "@app.route('/agents/<parent>/subagents/<name>', methods=['PATCH', 'PUT'])" in _ws)
+except Exception as _e:
+    test("Agent PUT-Alias grep", False, str(_e))
+
+try:
+    # Top-Level: PUT auf existierenden Agent → 200 (war vorher 405)
+    r = requests.put("http://localhost:8080/agents/privat",
+                     json={}, timeout=10)
+    test("Live: PUT /agents/privat -> 200 (war 405)", r.status_code == 200)
+    # PATCH bleibt funktional
+    r2 = requests.patch("http://localhost:8080/agents/privat",
+                        json={}, timeout=10)
+    test("Live: PATCH /agents/privat -> 200 (regression)", r2.status_code == 200)
+    # Unbekannter Agent: 404
+    r3 = requests.put("http://localhost:8080/agents/__doesnotexist__",
+                      json={}, timeout=10)
+    test("Live: PUT /agents/<unknown> -> 404", r3.status_code == 404)
+except requests.exceptions.RequestException as _e:
+    test("Agent PUT-Alias live", False, f"server not reachable: {_e}")
+except Exception as _e:
+    test("Agent PUT-Alias live", False, str(_e))
+
+
 section("CREATE_FILE Truncation-Detection + Provider-aware max_tokens (2026-04-27)")
 
 try:
