@@ -5353,6 +5353,14 @@ try:
     # System-Prompt-Endpoint: voller Slug + Suffix beide unterstuetzt
     test("api_system_prompt erkennt vollen Sub-Slug (signicat_outbound)",
          "sub.startswith(agent + '_')" in _ws and "candidates.append" in _ws)
+    # Email-Reply-Kontext enthaelt explicit message_id + Reply-Felder
+    test("Reply-Kontext setzt is_email_thread basierend auf type",
+         "is_email_thread = (target.get('type') == 'email')" in _ws)
+    test("Reply-Kontext fuegt E-MAIL-REPLY-FELDER-Block hinzu",
+         "E-MAIL-REPLY-FELDER (fuer CREATE_EMAIL_REPLY)" in _ws)
+    test("Reply-Kontext .eml-Reparse-Fallback fuer message_id",
+         "message_from_bytes" in _ws and "_EMAIL_PROCESSED_EML_DIR" in _ws and
+         "Message-ID" in _ws)
 except Exception as _e:
     test("Agent PUT-Alias grep", False, str(_e))
 

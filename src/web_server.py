@@ -18129,11 +18129,70 @@ def api_agent_sessions(agent):
                            if (m.get("conversation_id") or m.get("id")) == conv_id]
             thread_msgs.sort(key=lambda m: m.get("timestamp_epoch", 0))
             ctx_lines = []
+            is_email_thread = (target.get('type') == 'email')
             for m in thread_msgs[-10:]:  # Letzte 10 Messages reichen
                 who = m.get("sender_name") or m.get("sender_address") or "?"
                 preview = (m.get("full_content") or m.get("preview") or "")[:500]
-                ctx_lines.append(f"[{m.get('timestamp', '')}] {who}: {preview}")
-            kontext_text = f"Konversations-Kontext ({src_kind}):\n" + "\n".join(ctx_lines)
+                # Fuer E-Mails: explizit message_id + sender_address mitschicken,
+                # damit der LLM beim CREATE_EMAIL_REPLY threading-IDs korrekt
+                # einsetzen kann (sonst sieht er nur Sender-Name + Preview und
+                # die Message-ID 'nicht vollstaendig sichtbar').
+                if is_email_thread:
+                    addr = m.get('sender_address') or ''
+                    mid = m.get('message_id') or ''
+                    header = f"[{m.get('timestamp', '')}] {who}"
+                    if addr:
+                        header += f" <{addr}>"
+                    if mid:
+                        header += f" Message-ID: {mid}"
+                    ctx_lines.append(f"{header}\n  {preview}")
+                else:
+                    ctx_lines.append(f"[{m.get('timestamp', '')}] {who}: {preview}")
+            # Bei E-Mail-Threads: Header-Block mit den Reply-Pflichtfeldern
+            # explizit voranstellen, damit der LLM ihn nicht aus den ctx_lines
+            # rekonstruieren muss.
+            email_reply_hint = ""
+            if is_email_thread:
+                last = thread_msgs[-1] if thread_msgs else target
+                reply_to = last.get('sender_address') or target.get('sender_address') or ''
+                reply_subject = last.get('subject') or target.get('subject') or ''
+                reply_mid = last.get('message_id') or target.get('message_id') or ''
+                # Fallback: .eml-Reparse falls message_id im Listing leer ist —
+                # der Watcher schreibt 'Message-ID' nur unregelmaessig in den
+                # Header-Block der .txt-Datei (~1% Coverage), aber der Header
+                # steckt immer im processed-Ordner unter eml_source.
+                if not reply_mid:
+                    for cand in (last, target):
+                        eml_src = (cand.get('eml_source') or '').strip()
+                        if not eml_src:
+                            continue
+                        eml_path = os.path.join(_EMAIL_PROCESSED_EML_DIR, eml_src)
+                        if not os.path.isfile(eml_path):
+                            continue
+                        try:
+                            import email as _email_mod
+                            with open(eml_path, 'rb') as fh_eml:
+                                eml_msg = _email_mod.message_from_bytes(fh_eml.read())
+                            mid_hdr = (eml_msg.get('Message-ID')
+                                       or eml_msg.get('Message-Id')
+                                       or eml_msg.get('message-id')
+                                       or '').strip()
+                            if mid_hdr:
+                                reply_mid = mid_hdr
+                                break
+                        except Exception:
+                            continue
+                email_reply_hint = (
+                    "\n\nE-MAIL-REPLY-FELDER (fuer CREATE_EMAIL_REPLY):\n"
+                    f"  message_id: {reply_mid or '(nicht vorhanden — CREATE_EMAIL als Fallback)'}\n"
+                    f"  to:         {reply_to}\n"
+                    f"  subject:    Re: {reply_subject}\n"
+                )
+            kontext_text = (
+                f"Konversations-Kontext ({src_kind}):\n"
+                + "\n".join(ctx_lines)
+                + email_reply_hint
+            )
             initial_messages.append({
                 "role": "system_context",
                 "content": kontext_text,
