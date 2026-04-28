@@ -42,6 +42,27 @@ try:
 except ImportError:
     inject_capabilities_on_startup = None
 
+# Context Lifecycle Engine (Feature 1 — Roadmap April 2026): Event-Bus
+# fuer benannte Lifecycle-Punkte (BEFORE_TURN, AFTER_TURN, ON_AGENT_SWITCH, ...)
+try:
+    import lifecycle as _lifecycle
+except Exception as _lce:
+    print(f"[lifecycle] Import fehlgeschlagen: {_lce}", flush=True)
+    _lifecycle = None
+
+# Heartbeat-Daemon (Feature 2 — Roadmap April 2026): Notification-Pump fuer
+# pending_notifications.jsonl + Cron-Registry fuer wochentliche/taegliche Jobs.
+try:
+    import heartbeat as _heartbeat
+    try:
+        _heartbeat.start_daemon()
+        print("[heartbeat] Daemon gestartet", flush=True)
+    except Exception as _hbe:
+        print(f"[heartbeat] Daemon-Start fehlgeschlagen: {_hbe}", flush=True)
+except Exception as _hbe:
+    print(f"[heartbeat] Import fehlgeschlagen: {_hbe}", flush=True)
+    _heartbeat = None
+
 # Usage Logger (Feature 3 — Roadmap April 2026): passives Turn-Logging
 # Fire-and-forget, blockiert /chat nie. Bei Import-Fehler -> No-Op-Stub.
 try:
@@ -76,38 +97,82 @@ except Exception as _bfe:
     _bench = None
 
 
-def _log_chat_turn(*, msg, result, duration, session_id, agent_override=None,
-                   sub_agent=None):
-    """Wrapper um usage_logger.log_turn — niemals exception-propagating.
+def _usage_logger_after_turn(ctx):
+    """Lifecycle-Subscriber fuer AFTER_TURN: schreibt einen Turn ins JSONL.
 
-    Wird nach jedem erfolgreichen process_single_message-Aufruf gerufen.
-    'result' ist das Dict aus process_single_message (oder execute_delegation).
+    ctx erwartet folgende Keys (alle optional, Modul ist defensiv):
+      msg, result, duration, session_id, agent_override, sub_agent
     """
     if _usage_logger is None:
         return
+    result = ctx.get('result')
+    if not isinstance(result, dict):
+        return
+    # Sub-agent-Confirmation oder Fehler nicht mitloggen
+    if result.get('type') == 'subagent_confirmation_required':
+        return
+    if 'error' in result and 'response' not in result:
+        return
+    _usage_logger.log_turn(
+        agent=ctx.get('agent_override') or result.get('agent') or '',
+        provider=result.get('provider') or result.get('provider_display') or '',
+        model=result.get('model') or result.get('model_display') or result.get('model_name') or '',
+        user_message=ctx.get('msg'),
+        assistant_response=result.get('response') or '',
+        duration_seconds=ctx.get('duration'),
+        sub_agent=ctx.get('sub_agent') or result.get('delegated_to'),
+        session_id=ctx.get('session_id'),
+    )
+
+
+def _emit_after_turn(*, msg, result, duration, session_id,
+                     agent_override=None, sub_agent=None):
+    """Single Entry-Point an allen /chat-Call-Sites: feuert AFTER_TURN.
+
+    Wenn lifecycle-Modul nicht verfuegbar ist, faellt der Aufruf direkt
+    auf den usage_logger zurueck — Backward-Kompatibilitaet zu Feature 3.
+    """
+    ctx = {
+        'msg': msg, 'result': result, 'duration': duration,
+        'session_id': session_id, 'agent_override': agent_override,
+        'sub_agent': sub_agent,
+    }
+    if _lifecycle is not None:
+        try:
+            _lifecycle.emit(_lifecycle.EVENT_AFTER_TURN, ctx)
+            return
+        except Exception as e:
+            try:
+                print(f"[lifecycle] emit AFTER_TURN failed: {e}", flush=True)
+            except Exception:
+                pass
+    # Fallback: direkter Logger-Aufruf
     try:
-        if not isinstance(result, dict):
-            return
-        # Sub-agent-Confirmation oder Fehler nicht mitloggen
-        if result.get('type') == 'subagent_confirmation_required':
-            return
-        if 'error' in result and 'response' not in result:
-            return
-        _usage_logger.log_turn(
-            agent=agent_override or result.get('agent') or '',
-            provider=result.get('provider') or result.get('provider_display') or '',
-            model=result.get('model') or result.get('model_display') or result.get('model_name') or '',
-            user_message=msg,
-            assistant_response=result.get('response') or '',
-            duration_seconds=duration,
-            sub_agent=sub_agent or result.get('delegated_to'),
-            session_id=session_id,
-        )
+        _usage_logger_after_turn(ctx)
     except Exception as e:
         try:
-            print(f"[usage_logger] _log_chat_turn failed: {e}", flush=True)
+            print(f"[usage_logger] fallback failed: {e}", flush=True)
         except Exception:
             pass
+
+
+# Legacy-Alias — vorhandene Call-Sites rufen weiter _log_chat_turn(),
+# das delegiert jetzt auf den Lifecycle-Emit.
+def _log_chat_turn(**kwargs):
+    _emit_after_turn(**kwargs)
+
+
+# Subscriber registrieren: usage_logger laeuft auf AFTER_TURN
+if _lifecycle is not None and _usage_logger is not None:
+    try:
+        _lifecycle.on(_lifecycle.EVENT_AFTER_TURN,
+                      _usage_logger_after_turn,
+                      label='usage_logger.log_turn')
+        print("[lifecycle] usage_logger als AFTER_TURN-Handler registriert",
+              flush=True)
+    except Exception as _le:
+        print(f"[lifecycle] Subscriber-Registrierung fehlgeschlagen: {_le}",
+              flush=True)
 
 # ─── IMAGE HELPERS ───────────────────────────────────────────────────────────
 # Anthropic API limitiert Bild-Dimensionen auf max. 8000 px pro Seite.
@@ -13085,6 +13150,70 @@ def subagent_confirm():
         return jsonify(response_payload)
     except Exception as e:
         return jsonify({'error': str(e)})
+
+
+@app.route('/api/heartbeat/notifications', methods=['GET'])
+def api_heartbeat_notifications():
+    """Pending Push-Nachrichten fuer Browser-Polling (Feature 2, Roadmap 2026-04).
+    Query: since_id=<id> (optional), limit=<int> (1-200, default 50).
+    Markiert gelieferte Notifications als 'delivered' — werden erst nach
+    POST /api/heartbeat/ack aus der Pending-Queue entfernt."""
+    if _heartbeat is None:
+        return jsonify({'available': False, 'error': 'heartbeat nicht geladen',
+                       'notifications': []})
+    since = request.args.get('since_id') or None
+    try:
+        limit = int(request.args.get('limit', 50))
+    except Exception:
+        limit = 50
+    try:
+        items = _heartbeat.fetch_pending(since_id=since, limit=limit)
+        return jsonify({
+            'available': True,
+            'notifications': items,
+            'queue_size': _heartbeat.queue_size(),
+        })
+    except Exception as e:
+        return jsonify({'available': False, 'error': str(e),
+                       'notifications': []})
+
+
+@app.route('/api/heartbeat/ack', methods=['POST'])
+def api_heartbeat_ack():
+    """Markiert Notifications als gesehen. Body: {ids: [<id>, ...]} ."""
+    if _heartbeat is None:
+        return jsonify({'available': False, 'error': 'heartbeat nicht geladen',
+                       'acked': 0})
+    try:
+        body = request.get_json(silent=True) or {}
+        ids = body.get('ids') or []
+        if not isinstance(ids, list):
+            return jsonify({'available': True, 'error': 'ids muss Liste sein',
+                           'acked': 0}), 400
+        n = _heartbeat.ack(ids)
+        return jsonify({'available': True, 'acked': n,
+                       'queue_size': _heartbeat.queue_size()})
+    except Exception as e:
+        return jsonify({'available': False, 'error': str(e), 'acked': 0})
+
+
+@app.route('/api/heartbeat/status', methods=['GET'])
+def api_heartbeat_status():
+    """Diagnose: Queue-Groesse, registrierte Cron-Jobs, Lifecycle-Subscriber."""
+    out = {'available_heartbeat': _heartbeat is not None,
+           'available_lifecycle': _lifecycle is not None}
+    try:
+        if _heartbeat is not None:
+            out['queue_size'] = _heartbeat.queue_size()
+            out['cron_jobs'] = _heartbeat.list_cron()
+            out['notifications_path'] = _heartbeat.notifications_path()
+        if _lifecycle is not None:
+            out['events'] = list(_lifecycle.EVENTS)
+            out['subscribers'] = _lifecycle.list_subscribers()
+        return jsonify(out)
+    except Exception as e:
+        out['error'] = str(e)
+        return jsonify(out)
 
 
 @app.route('/api/skills/database', methods=['GET'])

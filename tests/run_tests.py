@@ -6085,6 +6085,275 @@ except Exception as _e:
     test("web_server skill-wiring", False, str(_e))
 
 
+section("Lifecycle + Heartbeat 2026-04-27 (Features 1+2 — Roadmap April 2026)")
+
+# Modul-Dateien vorhanden + importierbar
+try:
+    _lc_path = os.path.expanduser("~/AssistantDev/src/lifecycle.py")
+    _hb_path = os.path.expanduser("~/AssistantDev/src/heartbeat.py")
+    test("src/lifecycle.py existiert", os.path.exists(_lc_path))
+    test("src/heartbeat.py existiert", os.path.exists(_hb_path))
+
+    sys.path.insert(0, os.path.expanduser("~/AssistantDev/src"))
+    import lifecycle as _lc
+    import heartbeat as _hb
+    test("lifecycle importierbar", True)
+    test("heartbeat importierbar", True)
+
+    for _fn in ("on", "off", "emit", "list_subscribers", "reset"):
+        test(f"lifecycle.{_fn} vorhanden", callable(getattr(_lc, _fn, None)))
+    for _ev in ("EVENT_BEFORE_TURN", "EVENT_AFTER_TURN", "EVENT_ON_AGENT_SWITCH",
+                "EVENT_ON_SESSION_START", "EVENT_ON_SESSION_END",
+                "EVENT_ON_SUBAGENT_DELEGATION", "EVENT_ON_TURN_ERROR"):
+        test(f"lifecycle.{_ev} vorhanden",
+             isinstance(getattr(_lc, _ev, None), str))
+    test("lifecycle.EVENTS ist Tuple aller 7 Events",
+         isinstance(_lc.EVENTS, tuple) and len(_lc.EVENTS) == 7)
+
+    for _fn in ("enqueue_notification", "fetch_pending", "ack",
+                "queue_size", "schedule_cron", "list_cron",
+                "every_n_seconds", "daily_at", "weekly_at",
+                "start_daemon", "stop_daemon"):
+        test(f"heartbeat.{_fn} vorhanden", callable(getattr(_hb, _fn, None)))
+except Exception as _e:
+    test("lifecycle/heartbeat sanity", False, str(_e))
+
+
+# Lifecycle: on/emit/off
+try:
+    _lc.reset()
+    _captured = []
+    sid = _lc.on("AFTER_TURN", lambda ctx: _captured.append(ctx.get("x")),
+                 label="test_capture")
+    test("on() liefert numerische Subscriber-ID", isinstance(sid, int))
+
+    _stats = _lc.emit("AFTER_TURN", {"x": 42})
+    test("emit() ist dict", isinstance(_stats, dict))
+    test("emit() handlers_total >= 1", _stats.get("handlers_total", 0) >= 1)
+    test("emit() handlers_ok == handlers_total",
+         _stats["handlers_ok"] == _stats["handlers_total"])
+    test("emit() handlers_errored == 0",
+         _stats.get("handlers_errored") == 0)
+    test("Handler hat Wert empfangen", 42 in _captured)
+
+    _lc.on("AFTER_TURN", lambda ctx: _captured.append(ctx["x"] * 2),
+           label="test_double")
+    _lc.emit("AFTER_TURN", {"x": 5})
+    test("Beide Handler liefen (5 und 10)",
+         5 in _captured and 10 in _captured)
+
+    _lc.on("AFTER_TURN", lambda ctx: 1 / 0, label="test_crash")
+    _stats2 = _lc.emit("AFTER_TURN", {"x": 99})
+    test("Failing handler markiert errored == 1",
+         _stats2.get("handlers_errored") == 1)
+    test("Andere handler liefen trotz Fehler",
+         _stats2.get("handlers_ok") == 2)
+    test("Errors-Liste enthaelt traceback-snippet",
+         _stats2.get("errors") and "ZeroDivisionError" in _stats2["errors"][0]["traceback"])
+
+    _ok = _lc.off("AFTER_TURN", sid)
+    test("off() bekannter Subscriber liefert True", _ok is True)
+    test("off() unbekannter Subscriber liefert False",
+         _lc.off("AFTER_TURN", 99999) is False)
+
+    _stats3 = _lc.emit("DOES_NOT_EXIST")
+    test("Unknown event: 0 handlers",
+         _stats3.get("handlers_total") == 0)
+
+    _captured.clear()
+    _lc.on("ON_TEST", lambda ctx: _captured.append(ctx.get("value")),
+           label="non_dict_test")
+    _lc.emit("ON_TEST", "string_value")
+    test("emit mit non-dict ctx wraps in {value: ...}",
+         "string_value" in _captured)
+
+    _lc.reset()
+except Exception as _e:
+    test("lifecycle event-bus", False, str(_e))
+
+
+# Heartbeat: Notifications enqueue/fetch/ack
+try:
+    _sentinel = "HEARTBEAT_TEST_" + str(int(time.time()))
+    _ok = _hb.enqueue_notification({"type": "test", "message": _sentinel})
+    test("enqueue_notification liefert True", _ok is True)
+
+    _id1 = "stable_id_test_" + str(int(time.time()))
+    _hb.enqueue_notification({"id": _id1, "message": "first"})
+    _ok_dup = _hb.enqueue_notification({"id": _id1, "message": "second"})
+    test("enqueue mit dupliziertem id wird ignoriert", _ok_dup is False)
+
+    _items = _hb.fetch_pending(limit=200)
+    test("fetch_pending ist Liste", isinstance(_items, list))
+    test("fetch_pending findet Sentinel",
+         any(_sentinel in str(i.get("message", "")) for i in _items))
+
+    _sent_item = next((i for i in _items
+                       if _sentinel in str(i.get("message", ""))), None)
+    if _sent_item:
+        test("Notification hat 'id'", "id" in _sent_item)
+        test("Notification hat 'timestamp'", "timestamp" in _sent_item)
+        test("Notification hat 'status'", "status" in _sent_item)
+
+    _qsize_before = _hb.queue_size()
+    if _sent_item:
+        _n = _hb.ack([_sent_item["id"]])
+        test("ack() liefert removed >= 1", _n >= 1)
+        test("queue_size sinkt nach ack",
+             _hb.queue_size() < _qsize_before)
+except Exception as _e:
+    test("heartbeat notifications", False, str(_e))
+
+
+# Heartbeat: Cron-Predicates
+try:
+    import datetime as _dt_h
+    _ev = _hb.every_n_seconds(60)
+    test("every_n_seconds(60) None,now -> True",
+         _ev(None, _dt_h.datetime.now()))
+    test("every_n_seconds(60) frisch -> False",
+         _ev(_dt_h.datetime.now(), _dt_h.datetime.now()) is False)
+
+    _wk = _hb.weekly_at(0, 6)
+    _mo_07 = _dt_h.datetime(2026, 4, 27, 7, 0)
+    _mo_05 = _dt_h.datetime(2026, 4, 27, 5, 0)
+    _di_07 = _dt_h.datetime(2026, 4, 28, 7, 0)
+    test("weekly_at Mo06 / Mo07 None -> True",
+         _wk(None, _mo_07) is True)
+    test("weekly_at Mo06 / Mo05 None -> False",
+         _wk(None, _mo_05) is False)
+    test("weekly_at Mo06 / Di07 None -> False",
+         _wk(None, _di_07) is False)
+
+    _da = _hb.daily_at(8)
+    test("daily_at(8) heute09 None -> True",
+         _da(None, _dt_h.datetime(2026, 4, 27, 9, 0)) is True)
+    test("daily_at(8) heute07 None -> False",
+         _da(None, _dt_h.datetime(2026, 4, 27, 7, 0)) is False)
+except Exception as _e:
+    test("heartbeat cron predicates", False, str(_e))
+
+
+# Heartbeat: schedule_cron + run_immediately
+try:
+    _cron_ran = []
+    _hb.schedule_cron(
+        "test_cron_smoke_" + str(int(time.time())),
+        schedule_fn=_hb.every_n_seconds(0),
+        job_fn=lambda now: _cron_ran.append(now),
+        run_immediately=True,
+    )
+    test("schedule_cron + run_immediately fuehrt Job aus",
+         len(_cron_ran) >= 1)
+    _jobs = _hb.list_cron()
+    test("list_cron liefert Liste", isinstance(_jobs, list))
+except Exception as _e:
+    test("heartbeat cron schedule", False, str(_e))
+
+
+# Live-Endpoints
+try:
+    r = requests.get("http://localhost:8080/api/heartbeat/status", timeout=10)
+    test("/api/heartbeat/status 200", r.status_code == 200)
+    if r.status_code == 200:
+        _data = r.json()
+        test("/api/heartbeat/status liefert dict", isinstance(_data, dict))
+        test("/api/heartbeat/status available_heartbeat=True",
+             _data.get("available_heartbeat") is True)
+        test("/api/heartbeat/status available_lifecycle=True",
+             _data.get("available_lifecycle") is True)
+        test("/api/heartbeat/status hat 'subscribers'-Feld",
+             "subscribers" in _data)
+        test("AFTER_TURN-Subscriber registriert (usage_logger)",
+             len(_data.get("subscribers", {}).get("AFTER_TURN", [])) >= 1)
+except Exception as _e:
+    test("/api/heartbeat/status live", False, str(_e))
+
+try:
+    r = requests.get("http://localhost:8080/api/heartbeat/notifications?limit=200",
+                     timeout=10)
+    test("/api/heartbeat/notifications 200", r.status_code == 200)
+    if r.status_code == 200:
+        _data = r.json()
+        test("/notifications liefert 'notifications'-Liste",
+             isinstance(_data.get("notifications"), list))
+        test("/notifications hat 'queue_size'-Feld",
+             "queue_size" in _data)
+except Exception as _e:
+    test("/api/heartbeat/notifications live", False, str(_e))
+
+try:
+    r = requests.post("http://localhost:8080/api/heartbeat/ack",
+                      json={"ids": []}, timeout=10)
+    test("/api/heartbeat/ack 200 (leere ids)", r.status_code == 200)
+    if r.status_code == 200:
+        _data = r.json()
+        test("ack liefert int 'acked'",
+             isinstance(_data.get("acked"), int))
+
+    r2 = requests.post("http://localhost:8080/api/heartbeat/ack",
+                       json={"ids": "nope"}, timeout=10)
+    test("/api/heartbeat/ack ids non-list -> 400",
+         r2.status_code == 400)
+except Exception as _e:
+    test("/api/heartbeat/ack live", False, str(_e))
+
+
+# Wiring im web_server.py
+try:
+    with open(os.path.expanduser("~/AssistantDev/src/web_server.py")) as _f:
+        _ws_lh = _f.read()
+    test("web_server importiert lifecycle",
+         "import lifecycle" in _ws_lh)
+    test("web_server importiert heartbeat",
+         "import heartbeat" in _ws_lh)
+    test("web_server startet heartbeat-Daemon",
+         "_heartbeat.start_daemon()" in _ws_lh)
+    test("web_server registriert usage_logger als AFTER_TURN-Handler",
+         "_lifecycle.on(_lifecycle.EVENT_AFTER_TURN" in _ws_lh)
+    test("web_server hat _emit_after_turn-Wrapper",
+         "def _emit_after_turn(" in _ws_lh)
+    test("web_server feuert AFTER_TURN ueber lifecycle",
+         "_lifecycle.emit(_lifecycle.EVENT_AFTER_TURN" in _ws_lh)
+    for _route in ("'/api/heartbeat/notifications'", "'/api/heartbeat/ack'",
+                   "'/api/heartbeat/status'"):
+        test(f"Route {_route} registriert",
+             f"@app.route({_route}" in _ws_lh)
+except Exception as _e:
+    test("web_server lifecycle/heartbeat wiring", False, str(_e))
+
+
+# End-to-end: echter /chat-Turn -> AFTER_TURN -> usage_logger inkrementiert
+try:
+    _before_e2e = requests.get("http://localhost:8080/api/usage/summary",
+                               timeout=10).json()
+    _t0 = _before_e2e.get("turns_today", 0) if isinstance(_before_e2e, dict) else 0
+
+    import uuid as _u_lh
+    _SID_LH = "lc_test_" + str(_u_lh.uuid4())
+    requests.post("http://localhost:8080/select_agent",
+                  json={"agent": "privat", "session_id": _SID_LH}, timeout=5)
+    requests.post("http://localhost:8080/select_model",
+                  json={"provider": "anthropic",
+                        "model_id": "claude-haiku-4-5-20251001",
+                        "session_id": _SID_LH}, timeout=5)
+    requests.post("http://localhost:8080/chat",
+                  json={"message": "sag nur ok", "session_id": _SID_LH},
+                  timeout=60)
+    _t1 = _t0
+    for _ in range(30):
+        time.sleep(0.1)
+        _after_e2e = requests.get("http://localhost:8080/api/usage/summary",
+                                  timeout=10).json()
+        _t1 = _after_e2e.get("turns_today", 0) if isinstance(_after_e2e, dict) else 0
+        if _t1 > _t0:
+            break
+    test("E2E: /chat ueber Lifecycle inkrementiert turns_today",
+         _t1 > _t0, f"vorher={_t0} nachher={_t1}")
+except Exception as _e:
+    test("e2e lifecycle /chat", False, str(_e))
+
+
 _cleanup_test_artifacts()
 
 # ============================================================
