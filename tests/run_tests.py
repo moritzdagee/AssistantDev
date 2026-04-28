@@ -5361,6 +5361,20 @@ try:
     test("Reply-Kontext .eml-Reparse-Fallback fuer message_id",
          "message_from_bytes" in _ws and "_EMAIL_PROCESSED_EML_DIR" in _ws and
          "Message-ID" in _ws)
+    # BACKEND_TODO_REPLY_CONTEXT_TRUNCATION_2026-04-28
+    test("Per-Message-Body-Limit auf 8000 Zeichen (statt 500)",
+         "_PER_MSG_BODY_LIMIT = 8000" in _ws and "[…gekuerzt nach 8000 Zeichen…]" in _ws)
+    test("Thread-Endpoint filtert Mail-Self-Files (.eml/.txt)",
+         "_mail_self_re" in _ws and "_is_real_attachment" in _ws)
+    test("Thread-Endpoint dedupt attachments per stable-Key",
+         "seen_att_keys" in _ws)
+    # BACKEND_TODO_REPLY_FROM_FIELD_MISSING_2026-04-28
+    test("Reply-Felder-Block enthaelt 'from:'",
+         "f\"  from:       {from_addr or '(unbekannt)'}\"" in _ws)
+    test("Reply-Felder-Block respektiert Reply-To-Header",
+         "reply_to_hdr" in _ws and "eml_msg.get('Reply-To')" in _ws)
+    test("Reply-Felder-Block sammelt cc bei >2 Teilnehmern",
+         "cc_addrs" in _ws and "', '.join(cc_addrs)" in _ws)
 except Exception as _e:
     test("Agent PUT-Alias grep", False, str(_e))
 

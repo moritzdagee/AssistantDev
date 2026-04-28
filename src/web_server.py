@@ -17958,9 +17958,49 @@ def api_message_thread(msg_id):
                 "handle": addr, "avatar_url": None,
             })
 
+    # Attachment-Filter (BACKEND_TODO_REPLY_CONTEXT_TRUNCATION_2026-04-28 §1B+Bonus):
+    # 1. Mail-Files selbst (vom Watcher als .txt/.eml im Datalake-Pattern
+    #    '<datum>_<zeit>_(IN|OUT)_<sender>.eml') gehoeren NICHT in den
+    #    Reply-Anhang-Picker. Echte E-Mail-Anhaenge folgen dem Pattern
+    #    '<datum>_<zeit>_(IN|OUT)_<sender>__<original_filename>.<ext>'
+    #    (mit double-underscore-Separator) — die behalten wir.
+    # 2. Dedup ueber stable-Key (id || name+size+mime) — bei Quoted-Replies
+    #    erscheint das gleiche PDF in mehreren Messages und wuerde sonst N-fach
+    #    im Composer-Footer auftauchen.
+    _mail_self_re = _msgd_re.compile(
+        r'^\d{4}-\d{2}-\d{2}_\d{2}-\d{2}-\d{2}_(IN|OUT)_[^/]+\.(eml|txt)$',
+        _msgd_re.IGNORECASE,
+    )
+
+    def _is_real_attachment(att):
+        n = (att.get('name') or '') if isinstance(att, dict) else str(att or '')
+        if not n:
+            return False
+        # Nur die '.eml'/'.txt'-Mail-Files selbst rausfiltern. Echte
+        # Anhaenge mit File-Extension (.pdf, .png, .xlsx, ...) und
+        # double-underscore-Separator durchlassen, auch wenn der Watcher
+        # ihnen den Datums-Prefix gibt.
+        if _mail_self_re.match(n):
+            return False
+        return True
+
     # Format messages
     formatted = []
+    seen_att_keys = set()
     for m in thread_msgs:
+        raw_attachments = m.get("attachments") or []
+        kept = []
+        for att in raw_attachments:
+            if not _is_real_attachment(att):
+                continue
+            if isinstance(att, dict):
+                key = att.get('id') or f"{att.get('name','')}|{att.get('size','')}|{att.get('mime','')}"
+            else:
+                key = str(att)
+            if key in seen_att_keys:
+                continue
+            seen_att_keys.add(key)
+            kept.append(att)
         formatted.append({
             "id": m.get("id"),
             "direction": "sent" if _msg_is_sent_by_user(m) else "received",
@@ -17973,7 +18013,7 @@ def api_message_thread(msg_id):
             "timestamp": m.get("timestamp"),
             "body_text": m.get("full_content") or m.get("preview") or "",
             "body_html": None,
-            "attachments": m.get("attachments") or [],
+            "attachments": kept,
             "in_reply_to": m.get("in_reply_to"),
         })
 
@@ -18133,9 +18173,19 @@ def api_agent_sessions(agent):
             thread_msgs.sort(key=lambda m: m.get("timestamp_epoch", 0))
             ctx_lines = []
             is_email_thread = (target.get('type') == 'email')
+            # Pro-Message-Body-Limit: 8000 chars (vorher 500 — User sah nur
+            # die ersten 500 chars + '...'). 8000 chars = ~2000 Tokens, bei
+            # max 10 Messages = ~20k Tokens. Bewusst grosszuegig — User soll
+            # selber scrollen, das Frontend kann das.
+            # Vgl. BACKEND_TODO_REPLY_CONTEXT_TRUNCATION_2026-04-28 §1.
+            _PER_MSG_BODY_LIMIT = 8000
             for m in thread_msgs[-10:]:  # Letzte 10 Messages reichen
                 who = m.get("sender_name") or m.get("sender_address") or "?"
-                preview = (m.get("full_content") or m.get("preview") or "")[:500]
+                body_full = m.get("full_content") or m.get("preview") or ""
+                if len(body_full) > _PER_MSG_BODY_LIMIT:
+                    body_text = body_full[:_PER_MSG_BODY_LIMIT] + "\n  […gekuerzt nach 8000 Zeichen…]"
+                else:
+                    body_text = body_full
                 # Fuer E-Mails: explizit message_id + sender_address mitschicken,
                 # damit der LLM beim CREATE_EMAIL_REPLY threading-IDs korrekt
                 # einsetzen kann (sonst sieht er nur Sender-Name + Preview und
@@ -18148,49 +18198,82 @@ def api_agent_sessions(agent):
                         header += f" <{addr}>"
                     if mid:
                         header += f" Message-ID: {mid}"
-                    ctx_lines.append(f"{header}\n  {preview}")
+                    ctx_lines.append(f"{header}\n  {body_text}")
                 else:
-                    ctx_lines.append(f"[{m.get('timestamp', '')}] {who}: {preview}")
+                    ctx_lines.append(f"[{m.get('timestamp', '')}] {who}: {body_text}")
             # Bei E-Mail-Threads: Header-Block mit den Reply-Pflichtfeldern
             # explizit voranstellen, damit der LLM ihn nicht aus den ctx_lines
-            # rekonstruieren muss.
+            # rekonstruieren muss. (BACKEND_TODO_REPLY_FROM_FIELD_MISSING:
+            # 'from' + ggf. 'cc' + Reply-To-Header beruecksichtigen.)
             email_reply_hint = ""
             if is_email_thread:
                 last = thread_msgs[-1] if thread_msgs else target
-                reply_to = last.get('sender_address') or target.get('sender_address') or ''
+                from_addr = last.get('sender_address') or target.get('sender_address') or ''
+                reply_to = from_addr  # Default: an Absender der letzten Mail
                 reply_subject = last.get('subject') or target.get('subject') or ''
                 reply_mid = last.get('message_id') or target.get('message_id') or ''
-                # Fallback: .eml-Reparse falls message_id im Listing leer ist —
-                # der Watcher schreibt 'Message-ID' nur unregelmaessig in den
-                # Header-Block der .txt-Datei (~1% Coverage), aber der Header
-                # steckt immer im processed-Ordner unter eml_source.
-                if not reply_mid:
-                    for cand in (last, target):
-                        eml_src = (cand.get('eml_source') or '').strip()
-                        if not eml_src:
-                            continue
-                        eml_path = os.path.join(_EMAIL_PROCESSED_EML_DIR, eml_src)
-                        if not os.path.isfile(eml_path):
-                            continue
-                        try:
-                            import email as _email_mod
-                            with open(eml_path, 'rb') as fh_eml:
-                                eml_msg = _email_mod.message_from_bytes(fh_eml.read())
+                reply_to_hdr = ''  # Reply-To-Header aus .eml
+                # CC-Liste: alle distinct Sender im Thread ausser uns selbst
+                # und ausser dem from_addr (= reply_to).
+                cc_addrs = []
+                seen_cc = set()
+                for m in thread_msgs:
+                    a = (m.get('sender_address') or '').lower()
+                    if not a or a in seen_cc:
+                        continue
+                    seen_cc.add(a)
+                    if a in (from_addr.lower(),) or a in _MSG_OWN_EMAILS:
+                        continue
+                    cc_addrs.append(m.get('sender_address'))
+                # .eml-Reparse: message_id + Reply-To-Header notfalls aus
+                # processed-Ordner (Watcher schreibt Header nur ~1% in .txt).
+                for cand in (last, target):
+                    if reply_mid and reply_to_hdr:
+                        break
+                    eml_src = (cand.get('eml_source') or '').strip()
+                    if not eml_src:
+                        continue
+                    eml_path = os.path.join(_EMAIL_PROCESSED_EML_DIR, eml_src)
+                    if not os.path.isfile(eml_path):
+                        continue
+                    try:
+                        import email as _email_mod
+                        with open(eml_path, 'rb') as fh_eml:
+                            eml_msg = _email_mod.message_from_bytes(fh_eml.read())
+                        if not reply_mid:
                             mid_hdr = (eml_msg.get('Message-ID')
                                        or eml_msg.get('Message-Id')
                                        or eml_msg.get('message-id')
                                        or '').strip()
                             if mid_hdr:
                                 reply_mid = mid_hdr
-                                break
-                        except Exception:
-                            continue
-                email_reply_hint = (
-                    "\n\nE-MAIL-REPLY-FELDER (fuer CREATE_EMAIL_REPLY):\n"
-                    f"  message_id: {reply_mid or '(nicht vorhanden — CREATE_EMAIL als Fallback)'}\n"
-                    f"  to:         {reply_to}\n"
-                    f"  subject:    Re: {reply_subject}\n"
-                )
+                        if not reply_to_hdr:
+                            rt = (eml_msg.get('Reply-To') or eml_msg.get('reply-to') or '').strip()
+                            if rt:
+                                # Address aus '"Name" <addr>' extrahieren
+                                if '<' in rt and '>' in rt:
+                                    rt = rt[rt.index('<')+1:rt.index('>')].strip()
+                                reply_to_hdr = rt
+                    except Exception:
+                        continue
+                # Reply-To Override: bei Mailing-Listen / Reply-To-Header
+                # geht die Antwort dorthin, nicht an from_addr.
+                if reply_to_hdr:
+                    reply_to = reply_to_hdr
+                lines = [
+                    "",
+                    "",
+                    "E-MAIL-REPLY-FELDER (fuer CREATE_EMAIL_REPLY):",
+                    f"  message_id: {reply_mid or '(nicht vorhanden — CREATE_EMAIL als Fallback)'}",
+                    f"  from:       {from_addr or '(unbekannt)'}",
+                    f"  to:         {reply_to or from_addr or '(unbekannt)'}",
+                    f"  subject:    Re: {reply_subject}",
+                ]
+                if cc_addrs:
+                    lines.append(f"  cc:         {', '.join(cc_addrs)}")
+                if reply_to_hdr and reply_to_hdr.lower() != from_addr.lower():
+                    lines.append(f"  reply_to:   {reply_to_hdr}  (aus Reply-To-Header)")
+                email_reply_hint = "\n".join(lines) + "\n"
             kontext_text = (
                 f"Konversations-Kontext ({src_kind}):\n"
                 + "\n".join(ctx_lines)
