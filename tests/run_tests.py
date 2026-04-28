@@ -5398,6 +5398,13 @@ try:
          "@app.route('/api/memory/loading-config', methods=['PATCH', 'PUT'])" in _ws)
     test("/api/memory/load_suggestion POST registriert",
          "@app.route('/api/memory/load_suggestion', methods=['POST'])" in _ws)
+    # BACKEND_TODO_SLASH_HIERARCHY_2026-04-28
+    test("/api/commands liefert categories + commands",
+         "'categories': categories" in _ws and "'commands': flat" in _ws)
+    test("commands hierarchisch (find mit subcommands)",
+         "'slash': '/find_global'" in _ws and "'slash': '/find_email'" in _ws)
+    test("commands hierarchisch (create mit subcommands)",
+         "'slash': '/create_email'" in _ws and "'slash': '/create_pdf'" in _ws)
 except Exception as _e:
     test("Agent PUT-Alias grep", False, str(_e))
 

@@ -9378,34 +9378,124 @@ def api_custom_sources_validate():
 # ── /api/commands (Slash-Commands) ─────────────────────────────────────────
 @app.route('/api/commands')
 def api_commands():
-    """Bekannte Slash-Commands — pragmatische Liste aus dem Datalake."""
-    commands = [
-        {'name': '/create-email', 'description': 'E-Mail-Draft erstellen', 'args': ['empfaenger', 'betreff?']},
-        {'name': '/create-email-reply', 'description': 'Antwort auf existierende E-Mail', 'args': ['nachricht_id']},
-        {'name': '/create-whatsapp', 'description': 'WhatsApp-Draft', 'args': ['kontakt', 'text?']},
-        {'name': '/create-slack', 'description': 'Slack-Message-Draft', 'args': ['kanal']},
-        {'name': '/calendar-today', 'description': 'Heutige Termine', 'args': []},
-        {'name': '/calendar-tomorrow', 'description': 'Termine morgen', 'args': []},
-        {'name': '/calendar-week', 'description': 'Termine diese Woche', 'args': []},
-        {'name': '/calendar-search', 'description': 'Kalender-Suche', 'args': ['query']},
-        {'name': '/create-image', 'description': 'Bild generieren (Gemini/OpenAI)', 'args': ['prompt']},
-        {'name': '/create-video', 'description': 'Video generieren', 'args': ['prompt']},
-        {'name': '/create-file-docx', 'description': 'Word-Dokument erstellen', 'args': ['titel', 'inhalt']},
-        {'name': '/create-file-xlsx', 'description': 'Excel-Datei erstellen', 'args': ['titel']},
-        {'name': '/create-file-pdf', 'description': 'PDF erstellen', 'args': ['titel']},
-        {'name': '/create-file-pptx', 'description': 'PowerPoint erstellen', 'args': ['titel']},
-        {'name': '/canva-search', 'description': 'Canva-Designs suchen', 'args': ['query']},
-        {'name': '/canva-create', 'description': 'Neues Canva-Design', 'args': ['titel']},
-        {'name': '/find', 'description': 'Agent-lokale Suche', 'args': ['query']},
-        {'name': '/find-email', 'description': 'E-Mail-Suche', 'args': ['query']},
-        {'name': '/find-whatsapp', 'description': 'WhatsApp-Suche', 'args': ['query']},
-        {'name': '/find-webclip', 'description': 'Webclip-Suche', 'args': ['query']},
-        {'name': '/find-document', 'description': 'Dokument-Suche', 'args': ['query']},
-        {'name': '/find-conversation', 'description': 'Konversations-Suche', 'args': ['query']},
-        {'name': '/find_global', 'description': 'Agent-uebergreifende Suche', 'args': ['query']},
-        {'name': '/reply', 'description': 'Auf E-Mail aus Suche antworten', 'args': ['query']},
+    """Slash-Commands hierarchisch: Kategorie -> Subkommando.
+
+    Frontend-Convention (BACKEND_TODO_SLASH_HIERARCHY_2026-04-28):
+    - Top-Level mit `/` praefix (z.B. `/find`, `/create`, `/calendar`)
+    - Subkommandos via `_` Separator (`/find_email`, `/create_pdf`)
+    - Frontend-Autocomplete: `/` -> Top-Level zeigen, `_` nach Top-Level
+      -> Subkommandos zeigen.
+
+    Response liefert sowohl die flache Liste (`commands`, Backwards-Compat)
+    als auch die kategorisierte Hierarchie (`categories`).
+    """
+    categories = [
+        {
+            'name': 'find',
+            'slash': '/find',
+            'description': 'Suche im Agent-Memory oder global',
+            'icon': 'search',
+            'args': ['query'],
+            'subcommands': [
+                {'name': 'global', 'slash': '/find_global', 'description': 'Agent-uebergreifende Suche', 'args': ['query']},
+                {'name': 'email', 'slash': '/find_email', 'description': 'Nur E-Mails durchsuchen', 'args': ['query']},
+                {'name': 'whatsapp', 'slash': '/find_whatsapp', 'description': 'Nur WhatsApp', 'args': ['query']},
+                {'name': 'imessage', 'slash': '/find_imessage', 'description': 'Nur iMessage', 'args': ['query']},
+                {'name': 'webclip', 'slash': '/find_webclip', 'description': 'Nur Webclips', 'args': ['query']},
+                {'name': 'document', 'slash': '/find_document', 'description': 'Nur Dokumente (PDF/DOCX/XLSX)', 'args': ['query']},
+                {'name': 'conversation', 'slash': '/find_conversation', 'description': 'Frühere Chat-Sessions', 'args': ['query']},
+                {'name': 'contact', 'slash': '/find_contact', 'description': 'Kontakt-Lookup', 'args': ['name']},
+            ],
+        },
+        {
+            'name': 'create',
+            'slash': '/create',
+            'description': 'Neuen Inhalt erstellen',
+            'icon': 'plus-square',
+            'args': [],
+            'subcommands': [
+                {'name': 'email', 'slash': '/create_email', 'description': 'E-Mail-Draft', 'args': ['empfaenger', 'betreff?']},
+                {'name': 'email_reply', 'slash': '/create_email_reply', 'description': 'Antwort auf existierende Mail', 'args': ['nachricht_id']},
+                {'name': 'whatsapp', 'slash': '/create_whatsapp', 'description': 'WhatsApp-Draft', 'args': ['kontakt', 'text?']},
+                {'name': 'slack', 'slash': '/create_slack', 'description': 'Slack-Message-Draft', 'args': ['kanal']},
+                {'name': 'image', 'slash': '/create_image', 'description': 'Bild generieren (Gemini/OpenAI)', 'args': ['prompt']},
+                {'name': 'video', 'slash': '/create_video', 'description': 'Video generieren (Veo)', 'args': ['prompt']},
+                {'name': 'docx', 'slash': '/create_docx', 'description': 'Word-Dokument', 'args': ['titel']},
+                {'name': 'xlsx', 'slash': '/create_xlsx', 'description': 'Excel-Tabelle', 'args': ['titel']},
+                {'name': 'pdf', 'slash': '/create_pdf', 'description': 'PDF', 'args': ['titel']},
+                {'name': 'pptx', 'slash': '/create_pptx', 'description': 'PowerPoint', 'args': ['titel']},
+            ],
+        },
+        {
+            'name': 'calendar',
+            'slash': '/calendar',
+            'description': 'Termine + Kalender-Aktionen',
+            'icon': 'calendar',
+            'args': [],
+            'subcommands': [
+                {'name': 'today', 'slash': '/calendar_today', 'description': 'Heutige Termine', 'args': []},
+                {'name': 'tomorrow', 'slash': '/calendar_tomorrow', 'description': 'Termine morgen', 'args': []},
+                {'name': 'week', 'slash': '/calendar_week', 'description': 'Diese Woche', 'args': []},
+                {'name': 'search', 'slash': '/calendar_search', 'description': 'Kalender-Suche', 'args': ['query']},
+            ],
+        },
+        {
+            'name': 'canva',
+            'slash': '/canva',
+            'description': 'Canva-Connect-Aktionen',
+            'icon': 'palette',
+            'args': [],
+            'subcommands': [
+                {'name': 'search', 'slash': '/canva_search', 'description': 'Designs suchen', 'args': ['query']},
+                {'name': 'create', 'slash': '/canva_create', 'description': 'Neues Design', 'args': ['titel']},
+                {'name': 'templates', 'slash': '/canva_templates', 'description': 'Brand-Templates', 'args': []},
+                {'name': 'export', 'slash': '/canva_export', 'description': 'Design exportieren', 'args': ['design_id']},
+            ],
+        },
+        {
+            'name': 'memory',
+            'slash': '/memory',
+            'description': 'Memory + Working-Memory verwalten',
+            'icon': 'database',
+            'args': [],
+            'subcommands': [
+                {'name': 'add', 'slash': '/memory_add', 'description': 'Datei in Working-Memory pinnen', 'args': ['filename']},
+                {'name': 'remove', 'slash': '/memory_remove', 'description': 'Aus Working-Memory entfernen', 'args': ['filename']},
+                {'name': 'list', 'slash': '/memory_list', 'description': 'Working-Memory anzeigen', 'args': []},
+            ],
+        },
+        {
+            'name': 'reply',
+            'slash': '/reply',
+            'description': 'Reply-Helper auf gefundene Mail',
+            'icon': 'reply',
+            'args': ['query'],
+            'subcommands': [],
+        },
     ]
-    return jsonify(commands)
+    # Flat list (backwards-compat)
+    flat = []
+    for cat in categories:
+        if not cat['subcommands']:
+            flat.append({
+                'name': cat['slash'],
+                'description': cat['description'],
+                'category': cat['name'],
+                'args': cat['args'],
+            })
+        else:
+            for sub in cat['subcommands']:
+                flat.append({
+                    'name': sub['slash'],
+                    'description': sub['description'],
+                    'category': cat['name'],
+                    'subcommand': sub['name'],
+                    'args': sub['args'],
+                })
+    return jsonify({
+        'categories': categories,
+        'commands': flat,  # Backwards-Compat
+    })
 
 
 # ── /api/capabilities ──────────────────────────────────────────────────────
