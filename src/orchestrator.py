@@ -61,7 +61,46 @@ _BASE = os.path.expanduser(
     "Downloads shared/claude_datalake"
 )
 PROPOSALS_PATH = os.path.join(_BASE, "patterns", "orchestrator_proposals.json")
-DECOMPOSITION_MODEL = ("anthropic", "claude-haiku-4-5-20251001")
+_ORCHESTRATOR_CONFIG_PATH = os.path.join(_BASE, "config", "orchestrator.json")
+
+# Fallback-Cascade: erstes Modell, das funktioniert, gewinnt. Lokal zuerst,
+# damit der Orchestrator auch offline einsatzbereit ist (User-Wunsch
+# 2026-04-28: "Sonst ist der ganze Agent komplett useless wenn ich keine
+# Internetverbindung habe").
+_DEFAULT_DECOMPOSER_CASCADE = [
+    ("ollama", "deepseek-r1:14b"),
+    ("ollama", "deepseek-r1:8b"),
+    ("ollama", "qwen3:14b"),
+    ("deepseek", "deepseek-v4-flash"),
+    ("anthropic", "claude-haiku-4-5-20251001"),
+]
+
+
+def _load_orchestrator_config():
+    try:
+        with open(_ORCHESTRATOR_CONFIG_PATH, encoding="utf-8") as fh:
+            return json.load(fh)
+    except Exception:
+        return {}
+
+
+def _decomposer_cascade():
+    """Effektive Cascade aus config/orchestrator.json oder Default."""
+    cfg = _load_orchestrator_config()
+    raw = cfg.get("decomposer_cascade")
+    if isinstance(raw, list) and raw:
+        cascade = []
+        for item in raw:
+            if isinstance(item, (list, tuple)) and len(item) >= 2:
+                cascade.append((str(item[0]), str(item[1])))
+        if cascade:
+            return cascade
+    return list(_DEFAULT_DECOMPOSER_CASCADE)
+
+
+# Backwards-Compat: Modul-Konstante zeigt auf das erste Modell der Cascade
+# (alte Stellen die DECOMPOSITION_MODEL importieren bekommen das primary).
+DECOMPOSITION_MODEL = _decomposer_cascade()[0]
 
 MIN_WORDS_FOR_ORCHESTRATION = 50
 MIN_DISTINCT_CATEGORIES = 2
@@ -222,28 +261,52 @@ Wichtige Regeln:
 
 
 def _decompose_via_llm(msg):
+    """Probiert die Decomposer-Cascade durch (offline-first).
+
+    User-Wunsch 2026-04-28: 'Lieber DeepSeek-Local als Haiku — funktioniert
+    auch ohne Internetverbindung.' Daher: lokal (Ollama) zuerst, Cloud nur
+    als Fallback.
+    """
     if _llm_invoker is None:
         return None
-    provider, model_id = DECOMPOSITION_MODEL
-    try:
-        raw = _llm_invoker(provider, model_id, _DECOMP_SYSTEM_PROMPT,
-                           [{"role": "user", "content": msg}])
-    except Exception as e:
-        print(f"[orchestrator] LLM-Decomposition fehlgeschlagen: {e}",
-              flush=True)
-        return None
-    if not isinstance(raw, str):
-        return None
-    # JSON aus der Antwort extrahieren — manchmal kommt LLM mit Code-Fence
-    m = re.search(r"\{[\s\S]*\}", raw)
-    if not m:
-        return None
-    try:
-        data = json.loads(m.group(0))
-    except Exception:
-        return None
-    subs = data.get("subtasks") if isinstance(data, dict) else None
-    if not isinstance(subs, list) or not subs:
+    cascade = _decomposer_cascade()
+    last_error = None
+    for provider, model_id in cascade:
+        try:
+            raw = _llm_invoker(provider, model_id, _DECOMP_SYSTEM_PROMPT,
+                               [{"role": "user", "content": msg}])
+        except Exception as e:
+            last_error = e
+            print(f"[orchestrator] {provider}/{model_id} fehlgeschlagen: {e} "
+                  f"— probiere naechstes Modell der Cascade", flush=True)
+            continue
+        if not isinstance(raw, str):
+            continue
+        # JSON aus der Antwort extrahieren — manchmal kommt LLM mit Code-Fence
+        # oder DeepSeek-R1 mit <think>...</think>-Block davor.
+        m = re.search(r"\{[\s\S]*\}", raw)
+        if not m:
+            print(f"[orchestrator] {provider}/{model_id} lieferte kein JSON, "
+                  f"probiere naechstes Modell", flush=True)
+            continue
+        try:
+            data = json.loads(m.group(0))
+        except Exception:
+            print(f"[orchestrator] {provider}/{model_id}: JSON-parse-fail",
+                  flush=True)
+            continue
+        subs = data.get("subtasks") if isinstance(data, dict) else None
+        if not isinstance(subs, list) or not subs:
+            continue
+        # Ergebnis brauchbar — markiere welches Modell gewonnen hat
+        print(f"[orchestrator] decomposer-cascade: {provider}/{model_id} "
+              f"gewonnen ({len(subs)} subtasks)", flush=True)
+        # Cleanup-Schleife unten (gemeinsam fuer alle Pfade)
+        break
+    else:
+        if last_error:
+            print(f"[orchestrator] gesamte Cascade fehlgeschlagen "
+                  f"(letzter Fehler: {last_error})", flush=True)
         return None
     cleaned = []
     for i, s in enumerate(subs[:6]):

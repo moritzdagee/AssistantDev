@@ -5408,6 +5408,21 @@ try:
 except Exception as _e:
     test("Agent PUT-Alias grep", False, str(_e))
 
+# BACKEND_TODO_ORCHESTRATOR_OFFLINE_2026-04-28
+try:
+    with open(os.path.expanduser("~/AssistantDev/src/orchestrator.py")) as _f:
+        _orc = _f.read()
+    test("Orchestrator nutzt Decomposer-Cascade (offline-first)",
+         "_decomposer_cascade()" in _orc and "_DEFAULT_DECOMPOSER_CASCADE" in _orc)
+    test("Default-Cascade beginnt mit ollama (lokal, offline-faehig)",
+         '("ollama", "deepseek-r1' in _orc)
+    test("Anthropic Haiku ist nur Last-Resort-Fallback",
+         _orc.find('("anthropic"') > _orc.find('("ollama"'))
+    test("config/orchestrator.json wird geladen",
+         "_ORCHESTRATOR_CONFIG_PATH" in _orc and "decomposer_cascade" in _orc)
+except Exception as _e:
+    test("Orchestrator-Cascade grep", False, str(_e))
+
 # Live-Tests fuer Memory-Loading-Config
 try:
     r = requests.get("http://localhost:8080/api/memory/loading-config", timeout=10)
