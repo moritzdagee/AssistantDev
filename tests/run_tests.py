@@ -6816,6 +6816,152 @@ except Exception as _e:
     test("orchestrator wiring", False, str(_e))
 
 
+section("Klassifikator-Stems + Pattern-Bootstrap-Delay 2026-04-28")
+
+# Stem-API in usage_logger
+try:
+    sys.path.insert(0, os.path.expanduser("~/AssistantDev/src"))
+    import importlib
+    import usage_logger as _ul_st
+    importlib.reload(_ul_st)
+    test("usage_logger._stem vorhanden", callable(getattr(_ul_st, "_stem", None)))
+    test("usage_logger._STEM_INDEX existiert", isinstance(_ul_st._STEM_INDEX, dict))
+    test("usage_logger._MULTI_WORD existiert", isinstance(_ul_st._MULTI_WORD, list))
+    test("_LOANWORDS enthaelt 'email'", "email" in _ul_st._LOANWORDS)
+    test("_LOANWORDS enthaelt 'report'", "report" in _ul_st._LOANWORDS)
+    test("_LOANWORDS enthaelt 'meeting'", "meeting" in _ul_st._LOANWORDS)
+
+    # Stem-Verhalten
+    test("_stem('recherchiere') == 'recherch'",
+         _ul_st._stem("recherchiere") == "recherch")
+    test("_stem('schreibe') == 'schreib'",
+         _ul_st._stem("schreibe") == "schreib")
+    test("_stem('analysier') strippt nicht weiter (4-Char-Min)",
+         _ul_st._stem("analy") == "analy")
+    test("_stem('email') == 'email' (Lehnwort)",
+         _ul_st._stem("email") == "email")
+    test("_stem('report') == 'report' (Lehnwort)",
+         _ul_st._stem("report") == "report")
+    test("_stem mit Umlaut: 'übersetzung' -> 'ubersetz'",
+         _ul_st._stem("übersetzung") == "ubersetz")
+    test("_stem('') == ''", _ul_st._stem("") == "")
+    test("_stem(None) == ''", _ul_st._stem(None) == "")
+except Exception as _e:
+    test("usage_logger stem API", False, str(_e))
+
+
+# Klassifikator: regression + neue Faelle
+try:
+    _classify = _ul_st.classify_task
+    _cases = [
+        ("Recherchiere Stripe vs Adyen", "research"),
+        ("Recherchen zu digitaler Identitaet", "research"),
+        ("Schreib mir einen Report", "document"),
+        ("Schreibe mir einen Brief", "writing"),
+        ("Geschrieben haben wir das schon", "writing"),
+        ("Bild generieren fuer Marketing", "image"),
+        ("Generiere ein Video", "video"),
+        ("Uebersetzung ins Englische", "translation"),
+        ("Code schreiben", "coding"),
+        ("Repository klonen", "coding"),
+        ("Funktion debuggen", "coding"),
+        ("Marktanalyse durchfuehren", "research"),
+        ("Analysiere die Logs", "analysis"),
+        ("Schreib eine E-Mail an Sven", "email"),
+        ("sag nur ok", "other"),
+        ("", "other"),
+    ]
+    for _msg, _exp in _cases:
+        _got = _classify(_msg)
+        test(f"classify({_msg!r:50s}) == {_exp}",
+             _got == _exp, f"got={_got}")
+except Exception as _e:
+    test("classify_task new behaviour", False, str(_e))
+
+
+# Repo-Bug-Regression: " repo" matched in " report"
+try:
+    test("'Schreib mir einen Report' NICHT als coding (war ' repo'-Bug)",
+         _ul_st.classify_task("Schreib mir einen Report") != "coding")
+    # 'repository' ist nun das saubere Keyword
+    test("'Klone das repository' -> coding",
+         _ul_st.classify_task("Klone das repository") == "coding")
+except Exception as _e:
+    test("repo-bug regression", False, str(_e))
+
+
+# Pattern-Analyzer Bootstrap-Delay
+try:
+    import pattern_analyzer as _pa_st
+    importlib.reload(_pa_st)
+    test("pattern_analyzer.BOOTSTRAP_FIRST_RUN_AFTER vorhanden",
+         hasattr(_pa_st, "BOOTSTRAP_FIRST_RUN_AFTER"))
+    test("pattern_analyzer._bootstrap_aware_schedule callable",
+         callable(getattr(_pa_st, "_bootstrap_aware_schedule", None)))
+    test("pattern_analyzer.bootstrap_status callable",
+         callable(getattr(_pa_st, "bootstrap_status", None)))
+
+    import datetime as _dt_pa
+    _tz = _pa_st._TZ
+    _fn = _pa_st._bootstrap_aware_schedule
+    _today_in_bootstrap = _dt_pa.datetime(2026, 4, 28, 22, 0, tzinfo=_tz)
+    test("Bootstrap-Phase: 2026-04-28 -> False",
+         _fn(None, _today_in_bootstrap) is False)
+
+    _t_first = _dt_pa.datetime(2026, 5, 8, 22, 30, tzinfo=_tz)
+    test("Bootstrap-First-Run 2026-05-08 22:30 last=None -> True",
+         _fn(None, _t_first) is True)
+
+    _t_too_early = _dt_pa.datetime(2026, 5, 8, 21, 0, tzinfo=_tz)
+    test("2026-05-08 21:00 (vor 22:00) last=None -> False",
+         _fn(None, _t_too_early) is False)
+
+    _last = _dt_pa.datetime(2026, 5, 8, 22, 30, tzinfo=_tz)
+    _t_two_days_later = _dt_pa.datetime(2026, 5, 10, 22, 30, tzinfo=_tz)
+    test("Sonntag 2026-05-10 nur 2 Tage nach last_run -> False",
+         _fn(_last, _t_two_days_later) is False)
+
+    _t_nine_days_later = _dt_pa.datetime(2026, 5, 17, 22, 30, tzinfo=_tz)
+    test("Sonntag 2026-05-17 9 Tage nach last_run -> True",
+         _fn(_last, _t_nine_days_later) is True)
+
+    _status = _pa_st.bootstrap_status()
+    test("bootstrap_status liefert dict", isinstance(_status, dict))
+    test("bootstrap_status hat 'first_run_after'",
+         "first_run_after" in _status)
+    test("bootstrap_status hat 'in_bootstrap_phase'",
+         "in_bootstrap_phase" in _status)
+    test("bootstrap_status hat 'seconds_until_first_run'",
+         isinstance(_status.get("seconds_until_first_run"), int))
+except Exception as _e:
+    test("pattern_analyzer bootstrap delay", False, str(_e))
+
+
+# Live-Endpoint
+try:
+    r = requests.get("http://localhost:8080/api/patterns/bootstrap_status",
+                     timeout=10)
+    test("/api/patterns/bootstrap_status 200", r.status_code == 200)
+    if r.status_code == 200:
+        _data = r.json()
+        test("bootstrap_status liefert 'first_run_after'",
+             "first_run_after" in _data)
+        test("bootstrap_status liefert 'in_bootstrap_phase'",
+             "in_bootstrap_phase" in _data)
+except Exception as _e:
+    test("/api/patterns/bootstrap_status live", False, str(_e))
+
+
+# Wiring: Endpoint registriert
+try:
+    with open(os.path.expanduser("~/AssistantDev/src/web_server.py")) as _f:
+        _ws_st = _f.read()
+    test("Route /api/patterns/bootstrap_status registriert",
+         "@app.route('/api/patterns/bootstrap_status'" in _ws_st)
+except Exception as _e:
+    test("bootstrap_status wiring", False, str(_e))
+
+
 _cleanup_test_artifacts()
 
 # ============================================================

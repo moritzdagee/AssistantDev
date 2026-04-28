@@ -88,6 +88,16 @@ CATEGORY_TO_SKILL = {
 MIN_OCCURRENCES = 3
 DEFAULT_LATER_THRESHOLD = 10
 
+# Bootstrap-Delay (Roadmap-Anpassung 2026-04-28):
+# Der erste produktive Pattern-Analyse-Lauf findet erst nach diesem Datum
+# statt — bis dahin sammelt der Logger Daten, damit Patterns sinnvoll sind.
+# Manuelle Trigger via /api/patterns/analyze sind unbeschraenkt moeglich.
+# Nach dem ersten Auto-Run uebernimmt der wochentliche Sonntag-22:00-Schedule.
+if _TZ is not None:
+    BOOTSTRAP_FIRST_RUN_AFTER = datetime.datetime(2026, 5, 8, 22, 0, tzinfo=_TZ)
+else:
+    BOOTSTRAP_FIRST_RUN_AFTER = datetime.datetime(2026, 5, 8, 22, 0).astimezone()
+
 
 # ── Persistenz ───────────────────────────────────────────────────────────────
 
@@ -560,23 +570,64 @@ def _deactivate_pattern_locked(pattern):
 
 # ── Heartbeat-Integration ────────────────────────────────────────────────────
 
-def register_with_heartbeat():
-    """Registriert den woechentlichen Analyse-Lauf als Cron-Job.
+def _bootstrap_aware_schedule(last_run, now):
+    """Schedule-Predicate fuer den wochentlichen Analyse-Lauf.
 
-    Sonntag 22:00 Lokalzeit (Sao Paulo). Cron-Name: 'pattern_analyzer_weekly'.
-    Idempotent: bei Doppel-Aufruf wird der bestehende Job ueberschrieben.
+    Logik:
+    1. Solange now < BOOTSTRAP_FIRST_RUN_AFTER -> niemals ausloesen.
+    2. Sobald BOOTSTRAP_FIRST_RUN_AFTER erreicht UND noch nie gelaufen
+       (last_run is None) -> sofort ausloesen (initialer Bootstrap-Run).
+    3. Danach: Standard-Logik wie heartbeat.weekly_at(6, 22, 0)
+       — Sonntag, ab 22:00, mind. 6 Tage seit letztem Lauf.
+    """
+    if now < BOOTSTRAP_FIRST_RUN_AFTER:
+        return False
+    if last_run is None:
+        return True
+    # Standard wochentlich (Sonntag 22:00)
+    if now.weekday() != 6:
+        return False
+    if now.hour < 22:
+        return False
+    return (now - last_run).total_seconds() >= 6 * 86400
+
+
+def register_with_heartbeat():
+    """Registriert den Analyse-Lauf als Cron-Job mit Bootstrap-Delay.
+
+    - Erster produktiver Run: ab BOOTSTRAP_FIRST_RUN_AFTER (2026-05-08 22:00).
+    - Danach: wochentlich Sonntag 22:00 Lokalzeit (Sao Paulo).
+    - Cron-Name: 'pattern_analyzer_weekly'.
+    - Idempotent: bei Doppel-Aufruf wird der bestehende Job ueberschrieben.
+
+    Vorgehen "selbstaendig/proaktiv mit Genehmigung":
+    Der Cron triggert analyze_logs() autonom — gefundene Patterns gehen
+    via heartbeat.enqueue_notification mit type='pattern_suggestion' und
+    drei Action-Buttons (yes/no/later) ans Frontend. Erst nach 'yes'
+    wird ein Pattern als eigener Cron-Job aktiviert. Kein autonomer
+    Side-Effect ohne explizite User-Genehmigung.
     """
     if _hb is None:
         return False
-    # Sonntag = weekday 6 in Python (Mo=0)
-    schedule_fn = _hb.weekly_at(6, 22, 0)
     try:
         _hb.schedule_cron(
             "pattern_analyzer_weekly",
-            schedule_fn=schedule_fn,
+            schedule_fn=_bootstrap_aware_schedule,
             job_fn=lambda now: analyze_logs(),
             run_immediately=False,
         )
         return True
     except Exception:
         return False
+
+
+def bootstrap_status():
+    """Diagnose: liefert Bootstrap-Delay-Status fuer Frontend/Admin-Page."""
+    now = _now()
+    return {
+        "first_run_after": BOOTSTRAP_FIRST_RUN_AFTER.isoformat(timespec="seconds"),
+        "now": now.isoformat(timespec="seconds"),
+        "in_bootstrap_phase": now < BOOTSTRAP_FIRST_RUN_AFTER,
+        "seconds_until_first_run": max(
+            0, int((BOOTSTRAP_FIRST_RUN_AFTER - now).total_seconds())),
+    }

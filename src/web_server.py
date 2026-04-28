@@ -13333,6 +13333,17 @@ def api_patterns_respond():
         return jsonify({'ok': False, 'error': str(e)})
 
 
+@app.route('/api/patterns/bootstrap_status', methods=['GET'])
+def api_patterns_bootstrap_status():
+    """Liefert den Bootstrap-Delay-Status — wann der erste Auto-Run laeuft."""
+    if _pat is None:
+        return jsonify({'available': False})
+    try:
+        return jsonify({'available': True, **_pat.bootstrap_status()})
+    except Exception as e:
+        return jsonify({'available': False, 'error': str(e)})
+
+
 @app.route('/api/patterns/analyze', methods=['POST'])
 def api_patterns_analyze():
     """Manueller Trigger fuer den Pattern-Analyse-Lauf (Sonntag 22:00 Cron).

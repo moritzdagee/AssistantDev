@@ -15,6 +15,7 @@ Exposed API:
     get_summary()                     Aggregat fuer /api/usage/summary
 """
 import os
+import re
 import json
 import queue
 import threading
@@ -65,8 +66,8 @@ _KEYWORD_RULES = [
     ]),
     ("coding", [
         "code", "python", "javascript", "typescript", "funktion",
-        "function", "bug", "fix", "debug", "refactor", " repo",
-        "git ", "deploy", "server", "api ", "endpoint", "stack trace",
+        "function", "bug", "fix", "debug", "refactor", "repository",
+        "git ", "deploy", "server", "endpoint", "stack trace",
         "syntax error", "compile",
     ]),
     ("document", [
@@ -80,7 +81,7 @@ _KEYWORD_RULES = [
         "deep research", "tiefgehende",
     ]),
     ("writing", [
-        "schreib", "draft", "entwurf", "formulier", "blog",
+        "schreib", "geschrieb", "draft", "entwurf", "formulier", "blog",
         "newsletter", "artikel", "post für", "post fuer", "social",
         "linkedin post", "twitter post", "redigier",
     ]),
@@ -96,15 +97,124 @@ _KEYWORD_RULES = [
 ]
 
 
+# ── Stemming ─────────────────────────────────────────────────────────────────
+# Custom Suffix-Stripper fuer deutsches Token-Matching. Loest das Problem,
+# dass z.B. "recherchiere" nicht Substring "recherche" enthaelt.
+# Suffix-Liste: laengste zuerst (Greedy-Match). Min-Stem-Laenge 4.
+# Lehnwoerter (email, meeting, ...) werden NICHT gestemmt (siehe _LOANWORDS).
+
+_SUFFIXES = [
+    "iertest", "iertet", "ierten", "ierte",
+    "ieren", "iert", "ierst", "iere", "ier",
+    "endes", "enden", "endem", "ender", "ende",
+    "ungen", "ungs", "ung",
+    "isch", "ische", "ischen",
+    "lich", "liche", "lichen",
+    "est", "en", "er", "es", "em",
+    "st", "te",
+    "e", "t", "s", "n",
+]
+_SUFFIXES.sort(key=len, reverse=True)
+
+# Lehnwoerter / Anglizismen: nicht stemmen (sonst wird "email" zu "emai")
+_LOANWORDS = {
+    "email", "mail", "meeting", "report", "post", "social", "linkedin",
+    "twitter", "blog", "newsletter", "code", "python", "javascript",
+    "typescript", "function", "bug", "fix", "debug", "deploy", "server",
+    "api", "endpoint", "compile", "git", "research", "find", "search",
+    "analyze", "analysis", "calendar", "translate", "translation",
+    "image", "video", "document", "test", "ok", "wikipedia",
+}
+
+
+def _stem(word):
+    """Greedy Suffix-Stripping mit Min-Laenge 4. Lehnwoerter unveraendert."""
+    if not isinstance(word, str):
+        return ""
+    w = word.lower().strip()
+    if not w:
+        return ""
+    # Umlaut-Normalisierung
+    w = (w.replace("ä", "a").replace("ö", "o").replace("ü", "u")
+          .replace("ß", "ss"))
+    if w in _LOANWORDS:
+        return w
+    if len(w) <= 4:
+        return w
+    for suf in _SUFFIXES:
+        if len(suf) >= len(w):
+            continue
+        if w.endswith(suf) and len(w) - len(suf) >= 4:
+            return w[:-len(suf)]
+    return w
+
+
+def _is_single_word_keyword(kw):
+    return isinstance(kw, str) and " " not in kw and "/" not in kw
+
+
+# Pre-Compiled Stem-Index. Single-Word-Keywords werden gestemmt + im Dict
+# abgelegt. Multi-Word-Keywords (z.B. "suche heraus", "wer ist") laufen
+# weiter ueber substring-Match.
+_STEM_INDEX = {}    # stem -> first matching category
+_MULTI_WORD = []    # list of (category, keyword)
+_TOKEN_RE = re.compile(r"[a-z0-9äöüß]{2,}", re.UNICODE)
+
+
+def _build_keyword_index():
+    _STEM_INDEX.clear()
+    _MULTI_WORD.clear()
+    for category, keywords in _KEYWORD_RULES:
+        for kw in keywords:
+            if _is_single_word_keyword(kw):
+                stem = _stem(kw)
+                if not stem:
+                    continue
+                _STEM_INDEX.setdefault(stem, category)
+            else:
+                _MULTI_WORD.append((category, kw.lower()))
+
+
+_build_keyword_index()
+
+
 def classify_task(msg):
-    """Best-effort Kategorisierung anhand von Keywords. Default 'other'."""
+    """Best-effort Kategorisierung anhand von Keywords + Stems. Default 'other'.
+
+    Strategie:
+    1. Multi-Word-Keywords: substring-Match (aelter Pfad, robust fuer
+       Phrasen wie "suche heraus", "wer ist", "find out").
+    2. Single-Word-Keywords: Token-basiertes Stem-Matching. Tokens werden
+       gestemmt, im Pre-Compiled Index nachgeschlagen. Liefert die Kategorie
+       des ERSTEN Keywords aus _KEYWORD_RULES (Reihenfolge = Prioritaet).
+    """
     if not isinstance(msg, str) or not msg.strip():
         return "other"
     m = msg.lower()
+
+    # Stage 1: Multi-Word substring-Match in Original-Reihenfolge
+    for category, kw in _MULTI_WORD:
+        if kw in m:
+            return category
+
+    # Stage 2: Token-Match per Stem-Lookup. Aber Reihenfolge in
+    # _KEYWORD_RULES ist Prioritaet — wir muessen pro Kategorie pruefen,
+    # ob irgendein Token-Stem in _STEM_INDEX dieser Kategorie matcht.
+    tokens = _TOKEN_RE.findall(m)
+    if not tokens:
+        return "other"
+    token_stems = {_stem(t) for t in tokens if t}
+
     for category, keywords in _KEYWORD_RULES:
         for kw in keywords:
-            if kw in m:
+            if not _is_single_word_keyword(kw):
+                continue
+            kw_stem = _stem(kw)
+            if not kw_stem:
+                continue
+            if kw_stem in token_stems:
                 return category
+
     return "other"
 
 
