@@ -5383,8 +5383,62 @@ try:
          "Beruecksichtige die Timestamps der Messages" in _ws)
     test("Reply-Hint erinnert an exakte Reply-Felder (kein Halluzinieren)",
          "Halluziniere keine ID" in _ws)
+    # BACKEND_TODO_CONFIDENCE_THRESHOLD_2026-04-28
+    test("Memory-Loading Konfidenz-Helper definiert",
+         "def _memory_loading_config(agent_name: str)" in _ws)
+    test("Konfidenz-Routing: 3 Modi (auto / suggest / ignore)",
+         "score >= t_auto" in _ws and "score >= t_ask and len(suggested_loads)" in _ws)
+    test("Pending suggestions im Session-State",
+         "_pending_suggestions" in _ws and "_suggestion_hint" in _ws)
+    test("Suggestion-Hint wird ins System-Prompt injected",
+         "effective_system_prompt + " in _ws and "_suggest_hint" in _ws)
+    test("/api/memory/loading-config GET registriert",
+         "@app.route('/api/memory/loading-config', methods=['GET'])" in _ws)
+    test("/api/memory/loading-config PATCH/PUT registriert",
+         "@app.route('/api/memory/loading-config', methods=['PATCH', 'PUT'])" in _ws)
+    test("/api/memory/load_suggestion POST registriert",
+         "@app.route('/api/memory/load_suggestion', methods=['POST'])" in _ws)
 except Exception as _e:
     test("Agent PUT-Alias grep", False, str(_e))
+
+# Live-Tests fuer Memory-Loading-Config
+try:
+    r = requests.get("http://localhost:8080/api/memory/loading-config", timeout=10)
+    test("Live: GET /api/memory/loading-config -> 200", r.status_code == 200)
+    if r.status_code == 200:
+        d = r.json()
+        defaults = d.get('config', {}).get('default', {})
+        test("Live: Defaults haben auto_load_threshold + ask_threshold",
+             'auto_load_threshold' in defaults and 'ask_threshold' in defaults)
+        test("Live: agents_resolved enthaelt resolvte Werte pro Agent",
+             isinstance(d.get('agents_resolved'), dict)
+             and len(d.get('agents_resolved', {})) > 0)
+
+    # PATCH ohne agent setzt default
+    r2 = requests.patch(
+        "http://localhost:8080/api/memory/loading-config",
+        json={"key": "max_suggested", "value": 4},
+        timeout=10,
+    )
+    test("Live: PATCH default-key -> 200", r2.status_code == 200)
+    # Restore
+    requests.patch(
+        "http://localhost:8080/api/memory/loading-config",
+        json={"key": "max_suggested", "value": 3},
+        timeout=10,
+    )
+
+    # PATCH mit ungueltigem value -> 400
+    r3 = requests.patch(
+        "http://localhost:8080/api/memory/loading-config",
+        json={"key": "auto_load_threshold", "value": "not-a-number"},
+        timeout=10,
+    )
+    test("Live: PATCH mit non-number value -> 400", r3.status_code == 400)
+except requests.exceptions.RequestException as _e:
+    test("Memory-Loading live", False, f"server not reachable: {_e}")
+except Exception as _e:
+    test("Memory-Loading live", False, str(_e))
 
 try:
     # Top-Level: PUT auf existierenden Agent → 200 (war vorher 405)

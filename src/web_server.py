@@ -8170,6 +8170,176 @@ def _agent_exists(name: str) -> bool:
     return os.path.isfile(os.path.join(AGENTS_DIR, name + '.txt'))
 
 
+# ── Memory-Loading-Konfidenz (BACKEND_TODO_CONFIDENCE_THRESHOLD_2026-04-28)
+# Drei Konzepte koexistieren:
+#   A) Auto-Load        : Backend laedt File still wenn score >= t_auto
+#   B) Suggested-Load   : Backend zeigt Vorschlag, User entscheidet
+#                         (score in [t_ask, t_auto))
+#   C) Manual / Co-Search: User wirft File rein oder /find <X>
+# Per-Agent ueberschreibbar (z.B. Signicat strenger als Privat).
+_MEMORY_LOADING_CONFIG_PATH = os.path.join(
+    _REPO_ROOT_FOR_FRONTEND_APIS, 'config', 'memory_loading.json',
+)
+_MEMORY_LOADING_CONFIG_PATHS = [
+    os.path.expanduser(
+        '~/Library/Mobile Documents/com~apple~CloudDocs/Downloads shared/'
+        'claude_datalake/config/memory_loading.json'
+    ),
+    _MEMORY_LOADING_CONFIG_PATH,
+]
+_MEMORY_LOADING_DEFAULTS = {
+    'auto_load_threshold': 0.55,
+    'ask_threshold': 0.30,
+    'max_auto_loaded': 5,
+    'max_suggested': 3,
+}
+_MEMORY_LOADING_CACHE = {'data': None, 'mtime': 0.0, 'path': None}
+
+
+def _memory_loading_load_raw():
+    """Liest config/memory_loading.json mit mtime-cache. Default bei Fehler."""
+    for p in _MEMORY_LOADING_CONFIG_PATHS:
+        if not os.path.isfile(p):
+            continue
+        try:
+            mt = os.path.getmtime(p)
+        except OSError:
+            continue
+        if (_MEMORY_LOADING_CACHE['data'] is not None
+                and _MEMORY_LOADING_CACHE['path'] == p
+                and _MEMORY_LOADING_CACHE['mtime'] == mt):
+            return _MEMORY_LOADING_CACHE['data']
+        try:
+            with open(p, encoding='utf-8') as fh:
+                data = json.load(fh)
+            _MEMORY_LOADING_CACHE['data'] = data
+            _MEMORY_LOADING_CACHE['mtime'] = mt
+            _MEMORY_LOADING_CACHE['path'] = p
+            return data
+        except Exception as e:
+            print(f"[MEMORY-LOADING-CONFIG] Lesefehler {p}: {e}", flush=True)
+            continue
+    return {'default': dict(_MEMORY_LOADING_DEFAULTS), 'agents': {}}
+
+
+def _memory_loading_config(agent_name: str) -> dict:
+    """Effektive Thresholds fuer einen Agent: Default + Per-Agent-Override."""
+    raw = _memory_loading_load_raw()
+    eff = dict(_MEMORY_LOADING_DEFAULTS)
+    eff.update((raw.get('default') or {}))
+    per_agent = ((raw.get('agents') or {}).get(agent_name) or {})
+    eff.update(per_agent)
+    return eff
+
+
+@app.route('/api/memory/loading-config', methods=['GET'])
+def api_memory_loading_config_get():
+    """Liefert die aktuelle Config inkl. Defaults + alle Agent-Overrides.
+    Frontend kann pro Agent die Thresholds anpassen."""
+    raw = _memory_loading_load_raw()
+    return jsonify({
+        'config_defaults': _MEMORY_LOADING_DEFAULTS,
+        'config': raw,
+        'agents_resolved': {
+            a: _memory_loading_config(a)
+            for a in (
+                [
+                    f.replace('.txt', '') for f in os.listdir(AGENTS_DIR)
+                    if f.endswith('.txt') and '.backup_' not in f and '.deleted_' not in f
+                ] if os.path.isdir(AGENTS_DIR) else []
+            )
+        },
+    })
+
+
+@app.route('/api/memory/loading-config', methods=['PATCH', 'PUT'])
+def api_memory_loading_config_patch():
+    """Patch-Update: Body { agent: <name|''>, key: <field>, value: <num> }
+    oder { config: {...} } fuer Komplett-Replace."""
+    body = request.get_json(silent=True) or {}
+    raw = _memory_loading_load_raw()
+    if isinstance(body.get('config'), dict):
+        # Full replace
+        new_cfg = body['config']
+    else:
+        new_cfg = {
+            'default': dict((raw.get('default') or {})),
+            'agents': dict((raw.get('agents') or {})),
+        }
+        agent = (body.get('agent') or '').strip()
+        key = (body.get('key') or '').strip()
+        if not key:
+            return jsonify({'ok': False, 'error': 'key required'}), 400
+        try:
+            value = float(body.get('value'))
+        except (TypeError, ValueError):
+            return jsonify({'ok': False, 'error': 'value must be number'}), 400
+        if not agent:
+            new_cfg['default'][key] = value
+        else:
+            new_cfg.setdefault('agents', {}).setdefault(agent, {})[key] = value
+    target = _MEMORY_LOADING_CONFIG_PATHS[0]
+    try:
+        os.makedirs(os.path.dirname(target), exist_ok=True)
+        tmp = target + '.tmp'
+        with open(tmp, 'w', encoding='utf-8') as fh:
+            json.dump(new_cfg, fh, indent=2, ensure_ascii=False)
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.replace(tmp, target)
+        # Cache invalidieren
+        _MEMORY_LOADING_CACHE['data'] = None
+        _MEMORY_LOADING_CACHE['mtime'] = 0.0
+        return jsonify({'ok': True, 'config': new_cfg})
+    except OSError as e:
+        return jsonify({'ok': False, 'error': str(e)}), 500
+
+
+@app.route('/api/memory/load_suggestion', methods=['POST'])
+def api_memory_load_suggestion():
+    """User-Antwort auf einen Suggested-Load: Body { session_id, file, choice: yes|no }.
+    Bei 'yes' wird das File in den Session-Kontext geladen, beim naechsten /chat-
+    Aufruf sieht der LLM den Inhalt. Bei 'no' wird der Suggestion-Hint entfernt
+    und der LLM macht ohne diese Info weiter."""
+    body = request.get_json(silent=True) or {}
+    session_id = (body.get('session_id') or '').strip()
+    fname = (body.get('file') or '').strip()
+    choice = (body.get('choice') or '').strip().lower()
+    if choice not in ('yes', 'no'):
+        return jsonify({'ok': False, 'error': "choice must be 'yes' or 'no'"}), 400
+    if not session_id or not fname:
+        return jsonify({'ok': False, 'error': 'session_id and file required'}), 400
+    state = SESSIONS.get(session_id) if 'SESSIONS' in globals() else None
+    if state is None:
+        # Fallback: get_session laedt den session-state on-demand
+        state = get_session(session_id) if session_id else None
+    if state is None:
+        return jsonify({'ok': False, 'error': 'unknown session'}), 404
+    pending = state.get('_pending_suggestions') or []
+    if choice == 'yes':
+        memory_dir = os.path.join(state.get('speicher') or '', 'memory')
+        fpath = os.path.join(memory_dir, fname)
+        if not os.path.isfile(fpath):
+            return jsonify({'ok': False, 'error': f'file not found: {fname}'}), 404
+        try:
+            with open(fpath, 'r', encoding='utf-8', errors='replace') as f:
+                content = f.read(50000)
+        except OSError as e:
+            return jsonify({'ok': False, 'error': str(e)}), 500
+        state.setdefault('kontext_items', []).append({'name': fname, 'content': content})
+        state.setdefault('session_files', []).append(fname)
+    # In beiden Faellen: aus pending-Liste entfernen + Hint loeschen
+    state['_pending_suggestions'] = [s for s in pending if s.get('name') != fname]
+    if not state['_pending_suggestions']:
+        state.pop('_suggestion_hint', None)
+    return jsonify({
+        'ok': True,
+        'choice': choice,
+        'file': fname,
+        'remaining_suggestions': state['_pending_suggestions'],
+    })
+
+
 # ── Agent-Lifecycle: Helper fuer Create/Rename/Delete ───────────────────────
 # Robuste CRUD-Operations fuer Agents (BACKEND_TODO 2026-04-27 "Agent-
 # Creierung umbenennen + sauber abgespeichert in allen Orten"). Vor diesem
@@ -12399,15 +12569,62 @@ def process_single_message(msg, kontext_override=None, state=None, **kwargs):
                 pass
 
             search_results, search_feedback = auto_search(msg, state['speicher'])
+
+            # Konfidenz-basiertes Routing (BACKEND_TODO_CONFIDENCE_THRESHOLD_2026-04-28):
+            # score >= auto_load_threshold       -> stille Auto-Load wie bisher
+            # ask_threshold <= score < auto_load -> nur als VORSCHLAG dem LLM zeigen
+            # score < ask_threshold              -> ignorieren (zu schwach)
+            cfg = _memory_loading_config(state.get('agent', ''))
+            t_auto = float(cfg.get('auto_load_threshold', 0.55))
+            t_ask = float(cfg.get('ask_threshold', 0.30))
+            max_auto = int(cfg.get('max_auto_loaded', 5))
+            max_sugg = int(cfg.get('max_suggested', 3))
+
+            suggested_loads = []
             for item in search_results:
                 fname = item['name']
+                score = float(item.get('score') or 0.0)
                 if fname in wm_names:
                     continue  # already pinned in working memory
-                if not any(k['name'] == fname for k in kontext_items):
+                if any(k['name'] == fname for k in kontext_items):
+                    continue
+                if score >= t_auto and len(auto_loaded_names) < max_auto:
                     kontext_items.append(item)
                     if fname not in state['session_files']:
                         state['session_files'].append(fname)
                     auto_loaded_names.append(fname)
+                elif score >= t_ask and len(suggested_loads) < max_sugg:
+                    suggested_loads.append({
+                        'name': fname,
+                        'score': round(score, 3),
+                    })
+                # else: ignore (below ask threshold)
+
+            # Vorschlaege als sichtbarer Hint im Output — der LLM soll dem
+            # User aktiv sagen: "Diese Files koennten relevant sein, soll
+            # ich laden?". Das Frontend kann den [SUGGEST_FILE:...]-Marker
+            # zu Ja/Nein-Buttons rendern (FRONTEND_TODO).
+            if suggested_loads:
+                state['_pending_suggestions'] = suggested_loads
+                # Hinweis fuer den LLM via System-Kontext-Augment
+                hint_lines = [
+                    "",
+                    f"[MEMORY-FILE-VORSCHLAEGE — Konfidenz {t_ask:.2f}..{t_auto:.2f}]",
+                ]
+                for s in suggested_loads:
+                    hint_lines.append(
+                        f"  - {s['name']}  (score {s['score']})"
+                    )
+                hint_lines.extend([
+                    "",
+                    "Diese Files koennten zur Anfrage passen, sind aber unter dem",
+                    "Auto-Load-Threshold. Wenn dir Information fehlt: frag den User",
+                    "ob er eines davon laden moechte (User antwortet ja/nein).",
+                    "Bei 'nein' machst du mit aktuellem Wissen weiter — du hoerst",
+                    "nicht auf, sondern bittest ggf. um Spezifizierung der Anfrage.",
+                ])
+                state['_suggestion_hint'] = "\n".join(hint_lines)
+
             if search_feedback:
                 auto_search_info = format_search_feedback(search_feedback, len(auto_loaded_names))
         except Exception as e:
@@ -12558,7 +12775,16 @@ def process_single_message(msg, kontext_override=None, state=None, **kwargs):
         adapter = ADAPTERS.get(provider_key)
         if not adapter:
             raise ValueError('Unbekannter Anbieter: ' + provider_key)
-        text = adapter(api_key, model_id, state['system_prompt'], state['verlauf'])
+        # Memory-Loading-Suggestions als System-Augment injecten — der LLM
+        # sieht damit klar welche Files in der Vorschlags-Zone sind und
+        # kann den User danach fragen statt zu raten.
+        effective_system_prompt = state['system_prompt']
+        _suggest_hint = state.get('_suggestion_hint')
+        if _suggest_hint:
+            effective_system_prompt = (
+                effective_system_prompt + "\n\n" + _suggest_hint
+            )
+        text = adapter(api_key, model_id, effective_system_prompt, state['verlauf'])
 
         # Parse MEMORY_SEARCH in agent response and re-query if found.
         # WICHTIG (Reply-Session-Bug 2026-04-28): in Reply-Sessions ist der
