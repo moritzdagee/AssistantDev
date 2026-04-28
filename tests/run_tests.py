@@ -5350,6 +5350,9 @@ try:
          "@app.route('/agents/<name>', methods=['PATCH', 'PUT'])" in _ws)
     test("Sub-Agent: PATCH+PUT methods registriert",
          "@app.route('/agents/<parent>/subagents/<name>', methods=['PATCH', 'PUT'])" in _ws)
+    # System-Prompt-Endpoint: voller Slug + Suffix beide unterstuetzt
+    test("api_system_prompt erkennt vollen Sub-Slug (signicat_outbound)",
+         "sub.startswith(agent + '_')" in _ws and "candidates.append" in _ws)
 except Exception as _e:
     test("Agent PUT-Alias grep", False, str(_e))
 

@@ -9317,16 +9317,37 @@ def _parse_generated_sections(generated):
 @app.route('/api/system_prompt/<agent>/<sub>')
 def api_system_prompt(agent, sub=None):
     """Liefert den System-Prompt strukturiert: user (editierbar) + generated
-    (auto) + sections[]. Siehe BACKEND_TODO_SYSTEM_PROMPT_SECTIONS.md."""
+    (auto) + sections[]. Siehe BACKEND_TODO_SYSTEM_PROMPT_SECTIONS.md.
+
+    Sub-Agents: Frontend schickt teils bereits den vollen Slug
+    ('signicat_outbound') als sub, teils nur das Suffix ('outbound'). Wir
+    probieren beide Pfade — sonst kollidiert `f'{agent}_{sub}.txt'` mit
+    'signicat_signicat_outbound.txt' fuer den vollen Slug-Fall.
+    """
     if sub:
-        fname = f'{agent}_{sub}.txt'
+        candidates = []
+        # 1. Sub bereits voller Slug (signicat_outbound)
+        if sub.startswith(agent + '_') or sub == agent:
+            candidates.append(f'{sub}.txt')
+        # 2. Sub als Suffix, Praefix vom Parent (outbound -> signicat_outbound)
+        candidates.append(f'{agent}_{sub}.txt')
+        # 3. Fallback: Sub als eigenstaendige Datei (selten)
+        candidates.append(f'{sub}.txt')
+        path = None
+        for fname in candidates:
+            p = os.path.join(AGENTS_DIR, fname)
+            if os.path.isfile(p):
+                path = p
+                break
         key = f'{agent}/{sub}'
+        if not path:
+            return jsonify({'error': f'agent {key} not found'}), 404
     else:
         fname = f'{agent}.txt'
+        path = os.path.join(AGENTS_DIR, fname)
         key = agent
-    path = os.path.join(AGENTS_DIR, fname)
-    if not os.path.isfile(path):
-        return jsonify({'error': f'agent {key} not found'}), 404
+        if not os.path.isfile(path):
+            return jsonify({'error': f'agent {key} not found'}), 404
     try:
         with open(path, encoding='utf-8') as fh:
             prompt = fh.read()
